@@ -1,0 +1,900 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>IoT Medical Waste Tracker — Admin v2</title>
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- Base CSS reset (optional) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/modern-css-reset/dist/reset.min.css">
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <style>
+    :root{
+      --bg: #0b0f1a;
+      --bg-soft: #0f1524;
+      --surface: #111827;
+      --card: rgba(255,255,255,0.06);
+      --card-2: rgba(255,255,255,0.04);
+      --border: rgba(255,255,255,0.12);
+      --text: #e5e7eb;
+      --muted: #9aa3b2;
+      --primary: #60a5fa;
+      --primary-2: #7dd3fc;
+      --danger: #f87171;
+      --success: #4ade80;
+      --warn: #fbbf24;
+      --shadow: 0 20px 40px rgba(0,0,0,.45);
+      --radius: 14px;
+    }
+    html,body{ height:100%; }
+    body{
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      color: var(--text);
+      background: radial-gradient(1200px 800px at 10% -10%, #1f2a44 0%, transparent 60%),
+                  radial-gradient(1200px 800px at 110% 10%, #13233a 0%, transparent 60%),
+                  var(--bg);
+      background-attachment: fixed;
+      line-height: 1.45;
+    }
+
+    /* ====== Page frame ====== */
+    .container{ max-width: 1200px; margin: 0 auto; padding: 2rem 1.2rem 3rem; }
+    header.topbar{
+      position: sticky; top: 0; z-index: 40;
+      backdrop-filter: saturate(120%) blur(12px);
+      background: linear-gradient(180deg, rgba(11,15,26,.9), rgba(11,15,26,.65));
+      border-bottom: 1px solid var(--border); box-shadow: var(--shadow);
+    }
+
+    .top-inner{
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: .75rem;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: .9rem 1.2rem;
+      position: relative;
+    }
+
+    .brand{ display:flex; gap:.65rem; align-items:center; min-width: 0; }
+    .logo{ width: 34px; height: 34px; border-radius: 10px; display:grid; place-items:center;
+      background: linear-gradient(135deg, #60a5fa33, #34d39933);
+      border: 1px solid var(--border); flex: 0 0 auto; }
+    .brand h1{
+      font-size: 1.2rem; margin: 0; letter-spacing:.2px; font-weight: 800;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70vw;
+    }
+    .brand small{ display:block; margin-top:-.15rem; color: var(--muted); font-weight: 500; }
+
+    .menu-wrap{ position:relative; }
+    details.menu{ display:inline-block; }
+    details.menu>summary{
+      list-style:none; cursor:pointer; border:1px solid var(--border);
+      border-radius: 10px; padding:.5rem .7rem; font-weight:700; background: var(--card);
+    }
+    details.menu[open]>summary{ background: rgba(255,255,255,.10); }
+
+    .menu-panel{
+      position: absolute; left: 0; top: calc(100% + .5rem);
+      display: none;
+      padding: .5rem; width: 260px; background: var(--bg-soft);
+      border:1px solid var(--border); border-radius:12px; box-shadow: var(--shadow);
+    }
+    details.menu[open] .menu-panel{ display: grid; gap: .5rem; }
+
+    .menu-panel .btn{
+      width:100%; display:block; text-align:left;
+      padding:.6rem .7rem; border-radius:10px;
+      border:1px solid var(--border); background: rgba(255,255,255,0.04);
+      color:var(--text); font-weight:600; cursor:pointer; text-decoration:none;
+    }
+    .menu-panel .btn:hover{ background: rgba(255,255,255,.08); }
+
+    .quick-actions{ display:none !important; }
+
+    .kpis{ display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:1rem; margin: 1.25rem 0 1.25rem; }
+    .card{ background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem; box-shadow: var(--shadow);
+      transition: transform .2s ease, box-shadow .2s ease, background-color .2s ease; }
+    .card:hover{ transform: translateY(-3px); background: rgba(255,255,255,.08); }
+    .card h3{ margin:.1rem 0 .2rem; font-size:.95rem; color: var(--muted); font-weight:600; letter-spacing:.3px; }
+    .stat{ display:flex; align-items:center; gap:.65rem; }
+    .stat .bubble{ width:38px; height:38px; border-radius:12px; display:grid; place-items:center; border:1px solid var(--border);
+      background: linear-gradient(135deg, rgba(96,165,250,.2), rgba(52,211,153,.2)); }
+    .stat strong{ font-size: 1.45rem; letter-spacing:.2px; }
+
+    .panel{ background: var(--card-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; box-shadow: var(--shadow); }
+    .filters{ display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:.9rem; align-items:end; }
+    label{ font-size:.85rem; color: var(--muted); font-weight:600; margin-bottom:.25rem; display:block; }
+    input, select{ width:100%; padding:.6rem .7rem; border-radius: 10px; border:1px solid var(--border); background: rgba(255,255,255,.04); color: var(--text); }
+    input:focus, select:focus{ outline: none; border-color: var(--primary); box-shadow: 0 0 0 4px rgba(96,165,250,.15); }
+
+    .actions{ display:flex; gap:.6rem; flex-wrap:wrap; }
+    .btn-primary{ background: linear-gradient(135deg, #60a5fa, #34d399); color:#08121d; }
+    .btn-secondary{ background: transparent; color: var(--text); }
+    .button, button{ padding:.65rem .9rem; border-radius: 10px; border: 1px solid var(--border); cursor:pointer; font-weight:700; }
+    a.button{ text-decoration:none; color:var(--text); }
+    .button:hover, button:hover{ transform: translateY(-1px); }
+
+    .muted{ color: var(--muted); }
+    h2.page-title{ font-size:1.35rem; letter-spacing:.3px; margin: .25rem 0 0; }
+    p.subtitle{ margin:.25rem 0 0; color: var(--muted); }
+
+    .chart-card{ margin-top: 1.2rem; }
+    canvas{ max-width:100%; }
+
+    .table-wrap{ margin-top: .6rem; border:1px solid var(--border); border-radius: var(--radius); overflow:auto; background: var(--card-2); box-shadow: var(--shadow); }
+    table{ width:100%; border-collapse: collapse; font-size:.95rem; }
+    thead th{ position: sticky; top:0; background: linear-gradient(180deg, #0f1524, #0c1321); border-bottom:1px solid var(--border); text-align:left; padding:.7rem .8rem; font-weight:700; letter-spacing:.2px; }
+    tbody td{ border-bottom:1px solid rgba(255,255,255,.06); padding:.6rem .8rem; white-space:nowrap; }
+    tbody tr:hover{ background: rgba(255,255,255,.04); }
+
+    .pill{ padding:.2rem .55rem; border-radius:999px; font-size:.78rem; font-weight:800; letter-spacing:.3px; text-transform: uppercase; border: 1px solid var(--border); }
+    .pill-ok{ background: #16a34a22; color: var(--success); }
+    .pill-warn{ background: #dc262622; color: var(--danger); }
+
+    dialog::backdrop{ background: rgba(0,0,0,.55); backdrop-filter: blur(4px); }
+    dialog{ border:1px solid var(--border); border-radius: var(--radius); padding:1.1rem 1.2rem; width: 720px; max-width:95%; background: var(--bg-soft); color: var(--text); box-shadow: var(--shadow); }
+
+    /* ===== Wider Bin Classifications modal & tidy columns ===== */
+    #binClassesModal{ width: min(1280px, 98vw); max-width: 98vw; }
+    #binClassesTable { table-layout: fixed; }
+    #binClassesTable th:nth-child(1), #binClassesTable td:nth-child(1){ width: 280px; } /* Name */
+    #binClassesTable th:nth-child(2), #binClassesTable td:nth-child(2){ width: 240px; } /* MAC */
+    #binClassesTable th:nth-child(3), #binClassesTable td:nth-child(3){ width: 120px; } /* Temp */
+    #binClassesTable th:nth-child(4), #binClassesTable td:nth-child(4){ width: 130px; } /* Humidity */
+    #binClassesTable th:nth-child(5), #binClassesTable td:nth-child(5){ width: 130px; } /* Lid */
+
+    .row{ display:flex; gap:.6rem; }
+    .row>*{ flex:1; }
+    .dialog-actions{ display:flex; gap:.6rem; justify-content:flex-end; margin-top:.9rem; }
+
+    .toast{ position: fixed; right: 16px; bottom: 16px; z-index: 60; display:grid; gap:.6rem; }
+    .toast .t{ background: var(--bg-soft); border:1px solid var(--border); border-radius: 12px; padding:.7rem .9rem; box-shadow: var(--shadow); }
+
+    .spacer{ height: .6rem; }
+    .sr-only{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="top-inner">
+      <div class="menu-wrap">
+        <details class="menu">
+          <summary>☰ Menu</summary>
+          <div class="menu-panel" role="menu" aria-label="Quick actions">
+            <a class="btn" href="/admin">Dashboard</a>
+            <button class="btn" id="openAddEmployee">➕ Add Employee</button>
+            <button class="btn" id="openViewEmployees">👥 View Employees</button>
+            <button class="btn" id="openBinClasses">🗂️ Bin Classifications</button>
+            <button class="btn" id="openDeptClasses">🏥 Department Classifications</button>
+          </div>
+        </details>
+      </div>
+
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 3v18M3 12h18" stroke="#7dd3fc" stroke-width="2.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div>
+          <h1>IoT-Enabled Medical Waste Tracker</h1>
+          <small>Admin v2 • Local dashboard</small>
+        </div>
+      </div>
+
+      <div aria-hidden="true"></div>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- ===== KPI Cards ===== -->
+    <section class="kpis" aria-label="Key metrics">
+      <article class="card">
+        <h3>Employees</h3>
+        <div class="stat">
+          <div class="bubble" aria-hidden="true">👤</div>
+          <strong>{{.Counts.Employees}}</strong>
+        </div>
+      </article>
+      <article class="card">
+        <h3>Departments</h3>
+        <div class="stat">
+          <div class="bubble" aria-hidden="true">🏥</div>
+          <strong>{{.Counts.Departments}}</strong>
+        </div>
+      </article>
+      <article class="card">
+        <h3>Bins</h3>
+        <div class="stat">
+          <div class="bubble" aria-hidden="true">🗑️</div>
+          <strong>{{.Counts.Bins}}</strong>
+        </div>
+      </article>
+      <article class="card">
+        <h3>Active UUIDs <span class="sr-only">(unused & not expired)</span></h3>
+        <div class="stat">
+          <div class="bubble" aria-hidden="true">🔗</div>
+          <strong>{{.Counts.ActiveUUIDs}}</strong>
+        </div>
+        <p class="muted" style="margin:.4rem 0 0">unused &amp; not expired</p>
+      </article>
+    </section>
+
+    <!-- ===== Filters ===== -->
+    <section class="panel" aria-labelledby="filtersTitle">
+      <h2 id="filtersTitle" class="page-title" style="text-align:center">Filters</h2>
+      <p class="subtitle" style="text-align:center; margin-bottom:.8rem">Refine activity and exports by department, status, days, and row limit.</p>
+      <form id="filterForm" class="filters" method="get" action="/admin">
+        <div>
+          <label for="dept">Department ID</label>
+          <input type="number" id="dept" name="dept" min="1" placeholder="e.g. 1">
+        </div>
+        <div>
+          <label for="status">Status</label>
+          <select id="status" name="status">
+            <option value="">(all)</option>
+            <option value="active">active</option>
+            <option value="used">used</option>
+            <option value="expired">expired</option>
+          </select>
+        </div>
+        <div>
+          <label for="days">Days window</label>
+          <input type="number" id="days" name="days" min="1" max="180" value="14">
+        </div>
+        <div>
+          <label for="limit">Rows</label>
+          <input type="number" id="limit" name="limit" min="50" max="5000" value="200">
+        </div>
+        <div class="actions">
+          <button type="submit" class="button btn-primary">Apply</button>
+          <a id="exportBtn" class="button btn-secondary" href="/admin/export.csv">Export CSV</a>
+        </div>
+      </form>
+      <p class="muted" style="text-align:center;margin:.5rem 0 0">Tip: “Department ID” is the numeric <code>dept_id</code> from your DB.</p>
+    </section>
+
+    <!-- ===== Chart ===== -->
+    <section class="card chart-card" aria-labelledby="chartTitle">
+      <h2 id="chartTitle" class="page-title">Generated vs Used (daily)</h2>
+      <canvas id="usageChart" height="100"></canvas>
+    </section>
+
+    <!-- ===== LIVE BIN TELEMETRY (no refresh needed) ===== -->
+    <section class="card" style="margin-top:16px;">
+      <h2 style="margin:0 0 8px 0;">Live Bin Telemetry</h2>
+      <div id="live-bins-ts" style="font-size:12px;opacity:.7;margin-bottom:8px;">seeding…</div>
+      <div class="table-wrap" style="margin-top:0;">
+        <table id="live-bins" style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left;padding:.7rem .8rem;">Bin</th>
+              <th style="text-align:left;padding:.7rem .8rem;">Location</th>
+              <th style="text-align:left;padding:.7rem .8rem;">Stream</th>
+              <th style="text-align:left;padding:.7rem .8rem;">Temp (°C)</th>
+              <th style="text-align:left;padding:.7rem .8rem;">Humidity (%)</th>
+              <th style="text-align:left;padding:.7rem .8rem;">Door</th>
+              <th style="text-align:left;padding:.7rem .8rem;">Last Seen (UTC)</th>
+            </tr>
+          </thead>
+          <tbody id="live-bins-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== Recent table ===== -->
+    <section style="margin-top:1.2rem" aria-labelledby="recentTitle">
+      <div style="display:flex; justify-content:space-between; align-items:end; gap:1rem; flex-wrap:wrap;">
+        <div>
+          <h2 id="recentTitle" class="page-title" style="margin-bottom:.2rem">Recent Activity</h2>
+          <p class="muted">Last <span id="recentCount">{{len .Recent}}</span> events</p>
+        </div>
+        <div>
+          <a id="exportLink" class="button btn-secondary" href="/admin/export.csv">Export CSV</a>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="recentTable">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>UUID</th>
+              <th>Status</th>
+              <th>Employee</th>
+              <th>Department</th>
+              <th>Stream</th>
+              <th>Bin</th>
+              <th>Used At</th>
+              <th>Expires</th>
+            </tr>
+          </thead>
+          <tbody id="recentTbody">
+          {{range .Recent}}
+            <tr>
+              <td>{{.GeneratedAt}}</td>
+              <td><code>{{.UUID}}</code></td>
+              <td>
+                {{if .IsUsed}}<span class="pill pill-warn">used</span>
+                {{else}}{{if .Expired}}<span class="pill pill-warn">expired</span>{{else}}<span class="pill pill-ok">active</span>{{end}}{{end}}
+              </td>
+              <td>{{.Employee}}</td>
+              <td>{{.Department}}</td>
+              <td>{{.Stream}}</td>
+              <td>{{.BinName}}</td>
+              <td>{{if .UsedAt}}{{.UsedAt}}{{else}}—{{end}}</td>
+              <td>{{.ExpiresAt}}</td>
+            </tr>
+          {{end}}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===== Add Employee Modal ===== -->
+  <dialog id="addEmployeeModal" aria-labelledby="addEmpTitle">
+    <form id="addEmployeeForm" method="dialog">
+      <h3 id="addEmpTitle" style="margin-top:0">Add Employee</h3>
+      <label>Name
+        <input type="text" id="empName" name="name" placeholder="e.g. Taylor Reed" required>
+      </label>
+      <div class="row">
+        <label>Department ID
+          <input type="number" id="empDept" name="dept_id" min="1" required>
+        </label>
+        <label>5-digit PIN
+          <input type="text" id="empPin" name="pin" minlength="5" maxlength="5" pattern="\d{5}" required>
+        </label>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" id="cancelAddEmp">Cancel</button>
+        <button type="submit" class="button btn-primary">Save</button>
+      </div>
+      <p id="addEmpMsg" class="muted" style="margin:.6rem 0 0"></p>
+    </form>
+  </dialog>
+
+  <!-- ===== View Employees Modal ===== -->
+  <dialog id="viewEmployeesModal" aria-labelledby="viewEmpTitle">
+    <h3 id="viewEmpTitle" style="margin-top:0">All Employees</h3>
+    <div id="empListStatus" class="muted" style="margin:.25rem 0 .5rem">Loading…</div>
+    <div class="table-wrap" style="max-height:55vh; overflow:auto">
+      <table id="empTable">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Department</th>
+            <th>Employee ID</th>
+            <th>Department ID</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="closeViewEmployees">Close</button>
+    </div>
+  </dialog>
+
+  <!-- ===== Bin Classifications Modal ===== -->
+  <dialog id="binClassesModal" aria-labelledby="binClassesTitle">
+    <h3 id="binClassesTitle" style="margin-top:0">Bin Classifications</h3>
+    <p class="muted" style="margin:.25rem 0 .6rem">Configured medical waste streams / categories.</p>
+    <div class="table-wrap" style="max-height:55vh; overflow:auto">
+      <table id="binClassesTable">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>ESP32 MAC ID</th>
+            <th>Temp (°C)</th>
+            <th>Humidity (%)</th>
+            <th>Lid Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="closeBinClasses">Close</button>
+    </div>
+  </dialog>
+
+  <!-- ===== Department Classifications Modal ===== -->
+  <dialog id="deptClassesModal" aria-labelledby="deptClassesTitle">
+    <h3 id="deptClassesTitle" style="margin-top:0">Department Classifications</h3>
+    <p class="muted" style="margin:.25rem 0 .6rem">All departments and their IDs/codes.</p>
+    <div class="table-wrap" style="max-height:55vh; overflow:auto">
+      <table id="deptClassesTable">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Code</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="closeDeptClasses">Close</button>
+    </div>
+  </dialog>
+
+  <!-- Toast container -->
+  <div class="toast" id="toast" aria-live="polite" aria-atomic="true"></div>
+
+  <script>
+  (function(){
+    // ===== Helpers =====
+    const $ = (sel, root=document) => root.querySelector(sel);
+    const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+
+    function toast(msg, timeout=2400){
+      const box = document.getElementById('toast');
+      const t = document.createElement('div');
+      t.className = 't';
+      t.textContent = msg;
+      box.appendChild(t);
+      setTimeout(()=>{ t.style.opacity = '0'; t.style.transform='translateY(4px)'; setTimeout(()=>t.remove(), 350); }, timeout);
+    }
+
+    // Mirror current query in the filter form
+    const params = new URLSearchParams(location.search);
+    for (const id of ["dept","status","days","limit"]) {
+      const el = document.getElementById(id);
+      if (el && params.get(id)) el.value = params.get(id);
+    }
+
+    // Keep Export links in sync with filters
+    const exportBtn  = document.getElementById("exportBtn");
+    const exportLink = document.getElementById("exportLink");
+    const filterForm = document.getElementById('filterForm');
+
+    function formQS() {
+      return new URLSearchParams(new FormData(filterForm)).toString();
+    }
+    function setExportHref(){
+      const qs  = formQS();
+      const url = "/admin/export.csv" + (qs ? ("?" + qs) : "");
+      if (exportBtn)  exportBtn.href  = url;
+      if (exportLink) exportLink.href = url;
+    }
+    setExportHref();
+    filterForm?.addEventListener('input', setExportHref);
+
+    // ===== Chart (initial + polling) =====
+    let uuidChart = null;
+    async function refreshChart() {
+      try {
+        const qs = new URLSearchParams();
+        const dept = document.getElementById('dept')?.value;
+        const days = document.getElementById('days')?.value;
+        if (dept) qs.set('dept', dept);
+        if (days) qs.set('days', days);
+        const resp = await fetch('/admin/chart.json' + (qs.toString() ? '?' + qs.toString() : ''), { cache: 'no-store' });
+        const data = await resp.json();
+        const ctx = document.getElementById('usageChart').getContext('2d');
+        if (!uuidChart) {
+          uuidChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: data.labels,
+              datasets: [
+                { label: 'Generated', data: data.generated, borderWidth: 2, borderColor: '#60a5fa', tension: .25, pointRadius: 2 },
+                { label: 'Used',      data: data.used,      borderWidth: 2, borderColor: '#f87171', tension: .25, pointRadius: 2 }
+              ]
+            },
+            options: {
+              responsive: true,
+              interaction: { mode: 'index', intersect: false },
+              plugins: { legend: { labels: { color: '#cbd5e1' } } },
+              scales: {
+                x: { ticks: { color: '#cbd5e1' }, grid: { color: 'rgba(255,255,255,.06)' } },
+                y: { beginAtZero: true, ticks: { color: '#cbd5e1' }, grid: { color: 'rgba(255,255,255,.06)' } }
+              }
+            }
+          });
+        } else {
+          uuidChart.data.labels = data.labels;
+          uuidChart.data.datasets[0].data = data.generated;
+          uuidChart.data.datasets[1].data = data.used;
+          uuidChart.update('none');
+        }
+      } catch (e) { console.warn('chart refresh failed', e); }
+    }
+
+    // ===== Recent table (polling via CSV) =====
+    const recentTbody  = document.getElementById('recentTbody');
+    const recentCount  = document.getElementById('recentCount');
+
+    function parseCSV(text){
+      const rows = [];
+      let i=0, field='', row=[], inQuotes=false;
+      while (i < text.length) {
+        const c = text[i++];
+        if (inQuotes) {
+          if (c === '"') {
+            if (text[i] === '"') { field += '"'; i++; }
+            else inQuotes = false;
+          } else {
+            field += c;
+          }
+        } else {
+          if (c === '"') inQuotes = true;
+          else if (c === ',') { row.push(field); field=''; }
+          else if (c === '\n' || c === '\r') {
+            if (field.length || row.length) { row.push(field); rows.push(row); row=[]; field=''; }
+            if (c === '\r' && text[i] === '\n') i++;
+          } else field += c;
+        }
+      }
+      if (field.length || row.length) { row.push(field); rows.push(row); }
+      return rows;
+    }
+
+    async function refreshRecent() {
+      try {
+        const qs = formQS();
+        const url = '/admin/export.csv' + (qs ? '?' + qs : '');
+        const resp = await fetch(url, { cache: 'no-store' });
+        const csv  = await resp.text();
+        const rows = parseCSV(csv);
+        if (!rows || rows.length <= 1) return;
+
+        const header = rows[0].map(h => h.trim().toLowerCase());
+        const idx = Object.fromEntries(header.map((h,i)=>[h,i]));
+        const bodyRows = rows.slice(1).filter(r => r.length >= header.length);
+
+        recentTbody.innerHTML = bodyRows.map(r => {
+          const uuid        = r[idx.uuid] || '';
+          const statusRaw   = (r[idx.status] || '').toLowerCase();
+          const employee    = r[idx.employee] || '';
+          const department  = r[idx.department] || '';
+          const stream      = r[idx.stream] || '';
+          const bin         = r[idx.bin] || '';
+          const generatedAt = r[idx.generated_at] || '';
+          const usedAt      = r[idx.used_at] || '—';
+          const expiresAt   = r[idx.expires_at] || '';
+
+          const pill = statusRaw === 'used' ? '<span class="pill pill-warn">used</span>'
+                    : statusRaw === 'expired' ? '<span class="pill pill-warn">expired</span>'
+                    : '<span class="pill pill-ok">active</span>';
+
+          return `
+            <tr>
+              <td>${generatedAt}</td>
+              <td><code>${uuid}</code></td>
+              <td>${pill}</td>
+              <td>${employee}</td>
+              <td>${department}</td>
+              <td>${stream}</td>
+              <td>${bin}</td>
+              <td>${usedAt || '—'}</td>
+              <td>${expiresAt}</td>
+            </tr>`;
+        }).join('');
+
+        if (recentCount) recentCount.textContent = bodyRows.length;
+      } catch (e) { console.warn('recent refresh failed', e); }
+    }
+
+    // initial loads + intervals
+    refreshChart();
+    refreshRecent();
+    setInterval(refreshRecent, 5000);
+    setInterval(refreshChart, 15000);
+
+    filterForm?.addEventListener('submit', () => {
+      setTimeout(() => { refreshRecent(); refreshChart(); }, 150);
+    });
+
+    // ===== Add Employee modal & POST =====
+    const dlgAdd = document.getElementById('addEmployeeModal');
+    const openAddBtn = document.getElementById('openAddEmployee');
+    const cancelAddBtn = document.getElementById('cancelAddEmp');
+    const addForm = document.getElementById('addEmployeeForm');
+    const addMsg = document.getElementById('addEmpMsg');
+
+    function openAdd(){ addMsg.textContent=""; addForm.reset(); dlgAdd.showModal(); }
+    openAddBtn?.addEventListener('click', openAdd);
+    cancelAddBtn?.addEventListener('click', () => dlgAdd.close());
+
+    addForm?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      addMsg.textContent = "Saving...";
+      const payload = {
+        name: document.getElementById('empName').value.trim(),
+        dept_id: parseInt(document.getElementById('empDept').value, 10),
+        pin: document.getElementById('empPin').value.trim()
+      };
+      if (!/^\d{5}$/.test(payload.pin)) {
+        addMsg.textContent = "PIN must be exactly 5 digits.";
+        return;
+      }
+      try {
+        const res = await fetch('/employees', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+        });
+        const text = await res.text();
+        let data; try { data = JSON.parse(text); } catch { data = { error: text }; }
+        if (!res.ok) { addMsg.textContent = data.error || text || 'Failed to add employee.'; return; }
+        addMsg.textContent = `Added: ${data.name} (id=${data.emp_id}, dept=${data.dept_id})`;
+        toast('Employee added');
+        refreshRecent(); refreshChart();
+        setTimeout(() => { dlgAdd.close(); }, 650);
+      } catch (err) { console.error(err); addMsg.textContent = 'Network error.'; }
+    });
+
+    // Close dialogs on Escape
+    window.addEventListener('keydown', (e)=>{ if(e.key==='Escape'){ $$('dialog').forEach(d=>d.open && d.close()); } });
+
+    // ===== View Employees modal (GET /employees) =====
+    const dlgView = document.getElementById('viewEmployeesModal');
+    const openViewBtn = document.getElementById('openViewEmployees');
+    const closeViewBtn = document.getElementById('closeViewEmployees');
+    const empListStatus = document.getElementById('empListStatus');
+    const empTableBody = document.querySelector('#empTable tbody');
+
+    async function loadEmployees(){
+      empListStatus.textContent = 'Loading…';
+      empTableBody.innerHTML = '';
+      try {
+        const res = await fetch('/employees', { headers: { 'Accept': 'application/json' } });
+        const text = await res.text();
+        let data; try { data = JSON.parse(text); } catch { data = { error: text }; }
+        if (!res.ok) { empListStatus.textContent = data.error || text || 'Failed to fetch employees.'; return; }
+
+        const list = (data.employees || []);
+        if (!list.length) { empListStatus.textContent = 'No employees found.'; return; }
+        empListStatus.textContent = `Total: ${list.length}`;
+        for (const e of list) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${e.name}</td>
+            <td>${e.dept}</td>
+            <td>${e.emp_id}</td>
+            <td>${e.dept_id}</td>
+          `;
+          empTableBody.appendChild(tr);
+        }
+      } catch (err) {
+        console.error(err);
+        empListStatus.textContent = 'Network error.';
+      }
+    }
+
+    function openView(){ dlgView.showModal(); loadEmployees(); }
+    openViewBtn?.addEventListener('click', openView);
+    closeViewBtn?.addEventListener('click', () => dlgView.close());
+
+    // ===== Bin & Department Classifications =====
+    const dlgBin  = document.getElementById('binClassesModal');
+    const dlgDept = document.getElementById('deptClassesModal');
+
+    const openBinBtn  = document.getElementById('openBinClasses');
+    const openDeptBtn = document.getElementById('openDeptClasses');
+
+    const closeBinBtn  = document.getElementById('closeBinClasses');
+    const closeDeptBtn = document.getElementById('closeDeptClasses');
+
+    const binTableBody  = document.querySelector('#binClassesTable tbody');
+    const deptTableBody = document.querySelector('#deptClassesTable tbody');
+
+    async function fetchJSON(urls) {
+      for (const u of urls) {
+        try {
+          const r = await fetch(u, { headers: { 'Accept': 'application/json' } });
+          const t = await r.text();
+          let data; try { data = JSON.parse(t); } catch { data = { error: t }; }
+          if (r.ok) return data;
+        } catch { /* try next */ }
+      }
+      return null;
+    }
+
+    /* ===== Load live bins & map MAC via /streams ===== */
+    async function loadBinClasses() {
+      binTableBody.innerHTML = '';
+
+      // 1) Live bin telemetry
+      const live = await fetchJSON(['/bins/live.json']);
+      if (!live || !Array.isArray(live.bins)) {
+        binTableBody.innerHTML = `<tr><td colspan="5">Failed to load.</td></tr>`;
+        return;
+      }
+
+      // 2) Stream -> MAC mapping (first non-empty esp32_mac per stream)
+      const streams = await fetchJSON(['/streams']);
+      const macByStream = new Map();
+      if (Array.isArray(streams)) {
+        for (const s of streams) {
+          if (s && s.code && s.esp32_mac) macByStream.set(s.code, s.esp32_mac);
+        }
+      }
+
+      // 3) Build rows from live bins
+      const rows = live.bins.map(b => {
+        const tempC = (typeof b.temp_c === 'number') ? b.temp_c : null;
+        const rhPct = (typeof b.humidity_pct === 'number') ? b.humidity_pct : null;
+
+        let door = null;
+        if (typeof b.door_open === 'number') door = b.door_open === 1 ? 'open' : 'closed';
+        if (!door && typeof b.door_status === 'string' && b.door_status.trim()) {
+          door = b.door_status.trim().toLowerCase();
+        }
+
+        return {
+          name: b.bin_name || '',
+          mac: macByStream.get(b.stream_code) || '',
+          tempC,
+          rhPct,
+          door
+        };
+      });
+
+      rows.sort((a,b) => a.name.localeCompare(b.name));
+
+      if (!rows.length) {
+        binTableBody.innerHTML = `<tr><td colspan="5">No bins found.</td></tr>`;
+        return;
+      }
+
+      binTableBody.innerHTML = rows.map(r => {
+        const tempTxt = (r.tempC != null) ? r.tempC.toFixed(1) : '—';
+        const rhTxt   = (r.rhPct != null) ? r.rhPct.toFixed(1) : '—';
+
+        let doorCell = '—';
+        if (r.door === 'open' || r.door === 'opened' || r.door === '1') {
+          doorCell = `<span class="pill pill-warn">open</span>`;
+        } else if (r.door === 'closed' || r.door === '0') {
+          doorCell = `<span class="pill pill-ok">closed</span>`;
+        }
+
+        return `
+          <tr>
+            <td>${r.name}</td>
+            <td>${r.mac || '—'}</td>
+            <td>${tempTxt}</td>
+            <td>${rhTxt}</td>
+            <td>${doorCell}</td>
+          </tr>`;
+      }).join('');
+    }
+
+    async function loadDeptClasses() {
+      deptTableBody.innerHTML = '';
+      const data = await fetchJSON(['/departments/classes', '/departments']);
+      if (!data) { deptTableBody.innerHTML = `<tr><td colspan="3">Failed to load.</td></tr>`; return; }
+
+      let list = data.departments || data;
+      if (!Array.isArray(list)) list = [];
+
+      const norm = list.map(d => ({
+        id: Number(d.id ?? d.dept_id ?? d.department_id ?? 0),
+        name: d.name ?? d.dept ?? d.title ?? '',
+        code: d.code ?? d.abbr ?? d.short_code ?? d.dept_code ?? '—'
+      })).sort((a,b) => a.id - b.id);
+
+      if (!norm.length) {
+        deptTableBody.innerHTML = `<tr><td colspan="3">No departments found.</td></tr>`;
+        return;
+      }
+
+      norm.forEach(d => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${d.id}</td><td>${d.name}</td><td>${d.code}</td>`;
+        deptTableBody.appendChild(tr);
+      });
+    }
+
+    function openBin()  { dlgBin.showModal();  loadBinClasses(); }
+    function openDept() { dlgDept.showModal(); loadDeptClasses(); }
+
+    openBinBtn?.addEventListener('click', openBin);
+    openDeptBtn?.addEventListener('click', openDept);
+
+    closeBinBtn?.addEventListener('click', () => dlgBin.close());
+    closeDeptBtn?.addEventListener('click', () => dlgDept.close());
+
+    /* ===== LIVE BIN TELEMETRY: SSE + fallback ===== */
+    const liveBodyEl = document.getElementById('live-bins-body');
+    const liveTsEl   = document.getElementById('live-bins-ts');
+    const liveState  = new Map(); // bin_id -> rowData
+
+    function fmtNum(v, digits=1){
+      if (v === null || v === undefined) return '—';
+      if (typeof v === 'number') return v.toFixed(digits);
+      const n = Number(v);
+      return Number.isFinite(n) ? n.toFixed(digits) : '—';
+    }
+
+    function renderLive(){
+      const rows = Array.from(liveState.values()).sort((a,b)=> String(a.bin_name||'').localeCompare(String(b.bin_name||'')));
+      liveBodyEl.innerHTML = rows.map(r => `
+        <tr data-bin="${r.bin_id}">
+          <td style="padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.06);">${r.bin_name || ('Bin ' + r.bin_id)}</td>
+          <td style="padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.06);">${r.location || ''}</td>
+          <td style="padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.06);">${r.stream_code || ''}</td>
+          <td style="padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.06);">${fmtNum(r.temp_c)}</td>
+          <td style="padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.06);">${fmtNum(r.humidity_pct)}</td>
+          <td style="padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.06);">${r.door_status || ''}</td>
+          <td style="padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.06);">${r.last_seen || ''}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function seedLive(){
+      try {
+        const resp = await fetch('/bins/live.json', {cache:'no-store'});
+        const j = await resp.json();
+        liveTsEl.textContent = 'seeded at ' + (j.ts || new Date().toISOString());
+        (j.bins||[]).forEach(b => {
+          liveState.set(b.bin_id, {
+            bin_id: b.bin_id,
+            bin_name: b.bin_name,
+            location: b.location,
+            stream_code: b.stream_code,
+            temp_c: b.temp_c ?? null,
+            humidity_pct: b.humidity_pct ?? null,
+            door_status: b.door_status || '',
+            last_seen: b.last_seen || ''
+          });
+        });
+        renderLive();
+      } catch {
+        liveTsEl.textContent = 'seed failed';
+      }
+    }
+
+    function applyTelemetry(msg){
+      const r = liveState.get(msg.bin_id) || {bin_id: msg.bin_id, bin_name: `Bin ${msg.bin_id}`};
+      if (msg.temp_c !== undefined)       r.temp_c = msg.temp_c;
+      if (msg.humidity_pct !== undefined) r.humidity_pct = msg.humidity_pct;
+      if (msg.door_status)                r.door_status = msg.door_status;
+      if (msg.last_seen)                  r.last_seen = msg.last_seen;
+      liveState.set(msg.bin_id, r);
+      renderLive();
+    }
+
+    // Seed once
+    seedLive();
+
+    // Try SSE; fallback to polling every 3s
+    let livePollTimer = null;
+    function startLivePolling(){
+      if (livePollTimer) return;
+      liveTsEl.textContent = 'live: polling every 3s (SSE unavailable)';
+      livePollTimer = setInterval(seedLive, 3000);
+    }
+
+    try {
+      const es = new EventSource('/bins/live.sse');
+      liveTsEl.textContent = 'live: connected (SSE)';
+      es.onmessage = (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          if (payload.type === 'telemetry' && payload.data) {
+            applyTelemetry(payload.data);
+          }
+        } catch {}
+      };
+      es.onerror = () => {
+        es.close();
+        startLivePolling();
+      };
+    } catch {
+      startLivePolling();
+    }
+    /* ===== END LIVE BIN TELEMETRY ===== */
+
+  })();
+  </script>
+</body>
+</html>
