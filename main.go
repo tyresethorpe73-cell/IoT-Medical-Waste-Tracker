@@ -1378,5 +1378,6 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 		"labels":    labels,
 		"generated": genSeries,
 		"used":      usedSeries,
+		//tytrere
 	})
 }
