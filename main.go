@@ -1149,22 +1149,22 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	var counts adminCounts
 	if err := db.QueryRow(`SELECT COUNT(*) FROM employees`).Scan(&counts.Employees); err != nil {
-		bad(w, 500, "db")
+		bad(w, 500, "db1")
 		return
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM departments`).Scan(&counts.Departments); err != nil {
-		bad(w, 500, "db")
+		bad(w, 500, "db2")
 		return
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM bins`).Scan(&counts.Bins); err != nil {
-		bad(w, 500, "db")
+		bad(w, 500, "db3")
 		return
 	}
 	if err := db.QueryRow(`
 		SELECT COUNT(*) FROM uuid_logs
 		WHERE is_used=0 AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
 	`).Scan(&counts.ActiveUUIDs); err != nil {
-		bad(w, 500, "db")
+		bad(w, 500, "db4")
 		return
 	}
 
