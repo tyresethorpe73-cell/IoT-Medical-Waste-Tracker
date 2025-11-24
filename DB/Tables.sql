@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS uuid_logs (
     uuid_value VARCHAR(100) NOT NULL,
     emp_id INT,
     bin_id INT,
+    is_used TINYINT(1) DEFAULT 0,
+    expires_at TIMESTAMP NULL,
     generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
@@ -87,7 +89,6 @@ CREATE TABLE IF NOT EXISTS uuid_logs (
         ON UPDATE CASCADE
         ON DELETE SET NULL
 );
-
 -- =====================================================
 -- OPTIONAL SEED DATA (SAFE EMPTY INSERTS)
 -- =====================================================
