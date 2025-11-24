@@ -94,3 +94,9 @@ CREATE TABLE IF NOT EXISTS uuid_logs (
 INSERT INTO departments (dept_name) VALUES
 ("General"), ("Emergency"), ("Surgery"), ("Pharmacy"), ("Nuclear Medicine");
 
+CREATE USER 'tracker'@'localhost' IDENTIFIED BY 'Rootpass2025';
+GRANT SELECT, INSERT, UPDATE, DELETE
+ON iot_medical_waste_tracker.*
+TO 'tracker'@'localhost';
+FLUSH PRIVILEGES;
+
