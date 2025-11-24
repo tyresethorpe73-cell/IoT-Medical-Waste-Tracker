@@ -175,7 +175,7 @@ func doorText(v *int) string {
 func main() {
 	var err error
 	// ✅ UTC everywhere
-	dsn := "tracker:StrongLocalPass!123@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=UTC"
+	dsn := "tracker:Rootpass2025@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=UTC"
 
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
