@@ -31,44 +31,72 @@ type liveReading struct {
 	BinID     int       `json:"bin_id"`
 	Temp      *float64  `json:"temp_c"`
 	Humidity  *float64  `json:"humidity_pct"`
-	DoorOpen  *int      `json:"door_open"` // 1=open, 0=closed (live only)
-	LastSeen  time.Time `json:"-"`         // internal
-	LastSeenS string    `json:"last_seen"` // RFC3339 UTC for dashboard
+	DoorOpen  *int      `json:"door_open"`
+	LastSeen  time.Time `json:"-"`
+	LastSeenS string    `json:"last_seen"`
 }
 
 var (
 	liveMu    sync.RWMutex
-	liveByBin = map[int]liveReading{} // bin_id -> latest live reading
+	liveByBin = map[int]liveReading{}
 )
 
-// ========== SSE (push updates to dashboard) ==========
+// ========== SSE (push live updates to dashboard) ==========
 type sseMsg struct {
-	Type string      `json:"type"` // "telemetry" | "snapshot"
+	Type string      `json:"type"` // telemetry | snapshot | counts
 	Data interface{} `json:"data"`
 }
 
 var (
-	sseMu      sync.RWMutex
 	sseClients = map[chan []byte]struct{}{}
+	sseMu      sync.RWMutex
 )
 
 func sseBroadcast(msg sseMsg) {
 	b, _ := json.Marshal(msg)
-	b = append([]byte("data: "), b...)
-	b = append(b, []byte("\n\n")...)
+
+	out := []byte("event: " + msg.Type + "\n")
+	out = append(out, []byte("data: "+string(b)+"\n\n")...)
 
 	sseMu.RLock()
-	defer sseMu.RUnlock()
 	for ch := range sseClients {
 		select {
-		case ch <- b:
+		case ch <- out:
 		default:
-			// slow client; drop message
 		}
 	}
+	sseMu.RUnlock()
 }
 
-// --- CORS helper (same-file UI or cross-origin) ---
+// ========== ACTIVE UUID COUNTS ==========
+
+func getActiveUUIDCount() int {
+	var n int
+	err := db.QueryRow(`
+        SELECT COUNT(*)
+        FROM uuid_logs
+        WHERE is_used = 0
+          AND expires_at IS NOT NULL
+          AND UTC_TIMESTAMP() < expires_at
+    `).Scan(&n)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+type countMsg struct {
+	Active int `json:"active"`
+}
+
+func broadcastActiveUUIDCount() {
+	sseBroadcast(sseMsg{
+		Type: "counts",
+		Data: countMsg{Active: getActiveUUIDCount()},
+	})
+}
+
+// --- CORS helper ---
 func allowCORS(w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -80,14 +108,16 @@ func allowCORS(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+// ---------- LIVE SSE ----------
 func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // proxy/CDN friendliness
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -95,15 +125,12 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// new client channel (buffered)
 	ch := make(chan []byte, 64)
 
-	// register
 	sseMu.Lock()
 	sseClients[ch] = struct{}{}
 	sseMu.Unlock()
 
-	// cleanup on exit
 	defer func() {
 		sseMu.Lock()
 		delete(sseClients, ch)
@@ -113,11 +140,10 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// initial comment + flush
 	_, _ = w.Write([]byte(": connected\n\n"))
 	flusher.Flush()
 
-	// send initial snapshot so client sees something immediately
+	// initial snapshot
 	go func() {
 		liveMu.RLock()
 		type snapRow struct {
@@ -131,12 +157,24 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 		var all []snapRow
 		for _, lr := range liveByBin {
 			all = append(all, snapRow{
-				BinID: lr.BinID, Temp: lr.Temp, Humidity: lr.Humidity,
-				DoorOpen: lr.DoorOpen, DoorStatus: doorText(lr.DoorOpen), LastSeen: lr.LastSeenS,
+				BinID:      lr.BinID,
+				Temp:       lr.Temp,
+				Humidity:   lr.Humidity,
+				DoorOpen:   lr.DoorOpen,
+				DoorStatus: doorText(lr.DoorOpen),
+				LastSeen:   lr.LastSeenS,
 			})
 		}
 		liveMu.RUnlock()
-		msg := sseMsg{Type: "snapshot", Data: map[string]any{"bins": all, "ts": utcNow().Format(time.RFC3339)}}
+
+		msg := sseMsg{
+			Type: "snapshot",
+			Data: map[string]any{
+				"bins": all,
+				"ts":   utcNow().Format(time.RFC3339),
+			},
+		}
+
 		b, _ := json.Marshal(msg)
 		ch <- append(append([]byte("data: "), b...), []byte("\n\n")...)
 	}()
@@ -148,9 +186,11 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
+
 		case <-heartbeat.C:
 			_, _ = w.Write([]byte(": ping\n\n"))
 			flusher.Flush()
+
 		case b := <-ch:
 			_, _ = w.Write(b)
 			flusher.Flush()
@@ -160,7 +200,6 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 
 func utcNow() time.Time { return time.Now().UTC() }
 
-// doorText converts 0/1 pointer to user label
 func doorText(v *int) string {
 	if v == nil {
 		return ""
@@ -174,7 +213,7 @@ func doorText(v *int) string {
 // ========== MAIN ==========
 func main() {
 	var err error
-	// ✅ UTC everywhere
+
 	dsn := "tracker:Rootpass2025@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=UTC"
 
 	db, err = sql.Open("mysql", dsn)
@@ -184,72 +223,73 @@ func main() {
 	if err = db.Ping(); err != nil {
 		log.Fatal("❌ Database connection failed:", err)
 	}
+
 	if _, err := db.Exec(`SET time_zone = '+00:00'`); err != nil {
 		log.Fatal("❌ Failed to set MySQL time_zone to UTC:", err)
 	}
-	fmt.Println("✅ Connected to MySQL successfully (UTC mode)!")
 
-	// Chart JSON for dashboard (register ONCE)
+	fmt.Println("✅ Connected to MySQL (UTC mode)")
+
+	// AUTO-SSE COUNT REFRESH
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			broadcastActiveUUIDCount()
+		}
+	}()
+
+	// ===== ROUTES =====
 	http.HandleFunc("/admin/chart.json", handleAdminChartJSON)
+	http.HandleFunc("/streams", handleListStreams)
+	http.HandleFunc("/departments", handleListDepartments)
+	http.HandleFunc("/departments/classes", handleListDepartments)
 
-	// Reference data
-	http.HandleFunc("/streams", handleListStreams)                 // GET
-	http.HandleFunc("/departments", handleListDepartments)         // GET
-	http.HandleFunc("/departments/classes", handleListDepartments) // alias
-	http.HandleFunc("/bins", handleListBins)                       // GET ?stream_code=..
-	http.HandleFunc("/bins/summary", handleBinsSummary)            // GET (includes live T/H/Door)
+	http.HandleFunc("/bins", handleListBins)
+	http.HandleFunc("/bins/summary", handleBinsSummary)
+	http.HandleFunc("/bins/live.json", handleBinsLiveJSON)
+	http.HandleFunc("/bins/live.sse", handleBinsLiveSSE)
+	http.HandleFunc("/bins/live.peek", handleBinsLivePeek)
 
-	// Admin dashboard
 	http.HandleFunc("/admin", handleAdmin)
 	http.HandleFunc("/admin/export.csv", handleAdminExport)
 
-	// Employees (GET list, POST create)
 	http.HandleFunc("/employees", handleEmployees)
 
-	// Auth & UUID lifecycle
-	http.HandleFunc("/auth/pin", handleAuthPIN)                       // POST {pin}
-	http.HandleFunc("/uuid/create/from-pin", handleUUIDCreateFromPIN) // POST {pin, stream_code}
-	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)          // POST {emp_id, dept_id, stream_code, [bin_id]}
-	http.HandleFunc("/bin/consume", handleBinConsume)                 // POST {bin_id, uuid}
+	http.HandleFunc("/auth/pin", handleAuthPIN)
+	http.HandleFunc("/uuid/create/from-pin", handleUUIDCreateFromPIN)
+	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)
 
-	// 🔹 Telemetry (realtime in memory + daily averages in DB)
-	http.HandleFunc("/bin/telemetry", handleBinTelemetry)  // POST {bin_id, temp, humidity, door_open}
-	http.HandleFunc("/bins/live.json", handleBinsLiveJSON) // GET snapshot (polling)
-	http.HandleFunc("/bins/live.sse", handleBinsLiveSSE)   // GET Server-Sent Events (push)
-	http.HandleFunc("/bins/live.peek", handleBinsLivePeek) // GET simple smoke test
+	http.HandleFunc("/bin/consume", handleBinConsume)
+	http.HandleFunc("/bin/telemetry", handleBinTelemetry)
 
-	// Tiny client JS to wire up SSE on any page
 	http.HandleFunc("/static/live.js", handleLiveJS)
-
-	// Demo route
 	http.HandleFunc("/generate_uuid", handleGenerateUUID)
 
 	fmt.Println("🚀 Server running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-/* ---------- helpers ---------- */
-
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
+
 func bad(w http.ResponseWriter, code int, msg string) {
 	http.Error(w, msg, code)
 }
 
-// buildFilters builds a WHERE clause + args from URL params for admin views.
+/* ---------- buildFilters ---------- */
+
 func buildFilters(r *http.Request) (string, []any) {
 	where := " WHERE 1=1 "
 	args := []any{}
 
-	// department filter (now via employees join in admin queries)
 	if d := r.URL.Query().Get("dept"); d != "" {
 		where += " AND d.dept_id = ? "
 		args = append(args, d)
 	}
 
-	// status filter (UTC)
 	switch r.URL.Query().Get("status") {
 	case "active":
 		where += " AND ul.is_used = 0 AND (ul.expires_at IS NULL OR UTC_TIMESTAMP() < ul.expires_at) "
@@ -259,7 +299,6 @@ func buildFilters(r *http.Request) (string, []any) {
 		where += " AND ul.is_used = 0 AND ul.expires_at IS NOT NULL AND UTC_TIMESTAMP() > ul.expires_at "
 	}
 
-	// recent days window based on generated_at (rolling)
 	if days := r.URL.Query().Get("days"); days != "" {
 		where += " AND ul.generated_at >= (UTC_TIMESTAMP() - INTERVAL ? DAY) "
 		args = append(args, days)
@@ -270,11 +309,11 @@ func buildFilters(r *http.Request) (string, []any) {
 
 /* ---------- reference data ---------- */
 
-// One row per stream plus an esp32_mac sample (first non-empty via MAX()).
 func handleListStreams(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
+
 	rows, err := db.Query(`
 		SELECT
 			ws.waste_stream_id,
@@ -300,6 +339,7 @@ func handleListStreams(w http.ResponseWriter, r *http.Request) {
 		Hazardous bool   `json:"hazardous"`
 		ESP32MAC  string `json:"esp32_mac"`
 	}
+
 	var out []row
 	for rows.Next() {
 		var rr row
@@ -311,14 +351,15 @@ func handleListStreams(w http.ResponseWriter, r *http.Request) {
 		rr.Hazardous = hz == 1
 		out = append(out, rr)
 	}
+
 	writeJSON(w, out)
 }
 
-// Include dept code if present; fallback if column missing. Sort by dept_id ASC.
 func handleListDepartments(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
+
 	type row struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
@@ -331,7 +372,7 @@ func handleListDepartments(w http.ResponseWriter, r *http.Request) {
 		ORDER BY dept_id ASC
 	`)
 	if err != nil {
-		// Fallback if dept_code doesn't exist
+		// fallback: no dept_code column
 		rows, err = db.Query(`
 			SELECT dept_id, dept_name
 			FROM departments
@@ -353,9 +394,11 @@ func handleListDepartments(w http.ResponseWriter, r *http.Request) {
 			rr.Code = ""
 			out = append(out, rr)
 		}
+
 		writeJSON(w, map[string]any{"departments": out})
 		return
 	}
+
 	defer rows.Close()
 
 	var out []row
@@ -367,6 +410,7 @@ func handleListDepartments(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, rr)
 	}
+
 	writeJSON(w, map[string]any{"departments": out})
 }
 
@@ -374,16 +418,20 @@ func handleListBins(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
-	q := `SELECT b.bin_id, b.bin_name, b.location, ws.code
-	      FROM bins b
-	      JOIN waste_streams ws ON ws.waste_stream_id=b.waste_stream_id
-	      WHERE 1=1`
+
+	q := `
+		SELECT b.bin_id, b.bin_name, b.location, ws.code
+		FROM bins b
+		JOIN waste_streams ws ON ws.waste_stream_id=b.waste_stream_id
+		WHERE 1=1
+	`
 	args := []any{}
 
 	if streamCode := r.URL.Query().Get("stream_code"); streamCode != "" {
 		q += " AND ws.code = ?"
 		args = append(args, streamCode)
 	}
+
 	q += " ORDER BY b.bin_name"
 
 	rows, err := db.Query(q, args...)
@@ -399,21 +447,25 @@ func handleListBins(w http.ResponseWriter, r *http.Request) {
 		Location string `json:"location"`
 		Stream   string `json:"stream_code"`
 	}
+
 	var out []row
 	for rows.Next() {
 		var rr row
-		_ = rows.Scan(&rr.BinID, &rr.BinName, &rr.Location, &rr.Stream)
-		out = append(out, rr)
+		if err := rows.Scan(&rr.BinID, &rr.BinName, &rr.Location, &rr.Stream); err == nil {
+			out = append(out, rr)
+		}
 	}
+
 	writeJSON(w, out)
 }
 
-/* ---------- /bins/summary: per WASTE STREAM + latest LIVE (Temp/Humidity/Door/LastSeen) ---------- */
+/* ---------- /bins/summary ---------- */
+
 func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
-	// Load all streams and bins in one query, then pick the latest live reading per stream.
+
 	rows, err := db.Query(`
 		SELECT
 			ws.waste_stream_id,
@@ -438,7 +490,7 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 		Humidity        *float64 `json:"humidity_pct"`
 		DoorOpen        *int     `json:"door_open"`
 		DoorStatus      string   `json:"door_status"`
-		DoorStatusCamel string   `json:"doorStatus"` // alias for FE that expects camelCase
+		DoorStatusCamel string   `json:"doorStatus"`
 		LastSeen        string   `json:"last_seen"`
 	}
 
@@ -451,6 +503,7 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 		var sid int
 		var sname, mac string
 		var binID sql.NullInt64
+
 		if err := rows.Scan(&sid, &sname, &binID, &mac); err != nil {
 			bad(w, 500, "scan")
 			return
@@ -458,17 +511,27 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 
 		sr, ok := byStream[sid]
 		if !ok {
-			sr = &streamRow{ID: sid, Name: sname, ESP32MAC: "", TempC: nil, Humidity: nil, DoorOpen: nil, DoorStatus: "", DoorStatusCamel: "", LastSeen: ""}
+			sr = &streamRow{
+				ID:              sid,
+				Name:            sname,
+				ESP32MAC:        "",
+				TempC:           nil,
+				Humidity:        nil,
+				DoorOpen:        nil,
+				DoorStatus:      "",
+				DoorStatusCamel: "",
+				LastSeen:        "",
+			}
 			byStream[sid] = sr
 		}
-		// keep any non-empty MAC (or overwrite with a real one later)
+
 		if sr.ESP32MAC == "" && mac != "" {
 			sr.ESP32MAC = mac
 		}
 
-		// If this stream has a bin, check for a live reading and keep the most recent
 		if binID.Valid {
 			if lr, ok2 := liveByBin[int(binID.Int64)]; ok2 {
+
 				if sr.LastSeen == "" {
 					sr.TempC = lr.Temp
 					sr.Humidity = lr.Humidity
@@ -497,7 +560,6 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Flatten to ordered slice (by stream id for stable UI)
 	ids := make([]int, 0, len(byStream))
 	for id := range byStream {
 		ids = append(ids, id)
@@ -512,11 +574,12 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"classes": out})
 }
 
-/* ---------- auth ---------- */
+/* ---------- AUTH ---------- */
 
 type pinReq struct {
 	PIN string `json:"pin"`
 }
+
 type pinResp struct {
 	EmpID  int    `json:"emp_id"`
 	Name   string `json:"name"`
@@ -528,11 +591,13 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		bad(w, 405, "POST only")
 		return
 	}
+
 	var req pinReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		bad(w, 400, "bad json")
 		return
 	}
+
 	if len(req.PIN) != 5 {
 		bad(w, 400, "need 5-digit pin")
 		return
@@ -540,12 +605,14 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 
 	var empID, deptID int
 	var name string
+
 	err := db.QueryRow(`
 		SELECT emp_id, emp_name, dept_id
 		FROM employees
 		WHERE emp_pin = ?
 		LIMIT 1
 	`, req.PIN).Scan(&empID, &name, &deptID)
+
 	if err == sql.ErrNoRows {
 		bad(w, 401, "invalid pin")
 		return
@@ -554,21 +621,24 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, "db")
 		return
 	}
+
 	writeJSON(w, pinResp{EmpID: empID, Name: name, DeptID: deptID})
 }
 
-/* ---------- employees (GET list, POST create) ---------- */
+/* ---------- EMPLOYEES ---------- */
 
 type empCreateReq struct {
 	Name   string `json:"name"`
 	DeptID int    `json:"dept_id"`
-	PIN    string `json:"pin"` // 5 digits
+	PIN    string `json:"pin"`
 }
+
 type empCreateResp struct {
 	EmpID  int    `json:"emp_id"`
 	Name   string `json:"name"`
 	DeptID int    `json:"dept_id"`
 }
+
 type empListRow struct {
 	EmpID  int    `json:"emp_id"`
 	Name   string `json:"name"`
@@ -578,6 +648,7 @@ type empListRow struct {
 
 func handleEmployees(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
+
 	case http.MethodGet:
 		rows, err := db.Query(`
 			SELECT e.emp_id, e.emp_name, e.dept_id, d.dept_name
@@ -600,6 +671,7 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, rr)
 		}
+
 		writeJSON(w, map[string]any{"employees": out})
 		return
 
@@ -609,37 +681,42 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 			bad(w, 400, "bad json")
 			return
 		}
+
 		if req.Name == "" || req.DeptID == 0 || len(req.PIN) != 5 {
-			bad(w, 400, "need name, dept_id, 5-digit pin")
-			return
-		}
-		var tmp int
-		if err := db.QueryRow(`SELECT 1 FROM departments WHERE dept_id=?`, req.DeptID).Scan(&tmp); err != nil {
-			if err == sql.ErrNoRows {
-				bad(w, 400, "unknown department")
-				return
-			}
-			bad(w, 500, "db(departments)")
+			bad(w, 400, "need name, dept_id, and 5-digit pin")
 			return
 		}
 
-		if err := db.QueryRow(`SELECT 1 FROM employees WHERE emp_pin=?`, req.PIN).Scan(&tmp); err == nil {
+		var exists int
+		if err := db.QueryRow(`
+			SELECT 1 FROM departments WHERE dept_id=?
+		`, req.DeptID).Scan(&exists); err == sql.ErrNoRows {
+			bad(w, 400, "unknown department")
+			return
+		}
+
+		if err := db.QueryRow(`
+			SELECT 1 FROM employees WHERE emp_pin=?
+		`, req.PIN).Scan(&exists); err == nil {
 			bad(w, 409, "pin already in use")
 			return
-		} else if err != sql.ErrNoRows {
-			bad(w, 500, "db(employees)")
-			return
 		}
 
-		res, err := db.Exec(`INSERT INTO employees (emp_name, dept_id, emp_pin) VALUES (?, ?, ?)`,
-			req.Name, req.DeptID, req.PIN)
+		res, err := db.Exec(`
+			INSERT INTO employees (emp_name, dept_id, emp_pin)
+			VALUES (?, ?, ?)
+		`, req.Name, req.DeptID, req.PIN)
 		if err != nil {
 			bad(w, 500, "insert")
 			return
 		}
-		id64, _ := res.LastInsertId()
 
-		writeJSON(w, empCreateResp{EmpID: int(id64), Name: req.Name, DeptID: req.DeptID})
+		id64, _ := res.LastInsertId()
+		writeJSON(w, empCreateResp{
+			EmpID:  int(id64),
+			Name:   req.Name,
+			DeptID: req.DeptID,
+		})
 		return
 
 	default:
@@ -648,7 +725,7 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-/* ---------- uuid create (LEGACY body) ---------- */
+/* ---------- UUID CREATE (legacy) ---------- */
 
 type createReq struct {
 	EmpID      int    `json:"emp_id"`
@@ -656,6 +733,7 @@ type createReq struct {
 	StreamCode string `json:"stream_code"`
 	BinID      *int   `json:"bin_id,omitempty"`
 }
+
 type createResp struct {
 	UUID      string    `json:"uuid"`
 	BinID     int       `json:"bin_id"`
@@ -667,39 +745,57 @@ func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
 		bad(w, 405, "POST only")
 		return
 	}
+
 	var req createReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		bad(w, 400, "bad json")
 		return
 	}
+
 	if req.EmpID == 0 || req.DeptID == 0 || req.StreamCode == "" {
 		bad(w, 400, "missing fields")
 		return
 	}
 
 	var tmp int
-	if err := db.QueryRow(`SELECT 1 FROM employees WHERE emp_id=? AND dept_id=?`, req.EmpID, req.DeptID).Scan(&tmp); err != nil {
-		if err == sql.ErrNoRows {
-			bad(w, 400, "employee not in department")
-			return
-		}
+	err := db.QueryRow(`
+		SELECT 1 FROM employees
+		WHERE emp_id=? AND dept_id=?
+	`, req.EmpID, req.DeptID).Scan(&tmp)
+
+	if err == sql.ErrNoRows {
+		bad(w, 400, "employee not in department")
+		return
+	}
+	if err != nil {
 		bad(w, 500, "db")
 		return
 	}
 
 	var streamID int
-	if err := db.QueryRow(`SELECT waste_stream_id FROM waste_streams WHERE code=?`, req.StreamCode).Scan(&streamID); err != nil {
-		if err == sql.ErrNoRows {
-			bad(w, 400, "unknown stream code")
-			return
-		}
+	err = db.QueryRow(`
+		SELECT waste_stream_id
+		FROM waste_streams
+		WHERE code=?
+	`, req.StreamCode).Scan(&streamID)
+
+	if err == sql.ErrNoRows {
+		bad(w, 400, "unknown stream code")
+		return
+	}
+	if err != nil {
 		bad(w, 500, "db")
 		return
 	}
 
 	var binID int
 	if req.BinID == nil {
-		err := db.QueryRow(`SELECT bin_id FROM bins WHERE waste_stream_id=? ORDER BY bin_id LIMIT 1`, streamID).Scan(&binID)
+		err := db.QueryRow(`
+			SELECT bin_id FROM bins
+			WHERE waste_stream_id=?
+			ORDER BY bin_id LIMIT 1
+		`, streamID).Scan(&binID)
+
 		if err == sql.ErrNoRows {
 			bad(w, 404, "no bin for that stream")
 			return
@@ -708,8 +804,13 @@ func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
 			bad(w, 500, "db")
 			return
 		}
+
 	} else {
-		err := db.QueryRow(`SELECT 1 FROM bins WHERE bin_id=? AND waste_stream_id=?`, *req.BinID, streamID).Scan(&tmp)
+		err := db.QueryRow(`
+			SELECT 1 FROM bins
+			WHERE bin_id=? AND waste_stream_id=?
+		`, *req.BinID, streamID).Scan(&tmp)
+
 		if err == sql.ErrNoRows {
 			bad(w, 400, "bin mismatch for stream")
 			return
@@ -718,30 +819,35 @@ func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
 			bad(w, 500, "db")
 			return
 		}
+
 		binID = *req.BinID
 	}
 
 	code := uuid.New().String()
-	exp := utcNow().Add(72 * time.Hour)
+	exp := utcNow().Add(24 * time.Hour)
 
-	_, err := db.Exec(`
+	_, err = db.Exec(`
 		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
-		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0)`,
-		code, req.EmpID, binID, exp)
+		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0)
+	`, code, req.EmpID, binID, exp)
+
 	if err != nil {
 		bad(w, 500, "insert")
 		return
 	}
 
+	broadcastActiveUUIDCount()
+
 	writeJSON(w, createResp{UUID: code, BinID: binID, ExpiresAt: exp})
 }
 
-/* ---------- uuid create (PIN + stream_code) ---------- */
+/* ---------- UUID CREATE (via PIN) ---------- */
 
 type createFromPinReq struct {
 	PIN        string `json:"pin"`
 	StreamCode string `json:"stream_code"`
 }
+
 type createFromPinResp struct {
 	UUID      string    `json:"uuid"`
 	BinID     int       `json:"bin_id"`
@@ -762,6 +868,7 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		bad(w, 400, "bad json")
 		return
 	}
+
 	if len(req.PIN) != 5 || req.StreamCode == "" {
 		bad(w, 400, "need 5-digit pin and stream_code")
 		return
@@ -769,18 +876,20 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 
 	var empID, deptID int
 	var empName string
+
 	err := db.QueryRow(`
 		SELECT emp_id, emp_name, dept_id
 		FROM employees
 		WHERE emp_pin = ?
 		LIMIT 1
 	`, req.PIN).Scan(&empID, &empName, &deptID)
+
 	if err == sql.ErrNoRows {
 		bad(w, 401, "invalid pin")
 		return
 	}
 	if err != nil {
-		bad(w, 500, "db (employees)")
+		bad(w, 500, "db")
 		return
 	}
 
@@ -791,12 +900,13 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		WHERE code = ?
 		LIMIT 1
 	`, req.StreamCode).Scan(&streamID)
+
 	if err == sql.ErrNoRows {
 		bad(w, 400, "unknown stream_code")
 		return
 	}
 	if err != nil {
-		bad(w, 500, "db (waste_streams)")
+		bad(w, 500, "db")
 		return
 	}
 
@@ -808,27 +918,29 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		ORDER BY RAND()
 		LIMIT 1
 	`, streamID).Scan(&binID)
+
 	if err == sql.ErrNoRows {
-		bad(w, 404, "no bin available for that stream")
+		bad(w, 404, "no bin for that stream")
 		return
 	}
 	if err != nil {
-		log.Printf("bins query error: %v", err)
-		bad(w, 500, "db (bins)")
+		bad(w, 500, "db")
 		return
 	}
 
 	code := uuid.New().String()
-	exp := utcNow().Add(5 * time.Minute)
+	exp := utcNow().Add(24 * time.Hour)
 
 	_, err = db.Exec(`
 		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
 		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0)
 	`, code, empID, binID, exp)
 	if err != nil {
-		bad(w, 500, "insert (uuid_logs)")
+		bad(w, 500, "insert")
 		return
 	}
+
+	broadcastActiveUUIDCount()
 
 	writeJSON(w, createFromPinResp{
 		UUID:      code,
@@ -840,12 +952,13 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-/* ---------- consume at bin ---------- */
+/* ---------- CONSUME (BIN CONFIRMATION) ---------- */
 
 type consumeReq struct {
 	BinID int    `json:"bin_id"`
 	UUID  string `json:"uuid"`
 }
+
 type okResp struct {
 	OK bool `json:"ok"`
 }
@@ -855,22 +968,28 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		bad(w, 405, "POST only")
 		return
 	}
+
 	var req consumeReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		bad(w, 400, "bad json")
 		return
 	}
+
 	if req.BinID == 0 || req.UUID == "" {
 		bad(w, 400, "need bin_id and uuid")
 		return
 	}
 
 	var isUsed int
-	var expires time.Time
+	var expires *time.Time
+
 	err := db.QueryRow(`
-		SELECT is_used, IFNULL(expires_at, UTC_TIMESTAMP())
-		FROM uuid_logs WHERE uuid_value=? AND bin_id=? LIMIT 1`, req.UUID, req.BinID).
-		Scan(&isUsed, &expires)
+		SELECT is_used, expires_at
+		FROM uuid_logs
+		WHERE uuid_value=? AND bin_id=?
+		LIMIT 1
+	`, req.UUID, req.BinID).Scan(&isUsed, &expires)
+
 	if err == sql.ErrNoRows {
 		bad(w, 404, "uuid not found for this bin")
 		return
@@ -879,38 +998,47 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, "db")
 		return
 	}
+
 	if isUsed == 1 {
 		bad(w, 409, "already used")
 		return
 	}
+
 	if utcNow().After(expires.UTC()) {
 		bad(w, 410, "expired")
 		return
 	}
 
-	_, err = db.Exec(`UPDATE uuid_logs SET is_used=1, used_at=UTC_TIMESTAMP() WHERE uuid_value=? AND bin_id=?`, req.UUID, req.BinID)
+	_, err = db.Exec(`
+		UPDATE uuid_logs
+		SET is_used=1, used_at=UTC_TIMESTAMP()
+		WHERE uuid_value=? AND bin_id=?
+	`, req.UUID, req.BinID)
+
 	if err != nil {
 		bad(w, 500, "update")
 		return
 	}
 
+	broadcastActiveUUIDCount()
+
 	writeJSON(w, okResp{OK: true})
 }
 
-/* ---------- telemetry (LIVE + DAILY AVG) ---------- */
+/* ---------- TELEMETRY ---------- */
 
-// Body: {"bin_id":2,"temp":30.2,"humidity":58.3,"door_open":0}
 type TelemetryReq struct {
 	BinID    int      `json:"bin_id"`
 	Temp     *float64 `json:"temp"`
 	Humidity *float64 `json:"humidity"`
-	DoorOpen *int     `json:"door_open"` // stored live only
+	DoorOpen *int     `json:"door_open"`
 }
 
 func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
+
 	if r.Method != http.MethodPost {
 		bad(w, 405, "POST only")
 		return
@@ -918,18 +1046,18 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 
 	var req TelemetryReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		bad(w, http.StatusBadRequest, "bad json")
+		bad(w, 400, "bad json")
 		return
 	}
+
 	if req.BinID <= 0 {
-		bad(w, http.StatusBadRequest, "missing bin_id")
+		bad(w, 400, "missing bin_id")
 		return
 	}
 
-	// Log what we got
-	log.Printf("[TELEM] bin=%d temp=%v hum=%v door=%v", req.BinID, req.Temp, req.Humidity, req.DoorOpen)
+	log.Printf("[TELEM] bin=%d temp=%v hum=%v door=%v",
+		req.BinID, req.Temp, req.Humidity, req.DoorOpen)
 
-	// (A) Update LIVE snapshot IN MEMORY ONLY (not in DB)
 	now := utcNow()
 	lr := liveReading{
 		BinID:     req.BinID,
@@ -939,11 +1067,11 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 		LastSeen:  now,
 		LastSeenS: now.Format(time.RFC3339),
 	}
+
 	liveMu.Lock()
 	liveByBin[req.BinID] = lr
 	liveMu.Unlock()
 
-	// 🔴 Push to all live dashboards
 	sseBroadcast(sseMsg{
 		Type: "telemetry",
 		Data: map[string]any{
@@ -956,10 +1084,10 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	// (B) Upsert DAILY AGGREGATES into DB (UTC day)
 	if req.Temp != nil || req.Humidity != nil {
 		_, err := db.Exec(`
-			INSERT INTO bin_daily_stats (bin_id, day_utc, sum_temp, sum_humid, samples)
+			INSERT INTO bin_daily_stats
+			(bin_id, day_utc, sum_temp, sum_humid, samples)
 			VALUES (?, UTC_DATE(), COALESCE(?,0), COALESCE(?,0),
 			        CASE WHEN (? IS NULL AND ? IS NULL) THEN 0 ELSE 1 END)
 			ON DUPLICATE KEY UPDATE
@@ -969,6 +1097,7 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 			                            WHEN (VALUES(sum_temp)=0 AND VALUES(sum_humid)=0)
 			                            THEN 0 ELSE 1 END
 		`, req.BinID, req.Temp, req.Humidity, req.Temp, req.Humidity)
+
 		if err != nil {
 			bad(w, 500, err.Error())
 			return
@@ -978,14 +1107,13 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-/* ---------- LIVE snapshot for dashboard polling ---------- */
+/* ---------- LIVE JSON (polling fallback) ---------- */
 
 func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
 
-	// Join live map with static bin metadata for a nice table on the UI
 	rows, err := db.Query(`
 		SELECT b.bin_id, b.bin_name, b.location, ws.code
 		FROM bins b
@@ -1028,6 +1156,7 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 			Location:   loc,
 			StreamCode: code,
 		}
+
 		if lr, ok := liveByBin[id]; ok {
 			row.Temp = lr.Temp
 			row.Humidity = lr.Humidity
@@ -1035,14 +1164,8 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 			row.DoorStatus = doorText(lr.DoorOpen)
 			row.DoorStatusCamel = row.DoorStatus
 			row.LastSeenUTC = lr.LastSeenS
-		} else {
-			row.Temp = nil
-			row.Humidity = nil
-			row.DoorOpen = nil
-			row.DoorStatus = ""
-			row.DoorStatusCamel = ""
-			row.LastSeenUTC = ""
 		}
+
 		out = append(out, row)
 	}
 
@@ -1052,13 +1175,16 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-/* ---------- simple smoke test for live cache ---------- */
+/* ---------- LIVE PEEK ---------- */
+
 func handleBinsLivePeek(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
+
 	liveMu.RLock()
 	defer liveMu.RUnlock()
+
 	type row struct {
 		BinID int      `json:"bin_id"`
 		Temp  *float64 `json:"temp_c"`
@@ -1066,88 +1192,112 @@ func handleBinsLivePeek(w http.ResponseWriter, r *http.Request) {
 		Door  *int     `json:"door_open"`
 		Seen  string   `json:"last_seen"`
 	}
-	out := []row{}
+
+	var out []row
 	for _, lr := range liveByBin {
-		out = append(out, row{lr.BinID, lr.Temp, lr.Humidity, lr.DoorOpen, lr.LastSeenS})
+		out = append(out, row{
+			BinID: lr.BinID,
+			Temp:  lr.Temp,
+			Hum:   lr.Humidity,
+			Door:  lr.DoorOpen,
+			Seen:  lr.LastSeenS,
+		})
 	}
-	writeJSON(w, map[string]any{"bins": out, "ts": utcNow().Format(time.RFC3339)})
+
+	writeJSON(w, map[string]any{
+		"bins": out,
+		"ts":   utcNow().Format(time.RFC3339),
+	})
 }
 
-/* ---------- serve tiny client JS to wire SSE ---------- */
+/* ---------- LIVE JS ---------- */
 
 func handleLiveJS(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-	// This script auto-updates any row: <tr data-binid="2"> with .temp .hum .lid .last cells.
-	js := `
-(function(){
-  if (!window.EventSource) { console.warn("SSE not supported; consider polling /bins/live.json"); return; }
-  const src = new EventSource("/bins/live.sse");
-  function setText(el, v){ if(!el) return; el.textContent = (v===null||v===undefined||v==="") ? "—" : v; }
-  function doorLabel(v){ return v===1 || v==="1" ? "OPEN" : (v===0 || v==="0" ? "CLOSED" : "—"); }
+	w.Header().Set("Content-Type", "application/javascript")
 
-  function apply(row, data){
-    if(!row) return;
-    setText(row.querySelector(".temp"), data.temp_c);
-    setText(row.querySelector(".hum"), data.humidity_pct);
-    setText(row.querySelector(".lid"), doorLabel(data.door_open));
-    setText(row.querySelector(".last"), data.last_seen);
+	js := `
+// ===============================
+//   LIVE.JS (SSE HANDLER SCRIPT)
+// ===============================
+
+(function(){
+
+  console.log("🔥 LIVE.JS EXECUTED");   // <--- ADD THIS LINE
+
+  if (!window.EventSource) {
+    console.warn("EventSource not supported");
+    return;
   }
 
-  src.onmessage = function(evt){
-    try{
+  const src = new EventSource("/bins/live.sse");
+
+  // ===== ACTIVE UUID COUNTS =====
+  function updateCounts(d){
+    const el = document.getElementById("active-uuid-count");
+    if (el && d && typeof d.active === "number") {
+      el.textContent = d.active;
+      console.log("Updated Active UUID:", d.active);
+    }
+  }
+
+  src.addEventListener("counts", function(evt){
+    try {
       const msg = JSON.parse(evt.data);
-      if(msg.Type==="snapshot" || msg.type==="snapshot"){
-        const bins = (msg.Data && msg.Data.bins) || (msg.data && msg.data.bins) || [];
-        bins.forEach(function(b){
-          const row = document.querySelector("[data-binid='"+ b.bin_id +"']");
-          apply(row, b);
-        });
-      } else if (msg.Type==="telemetry" || msg.type==="telemetry") {
-        const d = msg.Data || msg.data || {};
-        const row = document.querySelector("[data-binid='"+ d.bin_id +"']");
-        apply(row, d);
-        document.dispatchEvent(new CustomEvent("bin-telemetry", {detail:d}));
-      }
-    }catch(e){ console.error("live.js parse", e); }
+      updateCounts(msg.data || msg.Data);
+    } catch(e){
+      console.error("counts event failed", e);
+    }
+  });
+
+  // ===== TELEMETRY =====
+  src.onmessage = function(evt){
+    try {
+      const payload = JSON.parse(evt.data);
+      document.dispatchEvent(new CustomEvent("bin-sse", { detail: payload }));
+    } catch(e){
+      console.error("telemetry parse failed", e);
+    }
   };
-})();
-`
+
+})();`
+
 	_, _ = w.Write([]byte(js))
 }
 
-/* ---------- demo ---------- */
+/* ---------- DEMO UUID ---------- */
 
 func handleGenerateUUID(w http.ResponseWriter, r *http.Request) {
 	id := uuid.New().String()
 	fmt.Fprintf(w, "Generated UUID: %s", id)
 }
 
-/* ---------- admin dashboard ---------- */
+/* ---------- ADMIN PAGE ---------- */
 
 type adminCounts struct {
-	Employees   int
-	Departments int
-	Bins        int
-	ActiveUUIDs int
+	Employees   int `json:"employees"`
+	Departments int `json:"departments"`
+	Bins        int `json:"bins"`
+	ActiveUUIDs int `json:"active_uuids"`
 }
 
 type adminRow struct {
-	UUID        string
-	IsUsed      bool
-	Expired     bool
-	Employee    string
-	Department  string
-	Stream      string
-	BinName     string
-	GeneratedAt string
-	UsedAt      string
-	ExpiresAt   string
+	UUID        string `json:"uuid"`
+	IsUsed      bool   `json:"is_used"`
+	Expired     bool   `json:"expired"`
+	Employee    string `json:"employee"`
+	Department  string `json:"department"`
+	Stream      string `json:"stream"`
+	BinName     string `json:"bin_name"`
+	GeneratedAt string `json:"generated_at"`
+	UsedAt      string `json:"used_at"`
+	ExpiresAt   string `json:"expires_at"`
 }
 
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	var counts adminCounts
+
 	if err := db.QueryRow(`SELECT COUNT(*) FROM employees`).Scan(&counts.Employees); err != nil {
 		bad(w, 500, "db1")
 		return
@@ -1160,13 +1310,8 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, "db3")
 		return
 	}
-	if err := db.QueryRow(`
-		SELECT COUNT(*) FROM uuid_logs
-		WHERE is_used=0 AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
-	`).Scan(&counts.ActiveUUIDs); err != nil {
-		bad(w, 500, "db4")
-		return
-	}
+
+	counts.ActiveUUIDs = getActiveUUIDCount()
 
 	lim := 200
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -1177,29 +1322,48 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 			lim = n
 		}
 	}
+
 	where, args := buildFilters(r)
 
 	q := `
-		SELECT
-			ul.uuid_value,
-			ul.is_used,
-			IF(ul.expires_at IS NOT NULL AND UTC_TIMESTAMP() > ul.expires_at, 1, 0) AS expired,
-			e.emp_name,
-			d.dept_name,
-			ws.code,
-			b.bin_name,
-			DATE_FORMAT(ul.generated_at, '%Y-%m-%d %H:%i:%s') AS gen_at,
-			IFNULL(DATE_FORMAT(ul.used_at, '%Y-%m-%d %H:%i:%s'), '') AS used_at,
-			IFNULL(DATE_FORMAT(ul.expires_at, '%Y-%m-%d %H:%i:%s'), '') AS exp_at
-		FROM uuid_logs ul
-		JOIN employees e   ON e.emp_id  = ul.emp_id
-		JOIN departments d ON d.dept_id = e.dept_id
-		JOIN bins b        ON b.bin_id  = ul.bin_id
-		JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
-	` + where + `
-		ORDER BY ul.uuid_id DESC
-		LIMIT ?
-	`
+SELECT
+    ul.uuid_value,
+
+    ul.is_used,
+
+    -- CORRECT expiry check
+    IF(ul.expires_at IS NOT NULL AND UTC_TIMESTAMP() > ul.expires_at, 1, 0) AS expired,
+
+    e.emp_name,
+    d.dept_name,
+    ws.code,
+    b.bin_name,
+
+    -- LOCAL TIME (Jamaica = UTC-5)
+    DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'),
+                '%Y-%m-%d %l:%i %p'),
+
+    IFNULL(
+        DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'),
+                    '%Y-%m-%d %l:%i %p'),
+        ''
+    ),
+
+    IFNULL(
+        DATE_FORMAT(CONVERT_TZ(ul.expires_at, '+00:00', '-05:00'),
+                    '%Y-%m-%d %l:%i %p'),
+        ''
+    )
+FROM uuid_logs ul
+JOIN employees e   ON e.emp_id  = ul.emp_id
+JOIN departments d ON d.dept_id = e.dept_id
+JOIN bins b        ON b.bin_id  = ul.bin_id
+JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
+` + where + `
+ORDER BY ul.uuid_id DESC
+LIMIT ?
+`
+
 	args = append(args, lim)
 
 	rows, err := db.Query(q, args...)
@@ -1210,15 +1374,23 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	var recent []adminRow
+
 	for rows.Next() {
 		var ar adminRow
 		var isUsedInt, expiredInt int
-		if err := rows.Scan(&ar.UUID, &isUsedInt, &expiredInt, &ar.Employee, &ar.Department, &ar.Stream, &ar.BinName, &ar.GeneratedAt, &ar.UsedAt, &ar.ExpiresAt); err != nil {
+
+		if err := rows.Scan(
+			&ar.UUID, &isUsedInt, &expiredInt,
+			&ar.Employee, &ar.Department, &ar.Stream,
+			&ar.BinName, &ar.GeneratedAt, &ar.UsedAt, &ar.ExpiresAt,
+		); err != nil {
 			bad(w, 500, "scan")
 			return
 		}
+
 		ar.IsUsed = isUsedInt == 1
-		ar.Expired = expiredInt == 1
+		ar.Expired = expiredInt == 1 // 🔥 THIS IS THE KEY
+
 		recent = append(recent, ar)
 	}
 
@@ -1236,6 +1408,8 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+/* ---------- EXPORT CSV ---------- */
+
 func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/csv")
@@ -1247,9 +1421,10 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			ul.uuid_value, ul.is_used,
 			e.emp_name, d.dept_name, ws.code, b.bin_name,
-			DATE_FORMAT(ul.generated_at, '%Y-%m-%d %H:%i:%s') AS gen_at,
-			IFNULL(DATE_FORMAT(ul.used_at, '%Y-%m-%d %H:%i:%s'), '') AS used_at,
-			IFNULL(DATE_FORMAT(ul.expires_at, '%Y-%m-%d %H:%i:%s'), '') AS exp_at
+			DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'),
+			IFNULL(DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'), ''),
+			IFNULL(DATE_FORMAT(CONVERT_TZ(ul.expires_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'), '')
+
 		FROM uuid_logs ul
 		JOIN employees e   ON e.emp_id  = ul.emp_id
 		JOIN departments d ON d.dept_id = e.dept_id
@@ -1269,27 +1444,39 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
-	_ = cw.Write([]string{"uuid", "status", "employee", "department", "stream", "bin", "generated_at", "used_at", "expires_at"})
+
+	_ = cw.Write([]string{
+		"uuid", "status", "employee", "department",
+		"stream", "bin", "generated_at", "used_at", "expires_at",
+	})
 
 	for rows.Next() {
 		var uuidVal, empName, deptName, streamCode, binName, genAt, usedAt, expAt string
 		var isUsed int
-		if err := rows.Scan(&uuidVal, &isUsed, &empName, &deptName, &streamCode, &binName, &genAt, &usedAt, &expAt); err != nil {
+
+		if err := rows.Scan(
+			&uuidVal, &isUsed,
+			&empName, &deptName, &streamCode, &binName,
+			&genAt, &usedAt, &expAt,
+		); err != nil {
 			bad(w, 500, "scan")
 			return
 		}
+
 		status := "active"
 		if isUsed == 1 {
 			status = "used"
 		}
-		_ = cw.Write([]string{uuidVal, status, empName, deptName, streamCode, binName, genAt, usedAt, expAt})
+
+		_ = cw.Write([]string{
+			uuidVal, status, empName, deptName,
+			streamCode, binName, genAt, usedAt, expAt,
+		})
 	}
 }
 
-/* ---------- chart data for admin ---------- */
+/* ---------- CHART DATA ---------- */
 
-// handleAdminChartJSON returns daily counts for last N days.
-// Params: ?days=14 (default, max 180)  &dept=ID (optional)
 func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -1303,6 +1490,7 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 	var deptCond string
 	var argsGen []any
 	var argsUsed []any
+
 	if dept := r.URL.Query().Get("dept"); dept != "" {
 		deptCond = " AND d.dept_id = ? "
 		argsGen = append(argsGen, dept)
@@ -1310,7 +1498,7 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 	}
 
 	qGen := `
-		SELECT DATE(ul.generated_at) AS d, COUNT(*) AS c
+		SELECT DATE(ul.generated_at) AS d, COUNT(*)
 		FROM uuid_logs ul
 		JOIN employees e   ON e.emp_id  = ul.emp_id
 		JOIN departments d ON d.dept_id = e.dept_id
@@ -1319,6 +1507,7 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 		GROUP BY DATE(ul.generated_at)
 		ORDER BY d
 	`
+
 	argsGen = append([]any{days}, argsGen...)
 	rowsGen, err := db.Query(qGen, argsGen...)
 	if err != nil {
@@ -1328,7 +1517,7 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 	defer rowsGen.Close()
 
 	qUsed := `
-		SELECT DATE(ul.used_at) AS d, COUNT(*) AS c
+		SELECT DATE(ul.used_at) AS d, COUNT(*)
 		FROM uuid_logs ul
 		JOIN employees e   ON e.emp_id  = ul.emp_id
 		JOIN departments d ON d.dept_id = e.dept_id
@@ -1338,6 +1527,7 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 		GROUP BY DATE(ul.used_at)
 		ORDER BY d
 	`
+
 	argsUsed = append([]any{days}, argsUsed...)
 	rowsUsed, err := db.Query(qUsed, argsUsed...)
 	if err != nil {
@@ -1353,6 +1543,7 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 		_ = rowsGen.Scan(&d, &c)
 		genMap[d] = c
 	}
+
 	usedMap := map[string]int{}
 	for rowsUsed.Next() {
 		var d string
@@ -1367,6 +1558,7 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 
 	todayUTC := utcNow().Truncate(24 * time.Hour)
 	start := todayUTC.AddDate(0, 0, -days+1)
+
 	for d := start; !d.After(todayUTC); d = d.AddDate(0, 0, 1) {
 		key := d.Format("2006-01-02")
 		labels = append(labels, key)
