@@ -251,6 +251,27 @@
     .dialog-actions{
       display:flex; gap:.6rem; justify-content:flex-end; margin-top:.9rem;
     }
+
+    /* TOAST (simple) */
+    .toast{
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      display: grid;
+      gap: 10px;
+      z-index: 9999;
+      pointer-events: none;
+    }
+    .toast .t{
+      pointer-events: none;
+      background: rgba(15,21,36,.9);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: .7rem .85rem;
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      transition: opacity .25s ease, transform .25s ease;
+    }
   </style>
 </head>
 
@@ -386,7 +407,7 @@
               <th>Stream</th>
               <th>Temp (°C)</th>
               <th>Humidity (%)</th>
-              <th>Door</th>
+              <th>Lid</th>
               <th>Last Seen (Local)</th>
             </tr>
           </thead>
@@ -532,10 +553,28 @@
       </div>
     </dialog>
 
-    <!-- DEPARTMENT CLASSIFICATIONS MODAL -->
+    <!-- DEPARTMENT CLASSIFICATIONS MODAL (UPDATED: ADD + DELETE) -->
     <dialog id="deptClassesModal">
       <h3>Department Classifications</h3>
-      <p class="muted">All departments and their IDs/codes.</p>
+      <p class="muted">Add or delete departments (IDs/codes).</p>
+
+      <!-- ADD FORM -->
+      <div class="panel" style="margin:10px 0;">
+        <div class="filters" style="grid-template-columns: 1fr 140px auto;">
+          <div>
+            <label for="newDeptName">Department Name</label>
+            <input id="newDeptName" type="text" placeholder="e.g. Test Dept">
+          </div>
+          <div>
+            <label for="newDeptCode">Code</label>
+            <input id="newDeptCode" type="text" maxlength="10" placeholder="e.g. TST">
+          </div>
+          <div style="display:flex; gap:.6rem; align-items:end;">
+            <button class="button btn-primary" id="btnAddDept" type="button">➕ Add</button>
+          </div>
+        </div>
+        <p id="deptAddMsg" class="muted" style="margin-top:.5rem;"></p>
+      </div>
 
       <div class="table-wrap" style="max-height:55vh; overflow:auto">
         <table id="deptClassesTable">
@@ -544,6 +583,7 @@
               <th>ID</th>
               <th>Name</th>
               <th>Code</th>
+              <th style="width:120px;">Action</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -978,11 +1018,14 @@
       }).join('');
     }
 
+    /* ============================================================
+       ================== DEPARTMENTS: LOAD + ADD + DELETE =========
+       ============================================================ */
     async function loadDeptClasses(){
       deptTableBody.innerHTML = "";
       const data = await fetchJSON(["/departments/classes", "/departments"]);
       if (!data){
-        deptTableBody.innerHTML = `<tr><td colspan="3">Failed to load.</td></tr>`;
+        deptTableBody.innerHTML = `<tr><td colspan="4">Failed to load.</td></tr>`;
         return;
       }
 
@@ -992,20 +1035,106 @@
       const norm = list.map(d=>({
         id: Number(d.id ?? d.dept_id ?? 0),
         name: d.name ?? d.dept ?? "",
-        code: d.code ?? d.dept_code ?? "—"
+        code: (d.code ?? d.dept_code ?? "") || ""
       })).sort((a,b)=> a.id - b.id);
 
       deptTableBody.innerHTML = norm.map(d=>`
         <tr>
           <td>${d.id}</td>
           <td>${d.name}</td>
-          <td>${d.code}</td>
+          <td>${d.code || "—"}</td>
+          <td>
+            <button class="button btn-secondary" data-del-dept="${d.id}">🗑️ Delete</button>
+          </td>
         </tr>
       `).join('');
+
+      // bind delete buttons
+      document.querySelectorAll("[data-del-dept]").forEach(btn=>{
+        btn.addEventListener("click", async ()=>{
+          const deptID = Number(btn.getAttribute("data-del-dept"));
+          if (!deptID) return;
+
+          if (!confirm(`Delete department #${deptID}?`)) return;
+
+          try{
+            const res = await fetch("/departments/delete", {
+              method: "POST",
+              headers: {"Content-Type":"application/json"},
+              body: JSON.stringify({dept_id: deptID})
+            });
+
+            const text = await res.text();
+            let out;
+            try { out = JSON.parse(text); } catch { out = {error:text}; }
+
+            if (!res.ok){
+              toast(out.error || text || "Delete failed");
+              return;
+            }
+
+            toast("Department deleted");
+            loadDeptClasses();
+          } catch(e){
+            toast("Network error");
+          }
+        });
+      });
     }
 
+    // Add department handler
+    const btnAddDept = $("#btnAddDept");
+    const deptAddMsg = $("#deptAddMsg");
+
+    btnAddDept?.addEventListener("click", async ()=>{
+      if (deptAddMsg) deptAddMsg.textContent = "Saving...";
+
+      const name = ($("#newDeptName")?.value || "").trim();
+      const code = ($("#newDeptCode")?.value || "").trim();
+
+      if (!name){
+        if (deptAddMsg) deptAddMsg.textContent = "Department name required.";
+        return;
+      }
+
+      try{
+        const res = await fetch("/departments", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({name, code})
+        });
+
+        const text = await res.text();
+        let out;
+        try { out = JSON.parse(text); } catch { out = {error:text}; }
+
+        if (!res.ok){
+          if (deptAddMsg) deptAddMsg.textContent = out.error || text || "Add failed";
+          toast(out.error || text || "Add failed");
+          return;
+        }
+
+        if (deptAddMsg) deptAddMsg.textContent = `Added: ${out.name} (id=${out.id})`;
+        toast("Department added");
+
+        if ($("#newDeptName")) $("#newDeptName").value = "";
+        if ($("#newDeptCode")) $("#newDeptCode").value = "";
+
+        loadDeptClasses();
+      } catch(e){
+        if (deptAddMsg) deptAddMsg.textContent = "Network error.";
+        toast("Network error");
+      }
+    });
+
     openBinBtn?.addEventListener("click", ()=>{ dlgBin.showModal();  loadBinClasses(); });
-    openDeptBtn?.addEventListener("click", ()=>{ dlgDept.showModal(); loadDeptClasses(); });
+    openDeptBtn?.addEventListener("click", ()=>{
+      if (deptAddMsg) deptAddMsg.textContent = "";
+      if ($("#newDeptName")) $("#newDeptName").value = "";
+      if ($("#newDeptCode")) $("#newDeptCode").value = "";
+      dlgDept.showModal();
+      loadDeptClasses();
+    });
 
     closeBinBtn?.addEventListener("click", ()=> dlgBin.close());
     closeDeptBtn?.addEventListener("click", ()=> dlgDept.close());
