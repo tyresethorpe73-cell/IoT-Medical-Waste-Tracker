@@ -72,12 +72,12 @@ func sseBroadcast(msg sseMsg) {
 
 func getActiveUUIDCount() int {
 	var n int
+	// ACTIVE means: unused AND (no expiry OR not yet expired)
 	err := db.QueryRow(`
         SELECT COUNT(*)
         FROM uuid_logs
         WHERE is_used = 0
-          AND expires_at IS NOT NULL
-          AND UTC_TIMESTAMP() < expires_at
+          AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
     `).Scan(&n)
 	if err != nil {
 		return 0
@@ -176,6 +176,7 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 		}
 
 		b, _ := json.Marshal(msg)
+		// IMPORTANT: send as a standard message (no custom "event:" line here)
 		ch <- append(append([]byte("data: "), b...), []byte("\n\n")...)
 	}()
 
@@ -824,7 +825,7 @@ func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := uuid.New().String()
-	exp := utcNow().Add(24 * time.Hour)
+	exp := utcNow().Add(48 * time.Hour)
 
 	_, err = db.Exec(`
 		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
@@ -929,7 +930,7 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := uuid.New().String()
-	exp := utcNow().Add(24 * time.Hour)
+	exp := utcNow().Add(48 * time.Hour)
 
 	_, err = db.Exec(`
 		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
@@ -1004,7 +1005,7 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if utcNow().After(expires.UTC()) {
+	if expires != nil && utcNow().After(expires.UTC()) {
 		bad(w, 410, "expired")
 		return
 	}
@@ -1222,7 +1223,7 @@ func handleLiveJS(w http.ResponseWriter, r *http.Request) {
 
 (function(){
 
-  console.log("🔥 LIVE.JS EXECUTED");   // <--- ADD THIS LINE
+  console.log("🔥 LIVE.JS EXECUTED");
 
   if (!window.EventSource) {
     console.warn("EventSource not supported");
@@ -1240,22 +1241,24 @@ func handleLiveJS(w http.ResponseWriter, r *http.Request) {
     }
   }
 
+  // Custom named event: "counts"
   src.addEventListener("counts", function(evt){
     try {
+      // evt.data is the full JSON of sseMsg {type,data}
       const msg = JSON.parse(evt.data);
-      updateCounts(msg.data || msg.Data);
+      updateCounts(msg.data);
     } catch(e){
       console.error("counts event failed", e);
     }
   });
 
-  // ===== TELEMETRY =====
+  // Default messages (includes snapshot + telemetry if you send them without "event:")
   src.onmessage = function(evt){
     try {
       const payload = JSON.parse(evt.data);
       document.dispatchEvent(new CustomEvent("bin-sse", { detail: payload }));
     } catch(e){
-      console.error("telemetry parse failed", e);
+      console.error("message parse failed", e);
     }
   };
 
@@ -1328,10 +1331,9 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	q := `
 SELECT
     ul.uuid_value,
-
     ul.is_used,
 
-    -- CORRECT expiry check
+    -- expired = has expiry AND now is after expiry
     IF(ul.expires_at IS NOT NULL AND UTC_TIMESTAMP() > ul.expires_at, 1, 0) AS expired,
 
     e.emp_name,
@@ -1389,7 +1391,7 @@ LIMIT ?
 		}
 
 		ar.IsUsed = isUsedInt == 1
-		ar.Expired = expiredInt == 1 // 🔥 THIS IS THE KEY
+		ar.Expired = expiredInt == 1
 
 		recent = append(recent, ar)
 	}
@@ -1417,9 +1419,10 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 
 	where, args := buildFilters(r)
 
+	// include expires_at raw to correctly compute "expired" (not just "expAt != ''")
 	q := `
 		SELECT
-			ul.uuid_value, ul.is_used,
+			ul.uuid_value, ul.is_used, ul.expires_at,
 			e.emp_name, d.dept_name, ws.code, b.bin_name,
 			DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'),
 			IFNULL(DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'), ''),
@@ -1453,9 +1456,10 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var uuidVal, empName, deptName, streamCode, binName, genAt, usedAt, expAt string
 		var isUsed int
+		var expires sql.NullTime
 
 		if err := rows.Scan(
-			&uuidVal, &isUsed,
+			&uuidVal, &isUsed, &expires,
 			&empName, &deptName, &streamCode, &binName,
 			&genAt, &usedAt, &expAt,
 		); err != nil {
@@ -1466,6 +1470,8 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 		status := "active"
 		if isUsed == 1 {
 			status = "used"
+		} else if expires.Valid && utcNow().After(expires.Time.UTC()) {
+			status = "expired"
 		}
 
 		_ = cw.Write([]string{
