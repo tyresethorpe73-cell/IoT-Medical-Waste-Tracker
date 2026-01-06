@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,7 +73,6 @@ func sseBroadcast(msg sseMsg) {
 
 func getActiveUUIDCount() int {
 	var n int
-	// ACTIVE means: unused AND (no expiry OR not yet expired)
 	err := db.QueryRow(`
         SELECT COUNT(*)
         FROM uuid_logs
@@ -106,6 +106,27 @@ func allowCORS(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	return false
+}
+
+func utcNow() time.Time { return time.Now().UTC() }
+
+func doorText(v *int) string {
+	if v == nil {
+		return ""
+	}
+	if *v == 1 {
+		return "Open"
+	}
+	return "Closed"
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func bad(w http.ResponseWriter, code int, msg string) {
+	http.Error(w, msg, code)
 }
 
 // ---------- LIVE SSE ----------
@@ -199,87 +220,6 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func utcNow() time.Time { return time.Now().UTC() }
-
-func doorText(v *int) string {
-	if v == nil {
-		return ""
-	}
-	if *v == 1 {
-		return "Open"
-	}
-	return "Closed"
-}
-
-// ========== MAIN ==========
-func main() {
-	var err error
-
-	dsn := "tracker:Rootpass2025@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=UTC"
-
-	db, err = sql.Open("mysql", dsn)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err = db.Ping(); err != nil {
-		log.Fatal("❌ Database connection failed:", err)
-	}
-
-	if _, err := db.Exec(`SET time_zone = '+00:00'`); err != nil {
-		log.Fatal("❌ Failed to set MySQL time_zone to UTC:", err)
-	}
-
-	fmt.Println("✅ Connected to MySQL (UTC mode)")
-
-	// AUTO-SSE COUNT REFRESH
-	go func() {
-		t := time.NewTicker(60 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			broadcastActiveUUIDCount()
-		}
-	}()
-
-	// ===== ROUTES =====
-	http.HandleFunc("/admin/chart.json", handleAdminChartJSON)
-	http.HandleFunc("/streams", handleListStreams)
-	http.HandleFunc("/departments", handleListDepartments)
-	http.HandleFunc("/departments/classes", handleListDepartments)
-
-	http.HandleFunc("/bins", handleListBins)
-	http.HandleFunc("/bins/summary", handleBinsSummary)
-	http.HandleFunc("/bins/live.json", handleBinsLiveJSON)
-	http.HandleFunc("/bins/live.sse", handleBinsLiveSSE)
-	http.HandleFunc("/bins/live.peek", handleBinsLivePeek)
-
-	http.HandleFunc("/admin", handleAdmin)
-	http.HandleFunc("/admin/export.csv", handleAdminExport)
-
-	http.HandleFunc("/employees", handleEmployees)
-
-	http.HandleFunc("/auth/pin", handleAuthPIN)
-	http.HandleFunc("/uuid/create/from-pin", handleUUIDCreateFromPIN)
-	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)
-
-	http.HandleFunc("/bin/consume", handleBinConsume)
-	http.HandleFunc("/bin/telemetry", handleBinTelemetry)
-
-	http.HandleFunc("/static/live.js", handleLiveJS)
-	http.HandleFunc("/generate_uuid", handleGenerateUUID)
-
-	fmt.Println("🚀 Server running at http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func bad(w http.ResponseWriter, code int, msg string) {
-	http.Error(w, msg, code)
-}
-
 /* ---------- buildFilters ---------- */
 
 func buildFilters(r *http.Request) (string, []any) {
@@ -356,38 +296,158 @@ func handleListStreams(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+/* ---------- DEPARTMENTS (GET + POST) ---------- */
+
+type deptCreateReq struct {
+	Name string `json:"name"`
+	Code string `json:"code"`
+}
+
+type deptCreateResp struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Code string `json:"code"`
+}
+
 func handleListDepartments(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
 		return
 	}
 
-	type row struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-		Code string `json:"code"`
+	switch r.Method {
+
+	case http.MethodGet:
+		type row struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+			Code string `json:"code"`
+		}
+
+		rows, err := db.Query(`
+			SELECT dept_id, dept_name, COALESCE(dept_code, '')
+			FROM departments
+			ORDER BY dept_id ASC
+		`)
+		if err != nil {
+			// fallback: no dept_code column
+			rows, err = db.Query(`
+				SELECT dept_id, dept_name
+				FROM departments
+				ORDER BY dept_id ASC
+			`)
+			if err != nil {
+				bad(w, 500, "db")
+				return
+			}
+			defer rows.Close()
+
+			var out []row
+			for rows.Next() {
+				var rr row
+				if err := rows.Scan(&rr.ID, &rr.Name); err != nil {
+					bad(w, 500, "scan")
+					return
+				}
+				rr.Code = ""
+				out = append(out, rr)
+			}
+
+			writeJSON(w, map[string]any{"departments": out})
+			return
+		}
+
+		defer rows.Close()
+
+		var out []row
+		for rows.Next() {
+			var rr row
+			if err := rows.Scan(&rr.ID, &rr.Name, &rr.Code); err != nil {
+				bad(w, 500, "scan")
+				return
+			}
+			out = append(out, rr)
+		}
+
+		writeJSON(w, map[string]any{"departments": out})
+		return
+
+	case http.MethodPost:
+		var req deptCreateReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			bad(w, 400, "bad json")
+			return
+		}
+
+		req.Name = strings.TrimSpace(req.Name)
+		req.Code = strings.TrimSpace(req.Code)
+
+		if req.Name == "" {
+			bad(w, 400, "department name required")
+			return
+		}
+
+		res, err := db.Exec(`
+			INSERT INTO departments (dept_name, dept_code)
+			VALUES (?, NULLIF(?, ''))
+		`, req.Name, req.Code)
+		if err != nil {
+			bad(w, 500, "insert failed")
+			return
+		}
+
+		id64, _ := res.LastInsertId()
+
+		writeJSON(w, deptCreateResp{
+			ID:   int(id64),
+			Name: req.Name,
+			Code: req.Code,
+		})
+		return
+
+	default:
+		bad(w, 405, "GET or POST only")
+		return
+	}
+}
+
+/* ---------- DEPARTMENTS ADMIN JSON (OPTIONAL) ---------- */
+
+type deptAdminRow struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Code string `json:"code"`
+}
+
+func handleDepartmentsAdminJSON(w http.ResponseWriter, r *http.Request) {
+	if allowCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
 	}
 
 	rows, err := db.Query(`
-		SELECT dept_id, dept_name, COALESCE(dept_code, '')
+		SELECT dept_id, dept_name, COALESCE(dept_code,'')
 		FROM departments
-		ORDER BY dept_id ASC
+		ORDER BY dept_id DESC
 	`)
 	if err != nil {
 		// fallback: no dept_code column
 		rows, err = db.Query(`
 			SELECT dept_id, dept_name
 			FROM departments
-			ORDER BY dept_id ASC
+			ORDER BY dept_id DESC
 		`)
 		if err != nil {
-			bad(w, 500, "db")
+			bad(w, 500, "db(departments)")
 			return
 		}
 		defer rows.Close()
 
-		var out []row
+		out := []deptAdminRow{}
 		for rows.Next() {
-			var rr row
+			var rr deptAdminRow
 			if err := rows.Scan(&rr.ID, &rr.Name); err != nil {
 				bad(w, 500, "scan")
 				return
@@ -395,16 +455,15 @@ func handleListDepartments(w http.ResponseWriter, r *http.Request) {
 			rr.Code = ""
 			out = append(out, rr)
 		}
-
 		writeJSON(w, map[string]any{"departments": out})
 		return
 	}
 
 	defer rows.Close()
 
-	var out []row
+	out := []deptAdminRow{}
 	for rows.Next() {
-		var rr row
+		var rr deptAdminRow
 		if err := rows.Scan(&rr.ID, &rr.Name, &rr.Code); err != nil {
 			bad(w, 500, "scan")
 			return
@@ -414,6 +473,59 @@ func handleListDepartments(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, map[string]any{"departments": out})
 }
+
+/* ---------- DEPARTMENTS DELETE ---------- */
+
+type deptDeleteReq struct {
+	DeptID int `json:"dept_id"`
+}
+
+func handleDepartmentDelete(w http.ResponseWriter, r *http.Request) {
+	if allowCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req deptDeleteReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+	if req.DeptID <= 0 {
+		bad(w, 400, "dept_id required")
+		return
+	}
+
+	// Safety: prevent delete if employees reference this department
+	var refs int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM employees WHERE dept_id=?`, req.DeptID).Scan(&refs); err != nil {
+		bad(w, 500, "db(check employees)")
+		return
+	}
+	if refs > 0 {
+		bad(w, 409, "cannot delete: department has employees")
+		return
+	}
+
+	res, err := db.Exec(`DELETE FROM departments WHERE dept_id=? LIMIT 1`, req.DeptID)
+	if err != nil {
+		bad(w, 500, "db(delete department)")
+		return
+	}
+
+	aff, _ := res.RowsAffected()
+	if aff == 0 {
+		bad(w, 404, "department not found")
+		return
+	}
+
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+/* ---------- BINS (LIST) ---------- */
 
 func handleListBins(w http.ResponseWriter, r *http.Request) {
 	if allowCORS(w, r) {
@@ -532,7 +644,6 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 
 		if binID.Valid {
 			if lr, ok2 := liveByBin[int(binID.Int64)]; ok2 {
-
 				if sr.LastSeen == "" {
 					sr.TempC = lr.Temp
 					sr.Humidity = lr.Humidity
@@ -1244,7 +1355,6 @@ func handleLiveJS(w http.ResponseWriter, r *http.Request) {
   // Custom named event: "counts"
   src.addEventListener("counts", function(evt){
     try {
-      // evt.data is the full JSON of sseMsg {type,data}
       const msg = JSON.parse(evt.data);
       updateCounts(msg.data);
     } catch(e){
@@ -1252,7 +1362,6 @@ func handleLiveJS(w http.ResponseWriter, r *http.Request) {
     }
   });
 
-  // Default messages (includes snapshot + telemetry if you send them without "event:")
   src.onmessage = function(evt){
     try {
       const payload = JSON.parse(evt.data);
@@ -1332,25 +1441,18 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 SELECT
     ul.uuid_value,
     ul.is_used,
-
-    -- expired = has expiry AND now is after expiry
     IF(ul.expires_at IS NOT NULL AND UTC_TIMESTAMP() > ul.expires_at, 1, 0) AS expired,
-
     e.emp_name,
     d.dept_name,
     ws.code,
     b.bin_name,
-
-    -- LOCAL TIME (Jamaica = UTC-5)
     DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'),
                 '%Y-%m-%d %l:%i %p'),
-
     IFNULL(
         DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'),
                     '%Y-%m-%d %l:%i %p'),
         ''
     ),
-
     IFNULL(
         DATE_FORMAT(CONVERT_TZ(ul.expires_at, '+00:00', '-05:00'),
                     '%Y-%m-%d %l:%i %p'),
@@ -1419,7 +1521,6 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 
 	where, args := buildFilters(r)
 
-	// include expires_at raw to correctly compute "expired" (not just "expAt != ''")
 	q := `
 		SELECT
 			ul.uuid_value, ul.is_used, ul.expires_at,
@@ -1427,7 +1528,6 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 			DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'),
 			IFNULL(DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'), ''),
 			IFNULL(DATE_FORMAT(CONVERT_TZ(ul.expires_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'), '')
-
 		FROM uuid_logs ul
 		JOIN employees e   ON e.emp_id  = ul.emp_id
 		JOIN departments d ON d.dept_id = e.dept_id
@@ -1577,4 +1677,183 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 		"generated": genSeries,
 		"used":      usedSeries,
 	})
+}
+
+/* ---------- ADMIN BINS JSON + DELETE (NEW) ---------- */
+
+type binAdminRow struct {
+	BinID      int    `json:"bin_id"`
+	BinName    string `json:"bin_name"`
+	Location   string `json:"location"`
+	StreamCode string `json:"stream_code"`
+	StreamName string `json:"stream_name"`
+}
+
+func handleBinsAdminJSON(w http.ResponseWriter, r *http.Request) {
+	if allowCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT
+			b.bin_id,
+			b.bin_name,
+			COALESCE(b.location,'') AS location,
+			ws.code,
+			ws.name
+		FROM bins b
+		JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
+		ORDER BY b.bin_id DESC
+	`)
+	if err != nil {
+		bad(w, 500, "db(bins)")
+		return
+	}
+	defer rows.Close()
+
+	out := []binAdminRow{}
+	for rows.Next() {
+		var rr binAdminRow
+		if err := rows.Scan(&rr.BinID, &rr.BinName, &rr.Location, &rr.StreamCode, &rr.StreamName); err != nil {
+			bad(w, 500, "scan")
+			return
+		}
+		out = append(out, rr)
+	}
+
+	writeJSON(w, map[string]any{"bins": out})
+}
+
+type binDeleteReq struct {
+	BinID int `json:"bin_id"`
+}
+
+func handleBinDelete(w http.ResponseWriter, r *http.Request) {
+	if allowCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req binDeleteReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+	if req.BinID <= 0 {
+		bad(w, 400, "bin_id required")
+		return
+	}
+
+	// Safety: prevent delete if UUID logs reference this bin
+	var refs int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM uuid_logs WHERE bin_id=?`, req.BinID).Scan(&refs); err != nil {
+		bad(w, 500, "db(check refs)")
+		return
+	}
+	if refs > 0 {
+		bad(w, 409, "cannot delete: bin has uuid_logs history")
+		return
+	}
+
+	// Safety: prevent delete if bin_daily_stats references this bin
+	_ = db.QueryRow(`SELECT COUNT(*) FROM bin_daily_stats WHERE bin_id=?`, req.BinID).Scan(&refs)
+	if refs > 0 {
+		bad(w, 409, "cannot delete: bin has daily stats history")
+		return
+	}
+
+	res, err := db.Exec(`DELETE FROM bins WHERE bin_id=? LIMIT 1`, req.BinID)
+	if err != nil {
+		bad(w, 500, "db(delete bin)")
+		return
+	}
+
+	aff, _ := res.RowsAffected()
+	if aff == 0 {
+		bad(w, 404, "bin not found")
+		return
+	}
+
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// ========== MAIN ==========
+func main() {
+	var err error
+
+	dsn := "tracker:Rootpass2025@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=UTC"
+
+	db, err = sql.Open("mysql", dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = db.Ping(); err != nil {
+		log.Fatal("❌ Database connection failed:", err)
+	}
+
+	if _, err := db.Exec(`SET time_zone = '+00:00'`); err != nil {
+		log.Fatal("❌ Failed to set MySQL time_zone to UTC:", err)
+	}
+
+	fmt.Println("✅ Connected to MySQL (UTC mode)")
+
+	// AUTO-SSE COUNT REFRESH
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			broadcastActiveUUIDCount()
+		}
+	}()
+
+	// ===== ROUTES =====
+	http.HandleFunc("/admin/chart.json", handleAdminChartJSON)
+	http.HandleFunc("/streams", handleListStreams)
+
+	// departments
+	http.HandleFunc("/departments", handleListDepartments)         // GET + POST
+	http.HandleFunc("/departments/classes", handleListDepartments) // GET alias
+	http.HandleFunc("/departments/delete", handleDepartmentDelete) // POST delete
+	http.HandleFunc("/admin/departments.json", handleDepartmentsAdminJSON)
+
+	// bins
+	http.HandleFunc("/bins", handleListBins)
+	http.HandleFunc("/bins/summary", handleBinsSummary)
+	http.HandleFunc("/bins/live.json", handleBinsLiveJSON)
+	http.HandleFunc("/bins/live.sse", handleBinsLiveSSE)
+	http.HandleFunc("/bins/live.peek", handleBinsLivePeek)
+
+	// bins admin + delete
+	http.HandleFunc("/admin/bins.json", handleBinsAdminJSON)
+	http.HandleFunc("/bins/delete", handleBinDelete)
+
+	// admin
+	http.HandleFunc("/admin", handleAdmin)
+	http.HandleFunc("/admin/export.csv", handleAdminExport)
+
+	// employees
+	http.HandleFunc("/employees", handleEmployees)
+
+	// auth + uuid
+	http.HandleFunc("/auth/pin", handleAuthPIN)
+	http.HandleFunc("/uuid/create/from-pin", handleUUIDCreateFromPIN)
+	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)
+
+	// bin module
+	http.HandleFunc("/bin/consume", handleBinConsume)
+	http.HandleFunc("/bin/telemetry", handleBinTelemetry)
+
+	// static + demo
+	http.HandleFunc("/static/live.js", handleLiveJS)
+	http.HandleFunc("/generate_uuid", handleGenerateUUID)
+
+	fmt.Println("🚀 Server running at http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
