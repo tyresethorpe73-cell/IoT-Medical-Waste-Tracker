@@ -33,25 +33,17 @@
       --warn: #fbbf24;
       --shadow: 0 20px 40px rgba(0,0,0,.45);
       --radius: 14px;
+    }
 
-      /* Improve dropdown option visibility */
-select option {
-  background: #0f1524;
-  color: #e5e7eb;
-  font-weight: 600;
-  padding: .5rem;
-}
-select option:hover {
-  background: #1a2234;
-
-  .pill-expired {
-  background: #fbbf2433;
-  color: #fbbf24;
-  border: 1px solid #fbbf24;
-}
-
-}
-
+    /* Improve dropdown option visibility */
+    select option {
+      background: #0f1524;
+      color: #e5e7eb;
+      font-weight: 600;
+      padding: .5rem;
+    }
+    select option:hover {
+      background: #1a2234;
     }
 
     html,body{ height:100%; }
@@ -219,6 +211,24 @@ select option:hover {
       text-transform: uppercase;
     }
 
+    /* ===== STATUS COLORS ===== */
+    .pill-used{
+      background: #dc262622;
+      color: #f87171;
+      border-color: #f87171;
+    }
+    .pill-expired{
+      background: #fbbf2422;
+      color: #fbbf24;
+      border-color: #fbbf24;
+    }
+    .pill-active{
+      background: #16a34a22;
+      color: #4ade80;
+      border-color: #4ade80;
+    }
+
+    /* For other pills used elsewhere (door open/closed, etc.) */
     .pill-ok { background: #16a34a22; color: var(--success); }
     .pill-warn { background: #dc262622; color: var(--danger); }
 
@@ -307,17 +317,15 @@ select option:hover {
         </div>
       </article>
 
-    <article class="card">
-      <h3>Active UUIDs</h3>
-      <div class="stat">
-        <div class="bubble">🔗</div>
-
-        <!-- 🔥 THIS ID IS REQUIRED FOR LIVE SSE UPDATES -->
-        <strong id="active-uuid-count">{{.Counts.ActiveUUIDs}}</strong>
-      </div>
-
-      <p class="muted">unused & not expired</p>
-    </article>
+      <article class="card">
+        <h3>Active UUIDs</h3>
+        <div class="stat">
+          <div class="bubble">🔗</div>
+          <!-- 🔥 THIS ID IS REQUIRED FOR LIVE SSE UPDATES -->
+          <strong id="active-uuid-count">{{.Counts.ActiveUUIDs}}</strong>
+        </div>
+        <p class="muted">unused & not expired</p>
+      </article>
     </section>
 
     <!-- FILTER PANEL -->
@@ -375,13 +383,10 @@ select option:hover {
             <tr>
               <th>Bin</th>
               <th>Location</th>
-
               <th>Stream</th>
               <th>Temp (°C)</th>
               <th>Humidity (%)</th>
               <th>Door</th>
-
-              <!-- UPDATED HEADER -->
               <th>Last Seen (Local)</th>
             </tr>
           </thead>
@@ -428,30 +433,23 @@ select option:hover {
 
     <td>
       {{if .IsUsed}}
-        <!-- USED = RED -->
-        <span class="pill pill-warn" style="color:#f87171; border-color:#f87171;">used</span>
-
+        <span class="pill pill-used">used</span>
       {{else if .Expired}}
-        <!-- EXPIRED = ORANGE -->
-        <span class="pill" style="color:#fbbf24; border-color:#fbbf24;">expired</span>
-
+        <span class="pill pill-expired">expired</span>
       {{else}}
-        <!-- ACTIVE = GREEN -->
-        <span class="pill pill-ok" style="color:#4ade80; border-color:#4ade80;">active</span>
+        <span class="pill pill-active">active</span>
       {{end}}
     </td>
 
+    <td>{{.Employee}}</td>
+    <td>{{.Department}}</td>
+    <td>{{.Stream}}</td>
+    <td>{{.BinName}}</td>
+    <td>{{if .UsedAt}}{{.UsedAt}}{{else}}—{{end}}</td>
+    <td>{{.ExpiresAt}}</td>
+  </tr>
+{{end}}
 
-
-              <td>{{.Employee}}</td>
-              <td>{{.Department}}</td>
-              <td>{{.Stream}}</td>
-              <td>{{.BinName}}</td>
-
-              <td>{{if .UsedAt}}{{.UsedAt}}{{else}}—{{end}}</td>
-              <td>{{.ExpiresAt}}</td>
-            </tr>
-          {{end}}
           </tbody>
         </table>
       </div>
@@ -583,6 +581,7 @@ select option:hover {
 
       return `${hours}:${minutes} ${ampm} ${mm}/${dd}/${yyyy}`;
     }
+
     /* ===== DOM Helpers ===== */
     const $  = (sel, root=document) => root.querySelector(sel);
     const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
@@ -752,9 +751,9 @@ select option:hover {
           const expFmt  = expRaw ? formatLocal(expRaw) : "";
 
           const pill =
-            rawStatus === "used"    ? `<span class="pill pill-warn">used</span>` :
-            rawStatus === "expired" ? `<span class="pill pill-warn">expired</span>` :
-                                       `<span class="pill pill-ok">active</span>`;
+            rawStatus === "used"    ? `<span class="pill pill-used">used</span>` :
+            rawStatus === "expired" ? `<span class="pill pill-expired">expired</span>` :
+                                       `<span class="pill pill-active">active</span>`;
 
           return `
             <tr>
@@ -1025,41 +1024,40 @@ select option:hover {
       return Number.isFinite(n)? n.toFixed(digits) : "—";
     }
 
-function renderLive(){
-  const rows = Array.from(liveState.values())
-    .sort((a,b)=> String(a.bin_name||"").localeCompare(String(b.bin_name||"")));
+    function renderLive(){
+      const rows = Array.from(liveState.values())
+        .sort((a,b)=> String(a.bin_name||"").localeCompare(String(b.bin_name||"")));
 
-  liveBodyEl.innerHTML = rows.map(r => `
-    <tr data-bin="${r.bin_id}">
-      <td>${r.bin_name || ("Bin " + r.bin_id)}</td>
-      <td>${r.location || ""}</td>
-      <td>${r.stream_code || ""}</td>
-      <td>${fmtNum(r.temp_c)}</td>
-      <td>${fmtNum(r.humidity_pct)}</td>
+      liveBodyEl.innerHTML = rows.map(r => `
+        <tr data-bin="${r.bin_id}">
+          <td>${r.bin_name || ("Bin " + r.bin_id)}</td>
+          <td>${r.location || ""}</td>
+          <td>${r.stream_code || ""}</td>
+          <td>${fmtNum(r.temp_c)}</td>
+          <td>${fmtNum(r.humidity_pct)}</td>
 
-      <!-- 🔥 Door Status Pills -->
-      <td>
-        ${
-          (function(){
-            const d = (r.door_status || "").toString().toLowerCase();
+          <!-- 🔥 Door Status Pills -->
+          <td>
+            ${
+              (function(){
+                const d = (r.door_status || "").toString().toLowerCase();
 
-            if (d === "open" || d === "opened" || d === "1") {
-              return `<span class="pill pill-warn">Open</span>`;
+                if (d === "open" || d === "opened" || d === "1") {
+                  return `<span class="pill pill-warn">Open</span>`;
+                }
+                if (d === "closed" || d === "close" || d === "0") {
+                  return `<span class="pill pill-ok">Closed</span>`;
+                }
+                return "—";
+              })()
             }
-            if (d === "closed" || d === "close" || d === "0") {
-              return `<span class="pill pill-ok">Closed</span>`;
-            }
-            return "—";
-          })()
-        }
-      </td>
+          </td>
 
-      <!-- 🔥 Updated: Local Time Format -->
-      <td>${r.last_seen ? formatLocal(r.last_seen) : ""}</td>
-    </tr>
-  `).join('');
-}
-
+          <!-- 🔥 Updated: Local Time Format -->
+          <td>${r.last_seen ? formatLocal(r.last_seen) : ""}</td>
+        </tr>
+      `).join('');
+    }
 
     async function seedLive(){
       try{
@@ -1102,10 +1100,6 @@ function renderLive(){
       renderLive();
     }
 
-
-
-
-
     /* SSE + Fallback Polling */
     let livePollTimer = null;
     function startLivePolling(){
@@ -1126,8 +1120,6 @@ function renderLive(){
           }
         } catch {}
       };
-
-      
 
       // "counts" event fix
       es.addEventListener("counts", (evt) => {
@@ -1160,11 +1152,9 @@ function renderLive(){
       }
     });
 
-})();  
-</script>
+  })();
+  </script>
 
-<script src="/static/live.js"></script>
+  <script src="/static/live.js"></script>
 </body>
 </html>
-
-
