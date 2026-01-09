@@ -302,7 +302,7 @@
         </div>
         <div>
           <h1>IoT-Enabled Medical Waste Tracker</h1>
-          <small>Admin v2 • Local dashboard</small>
+          <small>UHWI Admin v2 • Local dashboard</small>
         </div>
       </div>
 
@@ -389,7 +389,7 @@
 
     <!-- CHART -->
     <section class="card chart-card">
-      <h2 class="page-title">Generated vs Used (daily)</h2>
+      <h2 class="page-title">UUID Lifecycle Overview (Daily)</h2>
       <canvas id="usageChart" height="100"></canvas>
     </section>
 
@@ -478,7 +478,7 @@
 
     <!-- ADD EMPLOYEE MODAL -->
     <dialog id="addEmployeeModal">
-      <form id="addEmployeeForm" method="dialog">
+      <form id="addEmployeeForm">
         <h3>Add Employee</h3>
 
         <label>Name
@@ -599,6 +599,10 @@
     <div class="toast" id="toast"></div>
   </div>
 
+
+
+
+
   <!-- SCRIPT SECTION -->
   <script>
   (function(){
@@ -663,70 +667,102 @@
     filterForm?.addEventListener("input", setExportHref);
 
     /* ============================================================
-       ==================== CHART REFRESH ==========================
-       ============================================================ */
-    let uuidChart = null;
+   ========== UUID LIFECYCLE BAR GRAPH (FIXED) =================
+   ============================================================ */
+let uuidChart = null;
 
-    async function refreshChart(){
-      try {
-        const qs = new URLSearchParams();
-        const dept = $("#dept")?.value;
-        const days = $("#days")?.value;
-        if (dept) qs.set('dept', dept);
-        if (days) qs.set('days', days);
+async function refreshChart(){
+  try {
+    const qs = new URLSearchParams();
+    const dept = $("#dept")?.value;
+    const days = $("#days")?.value;
+    if (dept) qs.set("dept", dept);
+    if (days) qs.set("days", days);
 
-        const resp = await fetch("/admin/chart.json" + (qs.toString()? "?"+qs:""), {cache:"no-store"});
-        const data = await resp.json();
+    const resp = await fetch("/admin/chart.json" + (qs.toString()? "?"+qs:""), {
+      cache: "no-store"
+    });
+    const data = await resp.json();
 
-        const ctx = document.getElementById("usageChart").getContext("2d");
+    const ctx = document.getElementById("usageChart").getContext("2d");
+    function formatDayLabel(s){
+  if (!s) return "";
+  // If backend sends "YYYY-MM-DD", display it clean
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)){
+    const [y,m,d] = s.split("-");
+    return `${m}/${d}/${y}`;
+  }
+  // Otherwise fall back to date-only from a timestamp
+  const dt = new Date(s);
+  const mm = String(dt.getMonth()+1).padStart(2,"0");
+  const dd = String(dt.getDate()).padStart(2,"0");
+  const yyyy = dt.getFullYear();
+  return `${mm}/${dd}/${yyyy}`;
+}
+const labels = data.labels.map(formatDayLabel);
 
-        const fmtLabels = data.labels.map(ts => formatLocal(ts));
 
-        if (!uuidChart){
-          uuidChart = new Chart(ctx, {
-            type: "line",
-            data: {
-              labels: fmtLabels,
-              datasets: [
-                {
-                  label: "Generated",
-                  data: data.generated,
-                  borderWidth: 2,
-                  borderColor: "#60a5fa",
-                  tension: .25,
-                  pointRadius: 2
-                },
-                {
-                  label: "Used",
-                  data: data.used,
-                  borderWidth: 2,
-                  borderColor: "#f87171",
-                  tension: .25,
-                  pointRadius: 2
-                }
-              ]
+    const datasets = [
+      {
+        label: "Active",
+        data: data.active,
+        backgroundColor: "#16a34a",
+      },
+      {
+        label: "Used",
+        data: data.used,
+        backgroundColor: "#f87171",
+      },
+      {
+        label: "Expired",
+        data: data.expired,
+        backgroundColor: "#fbbf24",
+      }
+    ];
+
+    if (!uuidChart){
+      uuidChart = new Chart(ctx, {
+        type: "bar",
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: {
+              labels: { color: "#cbd5e1", font: { weight: "600" } }
             },
-            options: {
-              responsive:true,
-              interaction:{ mode:"index", intersect:false },
-              plugins:{
-                legend:{ labels:{ color:"#cbd5e1" } }
-              },
-              scales:{
-                x:{ ticks:{ color:"#cbd5e1" }, grid:{ color:"rgba(255,255,255,.06)" }},
-                y:{ beginAtZero:true, ticks:{ color:"#cbd5e1" }, grid:{ color:"rgba(255,255,255,.06)" }}
-              }
-            }
-          });
-        } else {
-          uuidChart.data.labels = fmtLabels;
-          uuidChart.data.datasets[0].data = data.generated;
-          uuidChart.data.datasets[1].data = data.used;
-          uuidChart.update("none");
-        }
+            tooltip: { mode: "index", intersect: false }
+          },
+          scales: {
+            x: {
+              stacked: false,
+              ticks: {
+  color: "#cbd5e1",
+  precision: 0,
+  stepSize: 1
+},
 
-      } catch(e){ console.warn("chart refresh failed", e); }
+              grid: { color: "rgba(255,255,255,.06)" }
+            },
+            y: {
+              beginAtZero: true,
+              ticks: { color: "#cbd5e1" },
+              grid: { color: "rgba(255,255,255,.06)" }
+            }
+          }
+        }
+      });
+    } else {
+      uuidChart.data.labels = labels;
+      uuidChart.data.datasets[0].data = data.active;
+      uuidChart.data.datasets[1].data = data.used;
+      uuidChart.data.datasets[2].data = data.expired;
+      uuidChart.update();
     }
+  } catch (e) {
+    console.warn("chart refresh failed", e);
+  }
+}
 
     /* ============================================================
        =============== RECENT ACTIVITY TABLE ======================
@@ -818,7 +854,6 @@
     refreshRecent();
     refreshChart();
     setInterval(refreshRecent, 5000);
-    setInterval(refreshChart, 15000);
 
     filterForm?.addEventListener("submit", ()=>{
       setTimeout(()=>{ refreshRecent(); refreshChart(); }, 150);
@@ -1251,19 +1286,23 @@
       };
 
       // "counts" event fix
-      es.addEventListener("counts", (evt) => {
-        try {
-          const msg = JSON.parse(evt.data);
-          const count = msg.data?.active;
+es.addEventListener("counts", (evt) => {
+  try {
+    const msg = JSON.parse(evt.data);
+    const count = msg.data?.active;
 
-          const el = window.__activeUUIDEl || document.getElementById("active-uuid-count");
-          if (el && typeof count === "number") {
-            el.textContent = count;
-          }
-        } catch (e) {
-          console.error("Error handling counts event", e);
-        }
-      });
+    const el = document.getElementById("active-uuid-count");
+    if (el && typeof count === "number") {
+      el.textContent = count;
+    }
+
+    // 🔥 ADD THIS LINE
+    refreshChart();
+
+  } catch (e) {
+    console.error("Error handling counts event", e);
+  }
+});
 
       es.onerror = ()=>{
         es.close();

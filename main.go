@@ -27,6 +27,21 @@ var tpl = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 
 var db *sql.DB
 
+// ================= TIMEZONE HELPERS =================
+// Jamaica is UTC-5 (no DST in your setup). If you ever change DST handling,
+// replace this with time.LoadLocation("America/Jamaica") on systems that support it.
+var jamaicaLoc = time.FixedZone("JAM", -5*3600)
+
+const tzFromUTC = "+00:00"
+const tzToJAM = "-05:00"
+
+// local "today" (midnight) in Jamaica time
+func jamTodayMidnight() time.Time {
+	now := time.Now().In(jamaicaLoc)
+	y, m, d := now.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, jamaicaLoc)
+}
+
 // ========== LIVE (in-memory only; NOT persisted) ==========
 type liveReading struct {
 	BinID     int       `json:"bin_id"`
@@ -69,7 +84,7 @@ func sseBroadcast(msg sseMsg) {
 	sseMu.RUnlock()
 }
 
-// ========== ACTIVE UUID COUNTS ==========
+// ========== ACTIVE UUID COUNTS (LIVE) ==========
 
 func getActiveUUIDCount() int {
 	var n int
@@ -698,20 +713,24 @@ type pinResp struct {
 	DeptID int    `json:"dept_id"`
 }
 
+var empID, deptID int
+var name string
+var isActive int
+
 func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		bad(w, 405, "POST only")
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req pinReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		bad(w, 400, "bad json")
+		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
 
 	if len(req.PIN) != 5 {
-		bad(w, 400, "need 5-digit pin")
+		http.Error(w, "need 5-digit pin", http.StatusBadRequest)
 		return
 	}
 
@@ -722,17 +741,26 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		SELECT emp_id, emp_name, dept_id
 		FROM employees
 		WHERE emp_pin = ?
+		  AND is_active = 1
 		LIMIT 1
 	`, req.PIN).Scan(&empID, &name, &deptID)
 
 	if err == sql.ErrNoRows {
-		bad(w, 401, "invalid pin")
+		http.Error(w, "Access denied. Contact admin", http.StatusUnauthorized)
 		return
 	}
+
 	if err != nil {
-		bad(w, 500, "db")
+		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
+
+	// ✅ SUCCESS — ONLY ONE RESPONSE
+	writeJSON(w, pinResp{
+		EmpID:  empID,
+		Name:   name,
+		DeptID: deptID,
+	})
 
 	writeJSON(w, pinResp{EmpID: empID, Name: name, DeptID: deptID})
 }
@@ -938,18 +966,29 @@ func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
 	code := uuid.New().String()
 	exp := utcNow().Add(48 * time.Hour)
 
-	_, err = db.Exec(`
+	// ✅ Transaction: uuid_logs + uuid_daily_stats
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
 		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
 		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0)
 	`, code, req.EmpID, binID, exp)
-
 	if err != nil {
 		bad(w, 500, "insert")
 		return
 	}
 
-	broadcastActiveUUIDCount()
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
+		return
+	}
 
+	broadcastActiveUUIDCount()
 	writeJSON(w, createResp{UUID: code, BinID: binID, ExpiresAt: exp})
 }
 
@@ -1043,7 +1082,15 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	code := uuid.New().String()
 	exp := utcNow().Add(48 * time.Hour)
 
-	_, err = db.Exec(`
+	// ✅ Transaction: uuid_logs + uuid_daily_stats
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
 		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
 		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0)
 	`, code, empID, binID, exp)
@@ -1052,8 +1099,12 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	broadcastActiveUUIDCount()
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
+		return
+	}
 
+	broadcastActiveUUIDCount()
 	writeJSON(w, createFromPinResp{
 		UUID:      code,
 		BinID:     binID,
@@ -1092,6 +1143,7 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate current status (keep your existing checks)
 	var isUsed int
 	var expires *time.Time
 
@@ -1115,25 +1167,41 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		bad(w, 409, "already used")
 		return
 	}
-
 	if expires != nil && utcNow().After(expires.UTC()) {
 		bad(w, 410, "expired")
 		return
 	}
 
-	_, err = db.Exec(`
+	// ✅ Transaction: mark used + update uuid_daily_stats
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`
 		UPDATE uuid_logs
 		SET is_used=1, used_at=UTC_TIMESTAMP()
-		WHERE uuid_value=? AND bin_id=?
+		WHERE uuid_value=? AND bin_id=? AND is_used=0
 	`, req.UUID, req.BinID)
-
 	if err != nil {
 		bad(w, 500, "update")
 		return
 	}
 
-	broadcastActiveUUIDCount()
+	aff, _ := res.RowsAffected()
+	if aff == 0 {
+		bad(w, 409, "already used or invalid")
+		return
+	}
 
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
+		return
+	}
+
+	broadcastActiveUUIDCount()
 	writeJSON(w, okResp{OK: true})
 }
 
@@ -1517,7 +1585,7 @@ LIMIT ?
 func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/csv")
-	w.Header().Set("Content-Disposition", `attachment; filename="uuid_logs.csv"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="UHWI UUID_logs.csv"`)
 
 	where, args := buildFilters(r)
 
@@ -1581,10 +1649,10 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-/* ---------- CHART DATA ---------- */
-
+/* ---------- CHART DATA (BAR GRAPH: generated/used/expired) ---------- */
 func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
 
 	days := 14
 	if d := r.URL.Query().Get("days"); d != "" {
@@ -1593,89 +1661,113 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var deptCond string
-	var argsGen []any
-	var argsUsed []any
+	start := jamTodayMidnight().AddDate(0, 0, -days+1)
 
-	if dept := r.URL.Query().Get("dept"); dept != "" {
-		deptCond = " AND d.dept_id = ? "
-		argsGen = append(argsGen, dept)
-		argsUsed = append(argsUsed, dept)
-	}
-
-	qGen := `
-		SELECT DATE(ul.generated_at) AS d, COUNT(*)
-		FROM uuid_logs ul
-		JOIN employees e   ON e.emp_id  = ul.emp_id
-		JOIN departments d ON d.dept_id = e.dept_id
-		WHERE ul.generated_at >= (UTC_TIMESTAMP() - INTERVAL ? DAY)
-	` + deptCond + `
-		GROUP BY DATE(ul.generated_at)
-		ORDER BY d
-	`
-
-	argsGen = append([]any{days}, argsGen...)
-	rowsGen, err := db.Query(qGen, argsGen...)
+	rows, err := db.Query(`
+  SELECT
+    DATE(CONVERT_TZ(generated_at,'+00:00','-05:00')) AS day,
+    COUNT(*) AS generated_cnt,
+    SUM(CASE WHEN is_used = 1 THEN 1 ELSE 0 END) AS used_cnt,
+    SUM(
+      CASE
+        WHEN is_used = 0
+         AND expires_at IS NOT NULL
+         AND UTC_TIMESTAMP() > expires_at
+        THEN 1 ELSE 0
+      END
+    ) AS expired_cnt
+  FROM uuid_logs
+  GROUP BY DATE(CONVERT_TZ(generated_at,'+00:00','-05:00'))
+  ORDER BY DATE(CONVERT_TZ(generated_at,'+00:00','-05:00'))
+`)
 	if err != nil {
-		bad(w, 500, "db")
+		bad(w, 500, err.Error())
 		return
 	}
-	defer rowsGen.Close()
+	defer rows.Close()
 
-	qUsed := `
-		SELECT DATE(ul.used_at) AS d, COUNT(*)
-		FROM uuid_logs ul
-		JOIN employees e   ON e.emp_id  = ul.emp_id
-		JOIN departments d ON d.dept_id = e.dept_id
-		WHERE ul.is_used = 1
-		  AND ul.used_at >= (UTC_TIMESTAMP() - INTERVAL ? DAY)
-	` + deptCond + `
-		GROUP BY DATE(ul.used_at)
-		ORDER BY d
-	`
+	type rec struct {
+		g int
+		u int
+		x int
+	}
 
-	argsUsed = append([]any{days}, argsUsed...)
-	rowsUsed, err := db.Query(qUsed, argsUsed...)
+	m := map[string]rec{}
+	activeByDay := map[string]int{}
+
+	for rows.Next() {
+		var day time.Time
+		var g, u, x int
+
+		if err := rows.Scan(&day, &g, &u, &x); err != nil {
+			bad(w, 500, "scan(chart)")
+			return
+		}
+
+		k := day.Format("2006-01-02")
+		m[k] = rec{g: g, u: u, x: x}
+	}
+	rows2, err := db.Query(`
+  SELECT
+    d.day,
+    (
+      SELECT COUNT(*)
+      FROM uuid_logs ul
+      WHERE
+        DATE(CONVERT_TZ(ul.generated_at,'+00:00','-05:00')) <= d.day
+        AND ul.is_used = 0
+        AND (
+          ul.expires_at IS NULL
+          OR DATE(CONVERT_TZ(ul.expires_at,'+00:00','-05:00')) > d.day
+        )
+    ) AS active_cnt
+  FROM (
+    SELECT DISTINCT
+      DATE(CONVERT_TZ(generated_at,'+00:00','-05:00')) AS day
+    FROM uuid_logs
+  ) d
+`)
 	if err != nil {
-		bad(w, 500, "db")
+		bad(w, 500, err.Error())
 		return
 	}
-	defer rowsUsed.Close()
+	defer rows2.Close()
 
-	genMap := map[string]int{}
-	for rowsGen.Next() {
-		var d string
-		var c int
-		_ = rowsGen.Scan(&d, &c)
-		genMap[d] = c
-	}
-
-	usedMap := map[string]int{}
-	for rowsUsed.Next() {
-		var d string
-		var c int
-		_ = rowsUsed.Scan(&d, &c)
-		usedMap[d] = c
+	for rows2.Next() {
+		var day time.Time
+		var cnt int
+		if err := rows2.Scan(&day, &cnt); err != nil {
+			bad(w, 500, "scan(active)")
+			return
+		}
+		activeByDay[day.Format("2006-01-02")] = cnt
 	}
 
 	labels := []string{}
-	genSeries := []int{}
-	usedSeries := []int{}
+	active := []int{}
+	used := []int{}
+	expired := []int{}
 
-	todayUTC := utcNow().Truncate(24 * time.Hour)
-	start := todayUTC.AddDate(0, 0, -days+1)
+	today := jamTodayMidnight()
 
-	for d := start; !d.After(todayUTC); d = d.AddDate(0, 0, 1) {
-		key := d.Format("2006-01-02")
-		labels = append(labels, key)
-		genSeries = append(genSeries, genMap[key])
-		usedSeries = append(usedSeries, usedMap[key])
+	for d := start; !d.After(today); d = d.AddDate(0, 0, 1) {
+		k := d.Format("2006-01-02")
+		r := m[k]
+
+		labels = append(labels, k)
+		a := activeByDay[k]
+		active = append(active, a)
+
+		used = append(used, r.u)
+		expired = append(expired, r.x)
 	}
 
 	writeJSON(w, map[string]any{
-		"labels":    labels,
-		"generated": genSeries,
-		"used":      usedSeries,
+		"title":   "UUID Daily Statistics",
+		"labels":  labels,
+		"active":  active,
+		"used":    used,
+		"expired": expired,
 	})
 }
 
@@ -1784,6 +1876,119 @@ func handleBinDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
+// ====== DAILY UUID STATS ROLLUP (uuid_daily_stats) ======
+
+// Ensures there's a row for today's date in uuid_daily_stats (Jamaica date)
+func ensureStatsRowForToday() {
+	day := jamTodayMidnight().Format("2006-01-02")
+	_, _ = db.Exec(`
+		INSERT INTO uuid_daily_stats (stat_date, generated_count, used, expired)
+		VALUES (?, 0, 0, 0)
+		ON DUPLICATE KEY UPDATE stat_date = stat_date
+	`, day)
+}
+
+// Roll up counts for a specific Jamaica day into uuid_daily_stats
+func updateStatsForDay(day time.Time) error {
+	dayStr := day.Format("2006-01-02")
+
+	// boundaries in UTC for "that Jamaica day"
+	startLocal := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, jamaicaLoc)
+	endLocal := startLocal.Add(24 * time.Hour)
+
+	startUTC := startLocal.UTC()
+	endUTC := endLocal.UTC()
+
+	// ✅ GENERATED during that day (generated_at inside the UTC window)
+	var generated int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM uuid_logs
+		WHERE generated_at >= ?
+		  AND generated_at < ?
+	`, startUTC, endUTC).Scan(&generated); err != nil {
+		return err
+	}
+
+	// USED during that day (used_at inside the UTC window)
+	var used int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM uuid_logs
+		WHERE is_used = 1
+		  AND used_at IS NOT NULL
+		  AND used_at >= ?
+		  AND used_at < ?
+	`, startUTC, endUTC).Scan(&used); err != nil {
+		return err
+	}
+
+	// EXPIRED during that day (expired_at inside the UTC window)
+	var expired int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM uuid_logs
+		WHERE expired_at IS NOT NULL
+		  AND expired_at >= ?
+		  AND expired_at < ?
+	`, startUTC, endUTC).Scan(&expired); err != nil {
+		return err
+	}
+
+	_, err := db.Exec(`
+		INSERT INTO uuid_daily_stats (stat_date, generated_count, used, expired)
+		VALUES (?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		  generated_count=VALUES(generated_count),
+		  used=VALUES(used),
+		  expired=VALUES(expired),
+		  updated_at=CURRENT_TIMESTAMP
+	`, dayStr, generated, used, expired)
+
+	return err
+}
+
+// Marks newly-expired UUIDs once, so they can be counted safely (no double counting)
+func markNewlyExpired() {
+	_, _ = db.Exec(`
+		UPDATE uuid_logs
+		SET expired_at = UTC_TIMESTAMP()
+		WHERE is_used = 0
+		  AND expires_at IS NOT NULL
+		  AND expires_at < UTC_TIMESTAMP()
+		  AND expired_at IS NULL
+	`)
+}
+
+// Runs forever: marks expiries + updates today/previous days
+func startUUIDDailyRollupJob() {
+	go func() {
+		// run once at boot
+		ensureStatsRowForToday()
+		markNewlyExpired()
+
+		// refresh last N days (covers restarts + late updates)
+		const backfillDays = 30
+		today := jamTodayMidnight()
+		for i := 0; i < backfillDays; i++ {
+			_ = updateStatsForDay(today.AddDate(0, 0, -i))
+		}
+
+		// then keep updating
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			ensureStatsRowForToday()
+			markNewlyExpired()
+
+			// update today + yesterday continuously
+			_ = updateStatsForDay(jamTodayMidnight())
+			_ = updateStatsForDay(jamTodayMidnight().AddDate(0, 0, -1))
+		}
+	}()
+}
+
 // ========== MAIN ==========
 func main() {
 	var err error
@@ -1803,15 +2008,7 @@ func main() {
 	}
 
 	fmt.Println("✅ Connected to MySQL (UTC mode)")
-
-	// AUTO-SSE COUNT REFRESH
-	go func() {
-		t := time.NewTicker(60 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			broadcastActiveUUIDCount()
-		}
-	}()
+	startUUIDDailyRollupJob()
 
 	// ===== ROUTES =====
 	http.HandleFunc("/admin/chart.json", handleAdminChartJSON)
