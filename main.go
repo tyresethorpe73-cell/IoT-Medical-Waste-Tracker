@@ -735,15 +735,15 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var empID, deptID int
-	var name string
+	var empName string
 
 	err := db.QueryRow(`
-		SELECT emp_id, emp_name, dept_id
-		FROM employees
-		WHERE emp_pin = ?
-		  AND is_active = 1
-		LIMIT 1
-	`, req.PIN).Scan(&empID, &name, &deptID)
+    SELECT emp_id, emp_name, dept_id
+    FROM employees
+    WHERE emp_pin = ?
+      AND is_active = 1
+    LIMIT 1
+`, req.PIN).Scan(&empID, &empName, &deptID)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "Access denied. Contact admin", http.StatusUnauthorized)
@@ -758,11 +758,9 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 	// ✅ SUCCESS — ONLY ONE RESPONSE
 	writeJSON(w, pinResp{
 		EmpID:  empID,
-		Name:   name,
+		Name:   empName,
 		DeptID: deptID,
 	})
-
-	writeJSON(w, pinResp{EmpID: empID, Name: name, DeptID: deptID})
 }
 
 /* ---------- EMPLOYEES ---------- */
@@ -779,11 +777,17 @@ type empCreateResp struct {
 	DeptID int    `json:"dept_id"`
 }
 
+type empStatusReq struct {
+	EmpID    int `json:"emp_id"`
+	IsActive int `json:"is_active"` // 1 = active, 0 = inactive
+}
+
 type empListRow struct {
-	EmpID  int    `json:"emp_id"`
-	Name   string `json:"name"`
-	DeptID int    `json:"dept_id"`
-	Dept   string `json:"dept"`
+	EmpID    int    `json:"emp_id"`
+	Name     string `json:"name"`
+	DeptID   int    `json:"dept_id"`
+	Dept     string `json:"dept"`
+	IsActive int    `json:"is_active"`
 }
 
 func handleEmployees(w http.ResponseWriter, r *http.Request) {
@@ -791,10 +795,10 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodGet:
 		rows, err := db.Query(`
-			SELECT e.emp_id, e.emp_name, e.dept_id, d.dept_name
-			FROM employees e
-			JOIN departments d ON d.dept_id = e.dept_id
-			ORDER BY d.dept_name, e.emp_name
+			SELECT e.emp_id, e.emp_name, e.dept_id, d.dept_name, e.is_active
+FROM employees e
+JOIN departments d ON d.dept_id = e.dept_id
+ORDER BY d.dept_name, e.emp_name
 		`)
 		if err != nil {
 			bad(w, 500, "db(employees)")
@@ -805,7 +809,7 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 		var out []empListRow
 		for rows.Next() {
 			var rr empListRow
-			if err := rows.Scan(&rr.EmpID, &rr.Name, &rr.DeptID, &rr.Dept); err != nil {
+			if err := rows.Scan(&rr.EmpID, &rr.Name, &rr.DeptID, &rr.Dept, &rr.IsActive); err != nil {
 				bad(w, 500, "scan")
 				return
 			}
@@ -865,6 +869,49 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func handleEmployeeStatus(w http.ResponseWriter, r *http.Request) {
+	log.Printf("EMP STATUS HIT → method=%s path=%s", r.Method, r.URL.Path)
+
+	if allowCORS(w, r) {
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req empStatusReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	if req.EmpID <= 0 || (req.IsActive != 0 && req.IsActive != 1) {
+		bad(w, 400, "invalid request")
+		return
+	}
+
+	res, err := db.Exec(`
+		UPDATE employees
+		SET is_active = ?
+		WHERE emp_id = ?
+	`, req.IsActive, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db(update employee status)")
+		return
+	}
+
+	aff, _ := res.RowsAffected()
+	if aff == 0 {
+		bad(w, 404, "employee not found")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 /* ---------- UUID CREATE (legacy) ---------- */
 
 type createReq struct {
@@ -899,8 +946,10 @@ func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
 
 	var tmp int
 	err := db.QueryRow(`
-		SELECT 1 FROM employees
-		WHERE emp_id=? AND dept_id=?
+SELECT 1 FROM employees
+WHERE emp_id=?
+  AND dept_id=?
+  AND is_active = 1
 	`, req.EmpID, req.DeptID).Scan(&tmp)
 
 	if err == sql.ErrNoRows {
@@ -1009,6 +1058,7 @@ type createFromPinResp struct {
 }
 
 func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		bad(w, 405, "POST only")
 		return
@@ -1029,11 +1079,12 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	var empName string
 
 	err := db.QueryRow(`
-		SELECT emp_id, emp_name, dept_id
-		FROM employees
-		WHERE emp_pin = ?
-		LIMIT 1
-	`, req.PIN).Scan(&empID, &empName, &deptID)
+    SELECT emp_id, emp_name, dept_id
+    FROM employees
+    WHERE emp_pin = ?
+      AND is_active = 1
+    LIMIT 1
+`, req.PIN).Scan(&empID, &empName, &deptID)
 
 	if err == sql.ErrNoRows {
 		bad(w, 401, "invalid pin")
@@ -2037,6 +2088,7 @@ func main() {
 
 	// employees
 	http.HandleFunc("/employees", handleEmployees)
+	http.HandleFunc("/employees/status", handleEmployeeStatus)
 
 	// auth + uuid
 	http.HandleFunc("/auth/pin", handleAuthPIN)

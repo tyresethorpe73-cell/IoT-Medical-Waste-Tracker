@@ -190,7 +190,7 @@
     table{ width:100%; border-collapse: collapse; font-size:.95rem; }
 
     thead th{
-      position: sticky; top:0;
+      position: sticky; top:0; z-index: 5;
       background: linear-gradient(180deg, #0f1524, #0c1321);
       border-bottom:1px solid var(--border);
       text-align:left; padding:.7rem .8rem;
@@ -231,6 +231,50 @@
     /* For other pills used elsewhere (door open/closed, etc.) */
     .pill-ok { background: #16a34a22; color: var(--success); }
     .pill-warn { background: #dc262622; color: var(--danger); }
+
+    /* ===== EMPLOYEE STATUS SWITCH ===== */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 24px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch .slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background-color: #374151;
+  border-radius: 999px;
+  transition: 0.25s;
+}
+
+.switch .slider:before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  border-radius: 50%;
+  transition: 0.25s;
+}
+
+.switch input:checked + .slider {
+  background-color: #22c55e;
+}
+
+.switch input:checked + .slider:before {
+  transform: translateX(22px);
+}
+
 
     /* DIALOGS */
     dialog::backdrop{
@@ -511,14 +555,17 @@
 
       <div class="table-wrap" style="max-height:55vh; overflow:auto">
         <table id="empTable">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Department</th>
-              <th>Employee ID</th>
-              <th>Department ID</th>
-            </tr>
-          </thead>
+
+<thead>
+  <tr>
+    <th>Name</th>
+    <th>Department</th>
+    <th>Emp ID</th>
+    <th>Dept ID</th>
+    <th>Status</th>
+  </tr>
+</thead>
+
           <tbody></tbody>
         </table>
       </div>
@@ -606,6 +653,28 @@
   <!-- SCRIPT SECTION -->
   <script>
   (function(){
+
+window.toggleEmployeeStatus = async function(empId, isActive) {
+  try {
+    const res = await fetch("/employees/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        emp_id: empId,
+        is_active: isActive ? 1 : 0
+      })
+    });
+
+    if (!res.ok) throw new Error("Update failed");
+
+   toast(isActive ? "Employee activated" : "Employee deactivated");
+loadEmployees(); // 🔥 force re-sync from backend
+  } catch (e) {
+    toast("Failed to update employee status");
+    console.error(e);
+  }
+}
+
 
     /* ==== Timestamp Formatter (Local Jamaica Time) ==== */
     function formatLocal(ts) {
@@ -949,16 +1018,28 @@ const labels = data.labels.map(formatDayLabel);
 
         empListStatus.textContent = `Total: ${list.length}`;
 
-        for (const e of list){
-          const tr = document.createElement("tr");
-          tr.innerHTML = `
-            <td>${e.name}</td>
-            <td>${e.dept}</td>
-            <td>${e.emp_id}</td>
-            <td>${e.dept_id}</td>
-          `;
-          empTableBody.appendChild(tr);
-        }
+for (const e of list){
+  const tr = document.createElement("tr");
+
+  const checked = e.is_active === 1 ? "checked" : "";
+
+  tr.innerHTML = `
+    <td>${e.name}</td>
+    <td>${e.dept}</td>
+    <td>${e.emp_id}</td>
+    <td>${e.dept_id}</td>
+    <td>
+      <label class="switch">
+        <input type="checkbox" ${checked}
+          onchange="toggleEmployeeStatus(${e.emp_id}, this.checked)">
+        <span class="slider"></span>
+      </label>
+    </td>
+  `;
+
+  empTableBody.appendChild(tr);
+}
+
 
       } catch(err){
         console.error(err);
@@ -1222,6 +1303,7 @@ const labels = data.labels.map(formatDayLabel);
         </tr>
       `).join('');
     }
+    
 
     async function seedLive(){
       try{
