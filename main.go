@@ -708,9 +708,11 @@ type pinReq struct {
 }
 
 type pinResp struct {
-	EmpID  int    `json:"emp_id"`
-	Name   string `json:"name"`
-	DeptID int    `json:"dept_id"`
+	Valid        bool   `json:"valid"`
+	Role         string `json:"role"`
+	EmployeeID   int    `json:"employee_id"`
+	EmployeeName string `json:"employee_name"`
+	SessionUUID  string `json:"session_uuid"`
 }
 
 var empID, deptID int
@@ -735,15 +737,15 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var empID, deptID int
-	var empName string
+	var empName, role string
 
 	err := db.QueryRow(`
-    SELECT emp_id, emp_name, dept_id
-    FROM employees
-    WHERE emp_pin = ?
-      AND is_active = 1
-    LIMIT 1
-`, req.PIN).Scan(&empID, &empName, &deptID)
+		SELECT emp_id, emp_name, dept_id, role
+		FROM employees
+		WHERE emp_pin = ?
+		  AND is_active = 1
+		LIMIT 1
+	`, req.PIN).Scan(&empID, &empName, &deptID, &role)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "Access denied. Contact admin", http.StatusUnauthorized)
@@ -755,11 +757,15 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ✅ SUCCESS — ONLY ONE RESPONSE
+	// ✅ SUCCESS — build response AFTER validation
+	sessionUUID := uuid.New().String()
+
 	writeJSON(w, pinResp{
-		EmpID:  empID,
-		Name:   empName,
-		DeptID: deptID,
+		Valid:        true,
+		Role:         role, // "employee" or "manager"
+		EmployeeID:   empID,
+		EmployeeName: empName,
+		SessionUUID:  sessionUUID,
 	})
 }
 
@@ -1024,8 +1030,17 @@ WHERE emp_id=?
 	defer tx.Rollback()
 
 	_, err = tx.Exec(`
-		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
-		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0)
+INSERT INTO uuid_logs (
+  uuid_value,
+  emp_id,
+  bin_id,
+  generated_at,
+  expires_at,
+  is_used,
+  action
+)
+VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in')
+
 	`, code, req.EmpID, binID, exp)
 	if err != nil {
 		bad(w, 500, "insert")
@@ -1142,9 +1157,18 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(`
-		INSERT INTO uuid_logs (uuid_value, emp_id, bin_id, generated_at, expires_at, is_used)
-		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0)
-	`, code, empID, binID, exp)
+    INSERT INTO uuid_logs (
+        uuid_value,
+        emp_id,
+        bin_id,
+        generated_at,
+        expires_at,
+        is_used,
+        action
+    )
+    VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in')
+`, code, empID, binID, exp)
+
 	if err != nil {
 		bad(w, 500, "insert")
 		return
@@ -1194,19 +1218,19 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate current status (keep your existing checks)
-	var isUsed int
-	var expires *time.Time
-
+	// 1️⃣ Ensure active clock-in exists
+	var empID int
 	err := db.QueryRow(`
-		SELECT is_used, expires_at
-		FROM uuid_logs
-		WHERE uuid_value=? AND bin_id=?
-		LIMIT 1
-	`, req.UUID, req.BinID).Scan(&isUsed, &expires)
+	SELECT emp_id
+	FROM uuid_logs
+	WHERE uuid_value = ?
+	  AND action = 'clock_in'
+	  AND closed_at IS NULL
+	LIMIT 1
+`, req.UUID).Scan(&empID)
 
 	if err == sql.ErrNoRows {
-		bad(w, 404, "uuid not found for this bin")
+		bad(w, 409, "no active clock-in")
 		return
 	}
 	if err != nil {
@@ -1214,46 +1238,41 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if isUsed == 1 {
-		bad(w, 409, "already used")
-		return
-	}
-	if expires != nil && utcNow().After(expires.UTC()) {
-		bad(w, 410, "expired")
+	// 2️⃣ Ensure NOT already consumed
+	var exists int
+	err = db.QueryRow(`
+	SELECT 1
+	FROM uuid_logs
+	WHERE uuid_value = ?
+	  AND action = 'consume'
+	LIMIT 1
+`, req.UUID).Scan(&exists)
+
+	if err == nil {
+		bad(w, 409, "already consumed")
 		return
 	}
 
-	// ✅ Transaction: mark used + update uuid_daily_stats
-	tx, err := db.Begin()
+	// 3️⃣ Insert consume row
+	_, err = db.Exec(`
+	INSERT INTO uuid_logs (
+		uuid_value,
+		emp_id,
+		bin_id,
+		is_used,
+		used_at,
+		action
+	)
+	VALUES (?, ?, ?, 1, UTC_TIMESTAMP(), 'consume')
+`, req.UUID, empID, req.BinID)
+
 	if err != nil {
-		bad(w, 500, "tx")
-		return
-	}
-	defer tx.Rollback()
-
-	res, err := tx.Exec(`
-		UPDATE uuid_logs
-		SET is_used=1, used_at=UTC_TIMESTAMP()
-		WHERE uuid_value=? AND bin_id=? AND is_used=0
-	`, req.UUID, req.BinID)
-	if err != nil {
-		bad(w, 500, "update")
+		bad(w, 500, "insert consume failed")
 		return
 	}
 
-	aff, _ := res.RowsAffected()
-	if aff == 0 {
-		bad(w, 409, "already used or invalid")
-		return
-	}
-
-	if err := tx.Commit(); err != nil {
-		bad(w, 500, "commit")
-		return
-	}
-
-	broadcastActiveUUIDCount()
 	writeJSON(w, okResp{OK: true})
+
 }
 
 /* ---------- TELEMETRY ---------- */
@@ -2040,6 +2059,199 @@ func startUUIDDailyRollupJob() {
 	}()
 }
 
+/* ---------- UUID CLOCK-OUT ---------- */
+
+type clockOutReq struct {
+	UUID string `json:"uuid"`
+}
+
+func handleUUIDClockOut(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req clockOutReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	req.UUID = strings.TrimSpace(req.UUID)
+	if req.UUID == "" {
+		bad(w, 400, "uuid required")
+		return
+	}
+
+	// 1️⃣ Ensure UUID exists and is aUPDATE uuid_log valid active clock-in
+	var uuidID int
+	err := db.QueryRow(`
+SELECT uuid_id
+FROM uuid_logs
+WHERE uuid_value = ?
+  AND action = 'clock_in'
+  AND closed_at IS NULL
+LIMIT 1
+
+`, req.UUID).Scan(&uuidID)
+
+	if err == sql.ErrNoRows {
+		bad(w, 409, "uuid not active or already closed")
+		return
+	}
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	// 2️⃣ Close the session
+	_, err = db.Exec(`
+UPDATE uuid_logs
+SET closed_at = UTC_TIMESTAMP()
+WHERE uuid_id = ?
+	`, uuidID)
+
+	if err != nil {
+		bad(w, 500, "db(update)")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+/* ---------- MANAGER UUID SYSTEM ---------- */
+
+type managerCreateResp struct {
+	UUID string `json:"uuid"`
+}
+
+func handleManagerCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	newUUID := uuid.New().String()
+
+_, err := db.Exec(`
+    INSERT INTO manager_uuids (uuid_value, is_revoked)
+    VALUES (?, 0)
+`, newUUID)
+
+
+	if err != nil {
+		bad(w, 500, "insert failed")
+		return
+	}
+
+	writeJSON(w, managerCreateResp{UUID: newUUID})
+}
+
+func handleManagerList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT uuid_value
+		FROM manager_uuids
+		WHERE is_revoked = 0
+	`)
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	var list []string
+
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err == nil {
+			list = append(list, u)
+		}
+	}
+
+	writeJSON(w, map[string]any{
+		"managers": list,
+	})
+}
+
+type managerRevokeReq struct {
+	UUID string `json:"uuid"`
+}
+
+func handleManagerRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerRevokeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+res, err := db.Exec(`
+    UPDATE manager_uuids
+    SET is_revoked = 1
+    WHERE uuid_value = ?
+`, req.UUID)
+
+if err != nil {
+    bad(w, 500, "db")
+    return
+}
+
+rows, _ := res.RowsAffected()
+if rows == 0 {
+    bad(w, 404, "manager uuid not found")
+    return
+}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+type managerValidateResp struct {
+	Valid bool `json:"valid"`
+}
+
+func handleManagerValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerRevokeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	var exists int
+	err := db.QueryRow(`
+		SELECT 1
+		FROM manager_uuids
+		WHERE uuid_value = ?
+		  AND is_revoked = 0
+		LIMIT 1
+	`, req.UUID).Scan(&exists)
+
+	if err == sql.ErrNoRows {
+		writeJSON(w, managerValidateResp{Valid: false})
+		return
+	}
+
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	writeJSON(w, managerValidateResp{Valid: true})
+}
+
 // ========== MAIN ==========
 func main() {
 	var err error
@@ -2094,6 +2306,13 @@ func main() {
 	http.HandleFunc("/auth/pin", handleAuthPIN)
 	http.HandleFunc("/uuid/create/from-pin", handleUUIDCreateFromPIN)
 	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)
+	http.HandleFunc("/uuid/clock-out", handleUUIDClockOut)
+
+	// manager system
+	http.HandleFunc("/manager/create", handleManagerCreate)
+	http.HandleFunc("/manager/list", handleManagerList)
+	http.HandleFunc("/manager/revoke", handleManagerRevoke)
+	http.HandleFunc("/manager/validate", handleManagerValidate)
 
 	// bin module
 	http.HandleFunc("/bin/consume", handleBinConsume)
