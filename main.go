@@ -2119,112 +2119,244 @@ WHERE uuid_id = ?
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-/* ---------- MANAGER UUID SYSTEM ---------- */
+/* ---------- MANAGERS (FULL ACCOUNT SYSTEM) ---------- */
 
-type managerCreateResp struct {
+type managerCreateReq struct {
+	Name string `json:"name"`
+	PIN  string `json:"pin"`
+}
+
+type managerStatusReq struct {
+	ManagerID int `json:"manager_id"`
+	IsActive  int `json:"is_active"`
+}
+
+type managerDeleteReq struct {
+	ManagerID int `json:"manager_id"`
+}
+
+type managerUUIDReq struct {
+	ManagerID int    `json:"manager_id"`
+	UUID      string `json:"uuid,omitempty"`
+}
+type managerValidateReq struct {
 	UUID string `json:"uuid"`
-}
-
-func handleManagerCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		bad(w, 405, "POST only")
-		return
-	}
-
-	newUUID := uuid.New().String()
-
-_, err := db.Exec(`
-    INSERT INTO manager_uuids (uuid_value, is_revoked)
-    VALUES (?, 0)
-`, newUUID)
-
-
-	if err != nil {
-		bad(w, 500, "insert failed")
-		return
-	}
-
-	writeJSON(w, managerCreateResp{UUID: newUUID})
-}
-
-func handleManagerList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		bad(w, 405, "GET only")
-		return
-	}
-
-	rows, err := db.Query(`
-		SELECT uuid_value
-		FROM manager_uuids
-		WHERE is_revoked = 0
-	`)
-	if err != nil {
-		bad(w, 500, "db")
-		return
-	}
-	defer rows.Close()
-
-	var list []string
-
-	for rows.Next() {
-		var u string
-		if err := rows.Scan(&u); err == nil {
-			list = append(list, u)
-		}
-	}
-
-	writeJSON(w, map[string]any{
-		"managers": list,
-	})
-}
-
-type managerRevokeReq struct {
-	UUID string `json:"uuid"`
-}
-
-func handleManagerRevoke(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		bad(w, 405, "POST only")
-		return
-	}
-
-	var req managerRevokeReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		bad(w, 400, "bad json")
-		return
-	}
-
-res, err := db.Exec(`
-    UPDATE manager_uuids
-    SET is_revoked = 1
-    WHERE uuid_value = ?
-`, req.UUID)
-
-if err != nil {
-    bad(w, 500, "db")
-    return
-}
-
-rows, _ := res.RowsAffected()
-if rows == 0 {
-    bad(w, 404, "manager uuid not found")
-    return
-}
-
-	writeJSON(w, map[string]bool{"ok": true})
 }
 
 type managerValidateResp struct {
 	Valid bool `json:"valid"`
 }
 
-func handleManagerValidate(w http.ResponseWriter, r *http.Request) {
+/* ---------- MANAGERS (GET + POST) ---------- */
+
+func handleManagers(w http.ResponseWriter, r *http.Request) {
+
+	switch r.Method {
+
+	case http.MethodGet:
+
+		rows, err := db.Query(`
+			SELECT manager_id, name, pin, is_active
+			FROM managers
+			ORDER BY name
+		`)
+		if err != nil {
+			bad(w, 500, "db(managers)")
+			return
+		}
+		defer rows.Close()
+
+		type row struct {
+			ManagerID int    `json:"manager_id"`
+			Name      string `json:"name"`
+			PIN       string `json:"pin"`
+			IsActive  int    `json:"is_active"`
+		}
+
+		var out []row
+
+		for rows.Next() {
+			var rr row
+			if err := rows.Scan(&rr.ManagerID, &rr.Name, &rr.PIN, &rr.IsActive); err != nil {
+				bad(w, 500, "scan")
+				return
+			}
+			out = append(out, rr)
+		}
+
+		writeJSON(w, map[string]any{"managers": out})
+		return
+
+	case http.MethodPost:
+
+		var req managerCreateReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			bad(w, 400, "bad json")
+			return
+		}
+
+		if req.Name == "" || len(req.PIN) != 5 {
+			bad(w, 400, "need name + 5-digit pin")
+			return
+		}
+
+		var exists int
+		if err := db.QueryRow(`
+			SELECT 1 FROM managers WHERE pin=?
+		`, req.PIN).Scan(&exists); err == nil {
+			bad(w, 409, "pin already in use")
+			return
+		}
+
+		res, err := db.Exec(`
+			INSERT INTO managers (name, pin)
+			VALUES (?, ?)
+		`, req.Name, req.PIN)
+
+		if err != nil {
+			bad(w, 500, "insert")
+			return
+		}
+
+		id64, _ := res.LastInsertId()
+
+		writeJSON(w, map[string]any{
+			"manager_id": int(id64),
+			"name":       req.Name,
+		})
+		return
+
+	default:
+		bad(w, 405, "GET or POST only")
+	}
+}
+
+/* ---------- MANAGER STATUS TOGGLE ---------- */
+
+func handleManagerStatus(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		bad(w, 405, "POST only")
 		return
 	}
 
-	var req managerRevokeReq
+	var req managerStatusReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	_, err := db.Exec(`
+		UPDATE managers
+		SET is_active = ?
+		WHERE manager_id = ?
+	`, req.IsActive, req.ManagerID)
+
+	if err != nil {
+		bad(w, 500, "update")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+/* ---------- DELETE MANAGER ---------- */
+
+func handleManagerDelete(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerDeleteReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	// delete UUIDs first
+	_, _ = db.Exec(`DELETE FROM manager_uuids WHERE manager_id=?`, req.ManagerID)
+
+	_, err := db.Exec(`DELETE FROM managers WHERE manager_id=?`, req.ManagerID)
+	if err != nil {
+		bad(w, 500, "delete")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+/* ---------- CREATE MANAGER UUID ---------- */
+
+func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerUUIDReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	newUUID := uuid.New().String()
+
+	_, err := db.Exec(`
+		INSERT INTO manager_uuids (manager_id, uuid_value)
+		VALUES (?, ?)
+	`, req.ManagerID, newUUID)
+
+	if err != nil {
+		bad(w, 500, "insert uuid")
+		return
+	}
+
+	writeJSON(w, map[string]string{"uuid": newUUID})
+}
+
+/* ---------- REVOKE MANAGER UUID ---------- */
+
+func handleManagerUUIDRevoke(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerUUIDReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	_, err := db.Exec(`
+    UPDATE manager_uuids
+    SET is_revoked = 1,
+        revoked_at = UTC_TIMESTAMP()
+    WHERE uuid_value = ?
+`, req.UUID)
+
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+/* ---------- VALIDATE MANAGER UUID ---------- */
+
+func handleManagerValidate(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerValidateReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		bad(w, 400, "bad json")
 		return
@@ -2233,9 +2365,11 @@ func handleManagerValidate(w http.ResponseWriter, r *http.Request) {
 	var exists int
 	err := db.QueryRow(`
 		SELECT 1
-		FROM manager_uuids
-		WHERE uuid_value = ?
-		  AND is_revoked = 0
+		FROM manager_uuids mu
+		JOIN managers m ON m.manager_id = mu.manager_id
+		WHERE mu.uuid_value = ?
+		  AND mu.is_revoked = 0
+		  AND m.is_active = 1
 		LIMIT 1
 	`, req.UUID).Scan(&exists)
 
@@ -2308,11 +2442,13 @@ func main() {
 	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)
 	http.HandleFunc("/uuid/clock-out", handleUUIDClockOut)
 
-	// manager system
-	http.HandleFunc("/manager/create", handleManagerCreate)
-	http.HandleFunc("/manager/list", handleManagerList)
-	http.HandleFunc("/manager/revoke", handleManagerRevoke)
-	http.HandleFunc("/manager/validate", handleManagerValidate)
+	// managers (new full system)
+	http.HandleFunc("/managers", handleManagers)
+	http.HandleFunc("/managers/status", handleManagerStatus)
+	http.HandleFunc("/managers/delete", handleManagerDelete)
+	http.HandleFunc("/managers/uuid/create", handleManagerUUIDCreate)
+	http.HandleFunc("/managers/uuid/revoke", handleManagerUUIDRevoke)
+	http.HandleFunc("/managers/uuid/validate", handleManagerValidate)
 
 	// bin module
 	http.HandleFunc("/bin/consume", handleBinConsume)
