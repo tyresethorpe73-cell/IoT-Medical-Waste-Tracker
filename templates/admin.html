@@ -227,6 +227,12 @@
       color: #4ade80;
       border-color: #4ade80;
     }
+    .pill-revoked{
+  background: #991b1b33;
+  color: #f87171;
+  border-color: #f87171;
+}
+
 
     /* For other pills used elsewhere (door open/closed, etc.) */
     .pill-ok { background: #16a34a22; color: var(--success); }
@@ -333,6 +339,8 @@
             <button class="btn" id="openViewEmployees">👥 View Employees</button>
             <button class="btn" id="openBinClasses">🗂️ Bin Classifications</button>
             <button class="btn" id="openDeptClasses">🏥 Department Classifications</button>
+            <button class="btn" id="openManagerPanel">🧑‍💼 Manage Managers</button>
+
           </div>
         </details>
       </div>
@@ -492,8 +500,8 @@
           <tbody id="recentTbody">
 
 {{range .Recent}}
-  <tr>
-    <td>{{.GeneratedAt}}</td>
+<tr>
+  <td>{{.GeneratedAt}}</td>
     <td><code>{{.UUID}}</code></td>
 
     <td>
@@ -547,6 +555,18 @@
         <p id="addEmpMsg" class="muted"></p>
       </form>
     </dialog>
+<dialog id="changePinModal">
+  <h3>Change Manager PIN</h3>
+
+  <label>New 5-digit PIN
+    <input type="text" id="newManagerPin" maxlength="5" placeholder="12345">
+  </label>
+
+  <div class="dialog-actions">
+    <button id="cancelChangePin">Cancel</button>
+    <button class="button btn-primary" id="saveNewPin">Save</button>
+  </div>
+</dialog>
 
     <!-- VIEW EMPLOYEES MODAL -->
     <dialog id="viewEmployeesModal">
@@ -641,6 +661,71 @@
         <button id="closeDeptClasses">Close</button>
       </div>
     </dialog>
+<!-- MANAGER MANAGEMENT MODAL -->
+<dialog id="managerModal">
+  <h3>Manager Accounts</h3>
+  <p class="muted">Create, activate/deactivate, delete, and manage UUIDs.</p>
+
+  <!-- ADD MANAGER -->
+  <div class="panel" style="margin-bottom:12px;">
+    <div class="filters" style="grid-template-columns: 1fr 140px auto;">
+      <div>
+        <label>Name</label>
+        <input id="managerName" type="text" placeholder="Manager name">
+      </div>
+      <div>
+        <label>5-digit PIN</label>
+        <input id="managerPin" type="text" maxlength="5" placeholder="12345">
+      </div>
+      <div style="display:flex;align-items:end;">
+        <button class="button btn-primary" id="btnAddManager" type="button">➕ Add</button>
+      </div>
+    </div>
+    <p id="managerMsg" class="muted"></p>
+  </div>
+
+  <!-- MANAGER TABLE -->
+  <div class="table-wrap" style="max-height:55vh; overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>PIN</th>
+          <th>Status</th>
+          <th>UUID</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="managerTableBody"></tbody>
+    </table>
+  </div>
+
+  <div class="dialog-actions">
+    <button id="closeManagerModal">Close</button>
+  </div>
+</dialog>
+<dialog id="managerUUIDModal">
+  <h3>Manager UUIDs</h3>
+
+  <div class="table-wrap" style="max-height:55vh; overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>UUID</th>
+          <th>Status</th>
+          <th>Created</th>
+          <th>Revoked</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="managerUUIDTable"></tbody>
+    </table>
+  </div>
+
+  <div class="dialog-actions">
+    <button id="closeManagerUUIDModal">Close</button>
+  </div>
+</dialog>
 
     <!-- TOAST -->
     <div class="toast" id="toast"></div>
@@ -653,6 +738,7 @@
   <!-- SCRIPT SECTION -->
   <script>
   (function(){
+  
 
 window.toggleEmployeeStatus = async function(empId, isActive) {
   try {
@@ -1355,17 +1441,20 @@ for (const e of list){
     }
 
     try {
-      const es = new EventSource("/bins/live.sse");
-      liveTsEl.textContent = "live: connected (SSE)";
+const es = new EventSource("/bins/live.sse");
+liveTsEl.textContent = "live: connected (SSE)";
 
-      es.onmessage = (e)=>{
-        try {
-          const payload = JSON.parse(e.data);
-          if (payload.type === "telemetry" && payload.data){
-            applyTelemetry(payload.data);
-          }
-        } catch {}
-      };
+// ✅ LISTEN TO *NAMED* TELEMETRY EVENTS
+es.addEventListener("telemetry", (e) => {
+  try {
+    const payload = JSON.parse(e.data);
+    if (payload?.data) {
+      applyTelemetry(payload.data);
+    }
+  } catch (err) {
+    console.error("telemetry parse error", err);
+  }
+});
 
       // "counts" event fix
 es.addEventListener("counts", (evt) => {
@@ -1394,6 +1483,272 @@ es.addEventListener("counts", (evt) => {
     } catch {
       startLivePolling();
     }
+/* ============================================================
+   ================== MANAGER PANEL LOGIC =====================
+   ============================================================ */
+
+const managerModal = document.getElementById("managerModal");
+const openManagerPanel = document.getElementById("openManagerPanel");
+const closeManagerModal = document.getElementById("closeManagerModal");
+const managerTableBody = document.getElementById("managerTableBody");
+const managerMsg = document.getElementById("managerMsg");
+
+openManagerPanel?.addEventListener("click", ()=>{
+  managerModal.showModal();
+  loadManagers();
+});
+
+closeManagerModal?.addEventListener("click", ()=>{
+  managerModal.close();
+});
+
+async function loadManagers(){
+  managerTableBody.innerHTML = "<tr><td colspan='5'>Loading...</td></tr>";
+  try{
+    const res = await fetch("/managers");
+    const data = await res.json();
+    const list = data.managers || [];
+
+    managerTableBody.innerHTML = list.map(m => {
+      const checked = m.is_active === 1 ? "checked" : "";
+return `
+  <tr>
+    <td>${m.name}</td>
+
+    <td>
+      <span id="pin-${m.manager_id}" data-pin="${m.pin}">•••••</span>
+      <button class="button btn-secondary"
+        style="padding:.3rem .6rem; margin-left:6px;"
+        onclick="togglePin(${m.manager_id})">
+        👁
+      </button>
+    </td>
+
+    <td>
+      <label class="switch">
+        <input type="checkbox" ${checked}
+          onchange="toggleManagerStatus(${m.manager_id}, this.checked)">
+        <span class="slider"></span>
+      </label>
+    </td>
+
+<td>
+  <button onclick="openChangePin(${m.manager_id})"
+    class="button btn-secondary">
+    🔑
+  </button>
+
+  <button onclick="deleteManager(${m.manager_id})"
+    class="button btn-secondary">
+    🗑️
+  </button>
+</td>
+
+
+    <td>
+      <button onclick="deleteManager(${m.manager_id})"
+        class="button btn-secondary">
+        🗑️
+      </button>
+    </td>
+  </tr>
+`;
+    }).join("");
+
+  } catch(e){
+    managerTableBody.innerHTML = "<tr><td colspan='5'>Failed to load</td></tr>";
+  }
+}
+
+document.getElementById("btnAddManager")?.addEventListener("click", async ()=>{
+  const name = document.getElementById("managerName").value.trim();
+  const pin  = document.getElementById("managerPin").value.trim();
+
+  if (!/^\d{5}$/.test(pin)){
+    managerMsg.textContent = "PIN must be 5 digits.";
+    return;
+  }
+
+  const res = await fetch("/managers", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({name, pin})
+  });
+
+  if (!res.ok){
+    managerMsg.textContent = "Failed to create manager.";
+    return;
+  }
+
+  managerMsg.textContent = "Manager created.";
+  document.getElementById("managerName").value="";
+  document.getElementById("managerPin").value="";
+  loadManagers();
+});
+
+window.toggleManagerStatus = async function(id, active){
+  await fetch("/managers/status", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      manager_id: id,
+      is_active: active ? 1 : 0
+    })
+  });
+
+  toast(active ? "Manager activated" : "Manager deactivated");
+  loadManagers(); // 🔥 add this line
+};
+
+
+window.deleteManager = async function(id){
+  if (!confirm("Delete this manager?")) return;
+
+  await fetch("/managers/delete", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({manager_id: id})
+  });
+
+  toast("Manager deleted");
+  loadManagers();
+};
+window.togglePin = function(id){
+  const el = document.getElementById(`pin-${id}`);
+  if (!el) return;
+
+  if (el.textContent === "•••••"){
+    el.textContent = el.getAttribute("data-pin");
+  } else {
+    el.textContent = "•••••";
+  }
+};
+/* ================= CHANGE PIN ================= */
+
+const changePinModal = document.getElementById("changePinModal");
+let currentManagerForPin = null;
+
+window.openChangePin = function(managerID){
+  currentManagerForPin = managerID;
+  document.getElementById("newManagerPin").value = "";
+  changePinModal.showModal();
+};
+
+document.getElementById("cancelChangePin")
+  ?.addEventListener("click", ()=> changePinModal.close());
+
+document.getElementById("saveNewPin")
+  ?.addEventListener("click", async ()=>{
+
+    const pin = document.getElementById("newManagerPin").value.trim();
+
+    if (!/^\d{5}$/.test(pin)){
+      toast("PIN must be exactly 5 digits");
+      return;
+    }
+
+    try{
+      const res = await fetch("/managers/change-pin", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          manager_id: currentManagerForPin,
+          pin: pin
+        })
+      });
+
+      if (!res.ok) throw new Error();
+
+      toast("PIN updated");
+      changePinModal.close();
+      loadManagers();
+
+    } catch{
+      toast("Failed to update PIN");
+    }
+});
+
+
+/* ================= MANAGER UUID VIEWER ================= */
+
+const uuidModal = document.getElementById("managerUUIDModal");
+const uuidTable = document.getElementById("managerUUIDTable");
+
+document.getElementById("closeManagerUUIDModal")
+  ?.addEventListener("click", ()=> uuidModal.close());
+
+window.openManagerUUIDs = async function(managerID){
+  uuidTable.setAttribute("data-manager", managerID);
+
+  uuidTable.innerHTML = "<tr><td colspan='5'>Loading...</td></tr>";
+
+  try{
+    const res = await fetch(`/managers/${managerID}/uuids`);
+    const data = await res.json();
+
+    if (!res.ok){
+      uuidTable.innerHTML = "<tr><td colspan='5'>Failed to load</td></tr>";
+      return;
+    }
+
+    uuidTable.innerHTML = (data.uuids || []).map(u=>{
+
+const status = u.is_revoked === 1
+  ? `<span class="pill pill-revoked">revoked</span>`
+  : `<span class="pill pill-active">active</span>`;
+
+
+      const revokeBtn = u.is_revoked === 0
+        ? `<button class="button btn-secondary"
+             onclick="revokeManagerUUID('${u.uuid_value}')">
+             Revoke
+           </button>`
+        : "—";
+
+      return `
+        <tr>
+          <td><code>${u.uuid_value}</code></td>
+          <td>${status}</td>
+          <td>${formatLocal(u.created_at)}</td>
+          <td>${u.revoked_at ? formatLocal(u.revoked_at) : "—"}</td>
+          <td>${revokeBtn}</td>
+        </tr>
+      `;
+    }).join("");
+
+    uuidModal.showModal();
+
+  } catch(e){
+    uuidTable.innerHTML = "<tr><td colspan='5'>Network error</td></tr>";
+  }
+};
+
+window.revokeManagerUUID = async function(uuid){
+
+  if (!confirm("Revoke this UUID?")) return;
+
+  try{
+    const res = await fetch("/managers/uuid/revoke", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({uuid})
+    });
+
+    if (!res.ok) throw new Error();
+
+    toast("UUID revoked");
+
+    const managerID = uuidTable.getAttribute("data-manager");
+    if (managerID){
+      openManagerUUIDs(managerID);
+    }
+
+  } catch{
+    toast("Failed to revoke");
+  }
+};
+
+
 
     /* ESC closes all dialogs — FIXED */
     window.addEventListener("keydown", e=>{
@@ -1407,4 +1762,4 @@ es.addEventListener("counts", (evt) => {
 
   <script src="/static/live.js"></script>
 </body>
-</html>
+</html>  
