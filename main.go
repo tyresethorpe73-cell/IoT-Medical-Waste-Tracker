@@ -2287,36 +2287,6 @@ func handleManagerDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-/* ---------- CREATE MANAGER UUID ---------- */
-
-func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
-
-	if r.Method != http.MethodPost {
-		bad(w, 405, "POST only")
-		return
-	}
-
-	var req managerUUIDReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		bad(w, 400, "bad json")
-		return
-	}
-
-	newUUID := uuid.New().String()
-
-	_, err := db.Exec(`
-		INSERT INTO manager_uuids (manager_id, uuid_value)
-		VALUES (?, ?)
-	`, req.ManagerID, newUUID)
-
-	if err != nil {
-		bad(w, 500, "insert uuid")
-		return
-	}
-
-	writeJSON(w, map[string]string{"uuid": newUUID})
-}
-
 /* ---------- REVOKE MANAGER UUID ---------- */
 
 func handleManagerUUIDRevoke(w http.ResponseWriter, r *http.Request) {
@@ -2386,6 +2356,64 @@ func handleManagerValidate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, managerValidateResp{Valid: true})
 }
 
+/* ---------- LIST MANAGER UUIDS ---------- */
+
+func handleManagerUUIDList(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	// Expecting path: /managers/{id}/uuids
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "managers" || parts[2] != "uuids" {
+		bad(w, 404, "invalid path")
+		return
+	}
+
+	managerID, err := strconv.Atoi(parts[1])
+	if err != nil || managerID <= 0 {
+		bad(w, 400, "invalid manager id")
+		return
+	}
+
+	rows, err := db.Query(`
+        SELECT uuid_value, is_revoked, created_at, revoked_at
+        FROM manager_uuids
+        WHERE manager_id = ?
+        ORDER BY created_at DESC
+    `, managerID)
+
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	type row struct {
+		UUIDValue string     `json:"uuid_value"`
+		IsRevoked int        `json:"is_revoked"`
+		CreatedAt time.Time  `json:"created_at"`
+		RevokedAt *time.Time `json:"revoked_at"`
+	}
+
+	var out []row
+
+	for rows.Next() {
+		var rr row
+		if err := rows.Scan(&rr.UUIDValue, &rr.IsRevoked, &rr.CreatedAt, &rr.RevokedAt); err != nil {
+			bad(w, 500, "scan")
+			return
+		}
+		out = append(out, rr)
+	}
+
+	writeJSON(w, map[string]any{
+		"uuids": out,
+	})
+}
+
 // ========== MAIN ==========
 func main() {
 	var err error
@@ -2444,9 +2472,9 @@ func main() {
 
 	// managers (new full system)
 	http.HandleFunc("/managers", handleManagers)
+	http.HandleFunc("/managers/", handleManagerUUIDList)
 	http.HandleFunc("/managers/status", handleManagerStatus)
 	http.HandleFunc("/managers/delete", handleManagerDelete)
-	http.HandleFunc("/managers/uuid/create", handleManagerUUIDCreate)
 	http.HandleFunc("/managers/uuid/revoke", handleManagerUUIDRevoke)
 	http.HandleFunc("/managers/uuid/validate", handleManagerValidate)
 
