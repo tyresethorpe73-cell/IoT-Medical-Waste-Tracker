@@ -2287,6 +2287,54 @@ func handleManagerDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+/* ---------- CHANGE MANAGER PIN ---------- */
+
+type managerChangePinReq struct {
+	ManagerID int    `json:"manager_id"`
+	PIN       string `json:"pin"`
+}
+
+func handleManagerChangePin(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerChangePinReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	if req.ManagerID <= 0 || len(req.PIN) != 5 {
+		bad(w, 400, "need manager_id and 5-digit pin")
+		return
+	}
+
+	// ensure PIN not already used
+	var exists int
+	if err := db.QueryRow(`
+		SELECT 1 FROM managers WHERE pin=? AND manager_id<>?
+	`, req.PIN, req.ManagerID).Scan(&exists); err == nil {
+		bad(w, 409, "pin already in use")
+		return
+	}
+
+	_, err := db.Exec(`
+		UPDATE managers
+		SET pin = ?
+		WHERE manager_id = ?
+	`, req.PIN, req.ManagerID)
+
+	if err != nil {
+		bad(w, 500, "update")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 /* ---------- REVOKE MANAGER UUID ---------- */
 
 func handleManagerUUIDRevoke(w http.ResponseWriter, r *http.Request) {
@@ -2475,6 +2523,7 @@ func main() {
 	http.HandleFunc("/managers/", handleManagerUUIDList)
 	http.HandleFunc("/managers/status", handleManagerStatus)
 	http.HandleFunc("/managers/delete", handleManagerDelete)
+	http.HandleFunc("/managers/change-pin", handleManagerChangePin)
 	http.HandleFunc("/managers/uuid/revoke", handleManagerUUIDRevoke)
 	http.HandleFunc("/managers/uuid/validate", handleManagerValidate)
 
