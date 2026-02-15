@@ -303,15 +303,17 @@
     }
 
     /* TOAST (simple) */
-    .toast{
-      position: fixed;
-      right: 16px;
-      bottom: 16px;
-      display: grid;
-      gap: 10px;
-      z-index: 9999;
-      pointer-events: none;
-    }
+/* TOAST */
+.toast{
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: grid;
+  gap: 10px;
+  pointer-events: none;
+  z-index: 999999;   /* force front layer */
+}
+
     .toast .t{
       pointer-events: none;
       background: rgba(15,21,36,.9);
@@ -562,11 +564,15 @@
     <input type="text" id="newManagerPin" maxlength="5" placeholder="12345">
   </label>
 
+  <!-- ADD THIS LINE -->
+  <p id="changePinMsg" class="muted" style="margin-top:8px;"></p>
+
   <div class="dialog-actions">
     <button id="cancelChangePin">Cancel</button>
     <button class="button btn-primary" id="saveNewPin">Save</button>
   </div>
 </dialog>
+
 
     <!-- VIEW EMPLOYEES MODAL -->
     <dialog id="viewEmployeesModal">
@@ -681,7 +687,6 @@
         <button class="button btn-primary" id="btnAddManager" type="button">➕ Add</button>
       </div>
     </div>
-    <p id="managerMsg" class="muted"></p>
   </div>
 
   <!-- MANAGER TABLE -->
@@ -700,9 +705,13 @@
     </table>
   </div>
 
+  <p id="managerMsg" class="muted" style="margin-top:12px;"></p>
+
+
   <div class="dialog-actions">
     <button id="closeManagerModal">Close</button>
   </div>
+
 </dialog>
 <dialog id="managerUUIDModal">
   <h3>Manager UUIDs</h3>
@@ -728,7 +737,6 @@
 </dialog>
 
     <!-- TOAST -->
-    <div class="toast" id="toast"></div>
   </div>
 
 
@@ -785,18 +793,35 @@ loadEmployees(); // 🔥 force re-sync from backend
     const $  = (sel, root=document) => root.querySelector(sel);
     const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
 
-    function toast(msg, timeout=2400){
-      const box = $("#toast");
-      const t = document.createElement('div');
-      t.className = 't';
-      t.textContent = msg;
-      box.appendChild(t);
-      setTimeout(()=>{
-        t.style.opacity = '0';
-        t.style.transform='translateY(4px)';
-        setTimeout(()=>t.remove(), 350);
-      }, timeout);
-    }
+function toast(msg, timeout = 2400){
+
+  // Always attach toast to Manager Modal if open
+  const managerDialog = document.getElementById("managerModal");
+  const container = managerDialog?.open ? managerDialog : document.body;
+
+  let box = container.querySelector(".toast");
+
+  if (!box){
+    box = document.createElement("div");
+    box.className = "toast";
+    container.appendChild(box);
+  }
+
+  const t = document.createElement("div");
+  t.className = "t";
+  t.textContent = msg;
+
+  box.appendChild(t);
+
+  setTimeout(()=>{
+    t.style.opacity = "0";
+    t.style.transform = "translateY(4px)";
+    setTimeout(()=>t.remove(), 300);
+  }, timeout);
+}
+
+
+
 
     /* ===== Sync Filter Values from Query Params ===== */
     const params = new URLSearchParams(location.search);
@@ -1493,6 +1518,13 @@ const closeManagerModal = document.getElementById("closeManagerModal");
 const managerTableBody = document.getElementById("managerTableBody");
 const managerMsg = document.getElementById("managerMsg");
 
+function showManagerMsg(text, ok=true){
+  if (!managerMsg) return;
+  managerMsg.textContent = text;
+  managerMsg.style.color = ok ? "#4ade80" : "#f87171"; // green / red
+}
+
+
 openManagerPanel?.addEventListener("click", ()=>{
   managerModal.showModal();
   loadManagers();
@@ -1512,46 +1544,41 @@ async function loadManagers(){
     managerTableBody.innerHTML = list.map(m => {
       const checked = m.is_active === 1 ? "checked" : "";
 return `
-  <tr>
-    <td>${m.name}</td>
+<tr>
+  <td>${m.name}</td>
 
-    <td>
-      <span id="pin-${m.manager_id}" data-pin="${m.pin}">•••••</span>
-      <button class="button btn-secondary"
-        style="padding:.3rem .6rem; margin-left:6px;"
-        onclick="togglePin(${m.manager_id})">
-        👁
-      </button>
-    </td>
+  <td>
+    <span id="pin-${m.manager_id}" data-pin="${m.pin}">•••••</span>
+    <button class="button btn-secondary"
+      style="padding:.3rem .6rem; margin-left:6px;"
+      onclick="togglePin(${m.manager_id})">
+      👁
+    </button>
+  </td>
 
-    <td>
-      <label class="switch">
-        <input type="checkbox" ${checked}
-          onchange="toggleManagerStatus(${m.manager_id}, this.checked)">
-        <span class="slider"></span>
-      </label>
-    </td>
+  <td>
+    <label class="switch">
+      <input type="checkbox" ${checked}
+        onchange="toggleManagerStatus(${m.manager_id}, this.checked)">
+      <span class="slider"></span>
+    </label>
+  </td>
 
-<td>
-  <button onclick="openChangePin(${m.manager_id})"
-    class="button btn-secondary">
-    🔑
-  </button>
+  <td>
+    <button onclick="openManagerUUIDs(${m.manager_id})"
+      class="button btn-secondary">
+      View
+    </button>
+  </td>
 
-  <button onclick="deleteManager(${m.manager_id})"
-    class="button btn-secondary">
-    🗑️
-  </button>
-</td>
+  <td>
+    <button onclick="openChangePin(${m.manager_id})"
+      class="button btn-secondary">🔑</button>
 
-
-    <td>
-      <button onclick="deleteManager(${m.manager_id})"
-        class="button btn-secondary">
-        🗑️
-      </button>
-    </td>
-  </tr>
+    <button onclick="deleteManager(${m.manager_id})"
+      class="button btn-secondary">🗑️</button>
+  </td>
+</tr>
 `;
     }).join("");
 
@@ -1564,10 +1591,10 @@ document.getElementById("btnAddManager")?.addEventListener("click", async ()=>{
   const name = document.getElementById("managerName").value.trim();
   const pin  = document.getElementById("managerPin").value.trim();
 
-  if (!/^\d{5}$/.test(pin)){
-    managerMsg.textContent = "PIN must be 5 digits.";
-    return;
-  }
+if (!/^\d{5}$/.test(pin)){
+  toast("PIN must be exactly 5 digits");
+  return;
+}
 
   const res = await fetch("/managers", {
     method: "POST",
@@ -1580,25 +1607,35 @@ document.getElementById("btnAddManager")?.addEventListener("click", async ()=>{
     return;
   }
 
-  managerMsg.textContent = "Manager created.";
+toast("Manager created");
   document.getElementById("managerName").value="";
   document.getElementById("managerPin").value="";
   loadManagers();
 });
 
 window.toggleManagerStatus = async function(id, active){
-  await fetch("/managers/status", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({
-      manager_id: id,
-      is_active: active ? 1 : 0
-    })
-  });
 
-  toast(active ? "Manager activated" : "Manager deactivated");
-  loadManagers(); // 🔥 add this line
+  try {
+    const res = await fetch("/managers/status", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        manager_id: id,
+        is_active: active ? 1 : 0
+      })
+    });
+
+    if (!res.ok) throw new Error();
+
+    toast(active ? "Manager activated" : "Manager deactivated");
+    loadManagers();
+
+  } catch {
+    toast("Failed to update manager status");
+  }
 };
+
+
 
 
 window.deleteManager = async function(id){
@@ -1642,10 +1679,16 @@ document.getElementById("saveNewPin")
 
     const pin = document.getElementById("newManagerPin").value.trim();
 
-    if (!/^\d{5}$/.test(pin)){
-      toast("PIN must be exactly 5 digits");
-      return;
-    }
+const msgEl = document.getElementById("changePinMsg");
+
+if (!/^\d{5}$/.test(pin)){
+  msgEl.textContent = "PIN must be exactly 5 digits.";
+  msgEl.style.color = "#f87171";
+  return;
+}
+
+msgEl.textContent = "";
+
 
     try{
       const res = await fetch("/managers/change-pin", {
@@ -1664,7 +1707,8 @@ document.getElementById("saveNewPin")
       loadManagers();
 
     } catch{
-      toast("Failed to update PIN");
+msgEl.textContent = "Failed to update PIN.";
+msgEl.style.color = "#f87171";
     }
 });
 
@@ -1761,5 +1805,5 @@ window.revokeManagerUUID = async function(uuid){
   </script>
 
   <script src="/static/live.js"></script>
-</body>
-</html>  
+    </body>
+</html> 
