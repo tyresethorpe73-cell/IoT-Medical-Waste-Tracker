@@ -286,17 +286,19 @@
     dialog::backdrop{
       background: rgba(0,0,0,.55); backdrop-filter: blur(4px);
     }
+dialog{
+  border:1px solid var(--border);
+  border-radius: var(--radius);
+  padding:1.1rem 1.2rem;
+  width: 1200px;
+  max-width: 98%;
+  max-height: 90vh;
+  overflow: auto;
+  background: var(--bg-soft);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
 
-    dialog{
-      border:1px solid var(--border);
-      border-radius: var(--radius);
-      padding:1.1rem 1.2rem;
-      width: 720px;
-      max-width:95%;
-      background: var(--bg-soft);
-      color: var(--text);
-      box-shadow: var(--shadow);
-    }
 
     .dialog-actions{
       display:flex; gap:.6rem; justify-content:flex-end; margin-top:.9rem;
@@ -313,6 +315,12 @@
   pointer-events: none;
   z-index: 999999;   /* force front layer */
 }
+dialog .toast{
+  position: absolute;
+  right: 20px;
+  bottom: 20px;
+}
+
 
     .toast .t{
       pointer-events: none;
@@ -575,11 +583,17 @@
 
 
     <!-- VIEW EMPLOYEES MODAL -->
-    <dialog id="viewEmployeesModal">
+<dialog id="viewEmployeesModal" style="width:1400px;">
       <h3>All Employees</h3>
+      <button class="button btn-secondary"
+        style="margin-bottom:10px;"
+        onclick="loadHiddenEmployees()">
+  View Hidden
+</button>
+
       <div id="empListStatus" class="muted">Loading…</div>
 
-      <div class="table-wrap" style="max-height:55vh; overflow:auto">
+<div class="table-wrap" style="max-height:75vh; overflow:auto">
         <table id="empTable">
 
 <thead>
@@ -588,9 +602,13 @@
     <th>Department</th>
     <th>Emp ID</th>
     <th>Dept ID</th>
+    <th>PIN</th>
     <th>Status</th>
+    <th>UUID</th>
+    <th>Actions</th>
   </tr>
 </thead>
+
 
           <tbody></tbody>
         </table>
@@ -736,6 +754,42 @@
   </div>
 </dialog>
 
+<dialog id="employeeChangePinModal">
+  <h3>Change Employee PIN</h3>
+
+  <label>New 5-digit PIN
+    <input type="text" id="newEmployeePin" maxlength="5" placeholder="12345">
+  </label>
+
+  <p id="employeeChangePinMsg" class="muted" style="margin-top:8px;"></p>
+
+  <div class="dialog-actions">
+    <button id="cancelEmployeeChangePin">Cancel</button>
+    <button class="button btn-primary" id="saveEmployeeNewPin">Save</button>
+  </div>
+</dialog>
+<dialog id="employeeUUIDModal">
+  <h3>Employee UUIDs</h3>
+
+  <div class="table-wrap" style="max-height:75vh; overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>UUID</th>
+          <th>Status</th>
+          <th>Created</th>
+          <th>Closed</th>
+        </tr>
+      </thead>
+      <tbody id="employeeUUIDTable"></tbody>
+    </table>
+  </div>
+
+  <div class="dialog-actions">
+    <button id="closeEmployeeUUIDModal">Close</button>
+  </div>
+</dialog>
+
     <!-- TOAST -->
   </div>
 
@@ -768,6 +822,68 @@ loadEmployees(); // 🔥 force re-sync from backend
     console.error(e);
   }
 }
+window.toggleEmployeePin = function(empId) {
+  const el = document.getElementById("emp-pin-" + empId);
+  if (!el) return;
+
+  const realPin = el.getAttribute("data-pin");
+
+  if (!realPin) {
+    console.warn("No pin found for employee:", empId);
+    return;
+  }
+
+  if (el.textContent === "•••••") {
+    el.textContent = realPin;
+  } else {
+    el.textContent = "•••••";
+  }
+};
+
+
+
+
+
+window.hideEmployee = async function(id){
+
+  if (!confirm("Hide this employee?")) return;
+
+  try{
+    const res = await fetch("/employees/hide", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ emp_id: id })
+    });
+
+    if (!res.ok) throw new Error();
+
+toast("Employee hidden");
+loadEmployees(); 
+
+  } catch {
+    toast("Failed to hide employee");
+  }
+};
+window.unhideEmployee = async function(id){
+
+  try{
+    const res = await fetch("/employees/unhide", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ emp_id: id })
+    });
+
+    if (!res.ok) throw new Error();
+
+toast("Employee restored");
+loadHiddenEmployees();
+
+  } catch {
+    toast("Failed to restore employee");
+  }
+};
+
+
 
 
     /* ==== Timestamp Formatter (Local Jamaica Time) ==== */
@@ -796,8 +912,7 @@ loadEmployees(); // 🔥 force re-sync from backend
 function toast(msg, timeout = 2400){
 
   // Always attach toast to Manager Modal if open
-  const managerDialog = document.getElementById("managerModal");
-  const container = managerDialog?.open ? managerDialog : document.body;
+const container = document.body;
 
   let box = container.querySelector(".toast");
 
@@ -1109,7 +1224,7 @@ const labels = data.labels.map(formatDayLabel);
       empTableBody.innerHTML = "";
 
       try{
-        const res = await fetch("/employees", {headers:{Accept:"application/json"}});
+const res = await fetch("/employees");
         const text = await res.text();
 
         let data;
@@ -1133,20 +1248,59 @@ for (const e of list){
   const tr = document.createElement("tr");
 
   const checked = e.is_active === 1 ? "checked" : "";
+  const isHidden = e.is_hidden === 1;
 
-  tr.innerHTML = `
-    <td>${e.name}</td>
-    <td>${e.dept}</td>
-    <td>${e.emp_id}</td>
-    <td>${e.dept_id}</td>
-    <td>
-      <label class="switch">
-        <input type="checkbox" ${checked}
-          onchange="toggleEmployeeStatus(${e.emp_id}, this.checked)">
-        <span class="slider"></span>
-      </label>
-    </td>
-  `;
+
+tr.innerHTML = `
+  <td>${e.name}</td>
+  <td>${e.dept}</td>
+  <td>${e.emp_id}</td>
+  <td>${e.dept_id}</td>
+
+  <td>
+<span id="emp-pin-${e.emp_id}" data-pin="${e.pin}">•••••</span>
+<button class="button btn-secondary"
+  style="padding:.3rem .6rem; margin-left:6px;"
+  onclick="window.toggleEmployeePin(${e.emp_id})">
+  👁
+</button>
+  </td>
+
+  <td>
+    <label class="switch">
+      <input type="checkbox" ${checked}
+        onchange="toggleEmployeeStatus(${e.emp_id}, this.checked)">
+      <span class="slider"></span>
+    </label>
+  </td>
+
+<td>
+  <button class="button btn-secondary"
+    onclick="openEmployeeUUIDs(${e.emp_id})">
+    View
+  </button>
+</td>
+
+<td>
+  <button class="button btn-secondary"
+    onclick="openEmployeeChangePin(${e.emp_id})">
+    🔑
+  </button>
+
+  ${
+    isHidden
+      ? `<button class="button btn-secondary"
+           onclick="unhideEmployee(${e.emp_id})">
+           ♻
+         </button>`
+      : `<button class="button btn-secondary"
+           onclick="hideEmployee(${e.emp_id})">
+           🚫
+         </button>`
+  }
+</td>
+`;
+
 
   empTableBody.appendChild(tr);
 }
@@ -1157,6 +1311,61 @@ for (const e of list){
         empListStatus.textContent = "Network error.";
       }
     }
+window.loadHiddenEmployees = async function(){
+  empListStatus.textContent = "Loading hidden...";
+  empTableBody.innerHTML = "";
+
+  try{
+    const res = await fetch("/employees/hidden");
+    const data = await res.json();
+
+    const list = data.employees || [];
+    empListStatus.textContent = `Hidden: ${list.length}`;
+
+    for (const e of list){
+      const tr = document.createElement("tr");
+      const checked = e.is_active === 1 ? "checked" : "";
+      const isHidden = true;
+
+tr.innerHTML = `
+  <td>${e.name}</td>
+  <td>${e.dept}</td>
+  <td>${e.emp_id}</td>
+  <td>${e.dept_id}</td>
+
+  <td>
+    <span id="emp-pin-${e.emp_id}" data-pin="${e.pin}">•••••</span>
+    <button class="button btn-secondary"
+      style="padding:.3rem .6rem; margin-left:6px;"
+      onclick="window.toggleEmployeePin(${e.emp_id})">
+      👁
+    </button>
+  </td>
+
+  <td>Hidden</td>
+
+  <td>
+    <button class="button btn-secondary"
+      onclick="openEmployeeUUIDs(${e.emp_id})">
+      View
+    </button>
+  </td>
+
+  <td>
+    <button class="button btn-secondary"
+      onclick="unhideEmployee(${e.emp_id})">
+      ♻ Restore
+    </button>
+  </td>
+`;
+      empTableBody.appendChild(tr);
+    }
+
+  } catch{
+    empListStatus.textContent = "Failed to load hidden.";
+  }
+}
+
 
     function openView(){ dlgView.showModal(); loadEmployees(); }
     openViewBtn?.addEventListener("click", openView);
@@ -1549,11 +1758,13 @@ return `
 
   <td>
     <span id="pin-${m.manager_id}" data-pin="${m.pin}">•••••</span>
-    <button class="button btn-secondary"
-      style="padding:.3rem .6rem; margin-left:6px;"
-      onclick="togglePin(${m.manager_id})">
-      👁
-    </button>
+<button class="button btn-secondary"
+  style="padding:.3rem .6rem; margin-left:6px;"
+  onclick="togglePin(${m.manager_id})">
+  👁
+</button>
+
+
   </td>
 
   <td>
@@ -1671,6 +1882,7 @@ window.openChangePin = function(managerID){
   changePinModal.showModal();
 };
 
+
 document.getElementById("cancelChangePin")
   ?.addEventListener("click", ()=> changePinModal.close());
 
@@ -1712,6 +1924,107 @@ msgEl.style.color = "#f87171";
     }
 });
 
+/* ================= EMPLOYEE CHANGE PIN ================= */
+
+const employeeChangePinModal = document.getElementById("employeeChangePinModal");
+let currentEmployeeForPin = null;
+
+window.openEmployeeChangePin = function(empID){
+  currentEmployeeForPin = empID;
+  document.getElementById("newEmployeePin").value = "";
+  employeeChangePinModal.showModal();
+};
+
+document.getElementById("cancelEmployeeChangePin")
+  ?.addEventListener("click", ()=> employeeChangePinModal.close());
+
+document.getElementById("saveEmployeeNewPin")
+  ?.addEventListener("click", async ()=>{
+
+    const pin = document.getElementById("newEmployeePin").value.trim();
+    const msgEl = document.getElementById("employeeChangePinMsg");
+
+    if (!/^\d{5}$/.test(pin)){
+      msgEl.textContent = "PIN must be exactly 5 digits.";
+      msgEl.style.color = "#f87171";
+      return;
+    }
+
+    msgEl.textContent = "";
+
+    try{
+      const res = await fetch("/employees/change-pin", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          emp_id: currentEmployeeForPin,
+          pin: pin
+        })
+      });
+
+      if (!res.ok) throw new Error();
+
+      toast("Employee PIN updated");
+      employeeChangePinModal.close();
+      loadEmployees();
+
+    } catch{
+      msgEl.textContent = "Failed to update PIN.";
+      msgEl.style.color = "#f87171";
+    }
+});
+
+/* ================= EMPLOYEE UUID VIEWER ================= */
+
+const employeeUUIDModal = document.getElementById("employeeUUIDModal");
+const employeeUUIDTable = document.getElementById("employeeUUIDTable");
+
+document.getElementById("closeEmployeeUUIDModal")
+  ?.addEventListener("click", ()=> employeeUUIDModal.close());
+
+window.openEmployeeUUIDs = async function(empID){
+
+  employeeUUIDTable.innerHTML = "<tr><td colspan='4'>Loading...</td></tr>";
+
+  try{
+const res = await fetch(`/employees/uuids?emp_id=${empID}`);
+    const data = await res.json();
+
+    if (!res.ok){
+      employeeUUIDTable.innerHTML = "<tr><td colspan='4'>Failed</td></tr>";
+      return;
+    }
+
+    employeeUUIDTable.innerHTML = (data.uuids || []).map(u=>{
+
+let status;
+
+if (u.closed_at) {
+  status = `<span class="pill pill-used">closed</span>`;
+}
+else if (u.expires_at && new Date(u.expires_at) < new Date()) {
+  status = `<span class="pill pill-expired">expired</span>`;
+}
+else {
+  status = `<span class="pill pill-active">active</span>`;
+}
+
+      return `
+        <tr>
+<td><code>${u.uuid}</code></td>
+          <td>${status}</td>
+          <td>${formatLocal(u.generated_at)}</td>
+          <td>${u.closed_at ? formatLocal(u.closed_at) : "—"}</td>
+        </tr>
+      `;
+    }).join("");
+
+    employeeUUIDModal.showModal();
+
+  } catch{
+    employeeUUIDTable.innerHTML = "<tr><td colspan='4'>Network error</td></tr>";
+  }
+};
 
 /* ================= MANAGER UUID VIEWER ================= */
 
@@ -1727,7 +2040,7 @@ window.openManagerUUIDs = async function(managerID){
   uuidTable.innerHTML = "<tr><td colspan='5'>Loading...</td></tr>";
 
   try{
-    const res = await fetch(`/managers/${managerID}/uuids`);
+const res = await fetch(`/managers/${managerID}/uuids`);
     const data = await res.json();
 
     if (!res.ok){

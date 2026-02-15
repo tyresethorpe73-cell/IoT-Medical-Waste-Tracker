@@ -715,11 +715,8 @@ type pinResp struct {
 	SessionUUID  string `json:"session_uuid"`
 }
 
-var empID, deptID int
-var name string
-var isActive int
-
 func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -735,34 +732,87 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "need 5-digit pin", http.StatusBadRequest)
 		return
 	}
-
 	var empID, deptID int
-	var empName, role string
+	var empName string
+	role := "employee"
 
 	err := db.QueryRow(`
-		SELECT emp_id, emp_name, dept_id, role
-		FROM employees
-		WHERE emp_pin = ?
-		  AND is_active = 1
-		LIMIT 1
-	`, req.PIN).Scan(&empID, &empName, &deptID, &role)
+    SELECT emp_id, emp_name, dept_id
+    FROM employees
+    WHERE pin = ?
+      AND is_active = 1
+      AND is_hidden = 0
+    LIMIT 1
+`, req.PIN).Scan(&empID, &empName, &deptID)
 
 	if err == sql.ErrNoRows {
-		http.Error(w, "Access denied. Contact admin", http.StatusUnauthorized)
+		http.Error(w, "Access denied", http.StatusUnauthorized)
 		return
 	}
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// 🔒 Prevent multiple active sessions
+	var existingUUID string
+	var existingExpiry sql.NullTime
+
+	err = db.QueryRow(`
+    SELECT uuid_value, expires_at
+    FROM uuid_logs
+    WHERE emp_id = ?
+      AND action = 'clock_in'
+      AND closed_at IS NULL
+    ORDER BY generated_at DESC
+    LIMIT 1
+`, empID).Scan(&existingUUID, &existingExpiry)
+
+	if err == nil {
+		if existingExpiry.Valid && utcNow().Before(existingExpiry.Time) {
+			http.Error(w, "already clocked in", http.StatusConflict)
+			return
+		}
+	}
+
+	sessionUUID := uuid.New().String()
+	expires := utcNow().Add(8 * time.Hour)
+	_, err = db.Exec(`
+    INSERT INTO uuid_logs (
+        uuid_value,
+        emp_id,
+        bin_id,
+        generated_at,
+        expires_at,
+        is_used,
+        action
+    )
+    VALUES (?, ?, 0, UTC_TIMESTAMP(), ?, 0, 'clock_in')
+`, sessionUUID, empID, expires)
 
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
 
-	// ✅ SUCCESS — build response AFTER validation
-	sessionUUID := uuid.New().String()
+	broadcastActiveUUIDCount()
+
+	_, err = db.Exec(`
+		UPDATE employees
+		SET current_uuid = ?,
+			uuid_issued_at = UTC_TIMESTAMP(),
+			uuid_expires_at = ?
+		WHERE emp_id = ?
+	`, sessionUUID, expires, empID)
+
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
 
 	writeJSON(w, pinResp{
 		Valid:        true,
-		Role:         role, // "employee" or "manager"
+		Role:         role,
 		EmployeeID:   empID,
 		EmployeeName: empName,
 		SessionUUID:  sessionUUID,
@@ -794,18 +844,29 @@ type empListRow struct {
 	DeptID   int    `json:"dept_id"`
 	Dept     string `json:"dept"`
 	IsActive int    `json:"is_active"`
+	PIN      string `json:"pin"`
+	IsHidden int    `json:"is_hidden"`
 }
 
 func handleEmployees(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 
 	case http.MethodGet:
+
 		rows, err := db.Query(`
-			SELECT e.emp_id, e.emp_name, e.dept_id, d.dept_name, e.is_active
-FROM employees e
-JOIN departments d ON d.dept_id = e.dept_id
-ORDER BY d.dept_name, e.emp_name
-		`)
+    SELECT e.emp_id,
+           e.emp_name,
+           e.dept_id,
+           d.dept_name,
+           e.is_active,
+           e.pin,
+           e.is_hidden
+    FROM employees e
+    JOIN departments d ON d.dept_id = e.dept_id
+    WHERE e.is_hidden = 0
+    ORDER BY d.dept_name, e.emp_name
+`)
+
 		if err != nil {
 			bad(w, 500, "db(employees)")
 			return
@@ -813,9 +874,18 @@ ORDER BY d.dept_name, e.emp_name
 		defer rows.Close()
 
 		var out []empListRow
+
 		for rows.Next() {
 			var rr empListRow
-			if err := rows.Scan(&rr.EmpID, &rr.Name, &rr.DeptID, &rr.Dept, &rr.IsActive); err != nil {
+			if err := rows.Scan(
+				&rr.EmpID,
+				&rr.Name,
+				&rr.DeptID,
+				&rr.Dept,
+				&rr.IsActive,
+				&rr.PIN,
+				&rr.IsHidden,
+			); err != nil {
 				bad(w, 500, "scan")
 				return
 			}
@@ -826,6 +896,7 @@ ORDER BY d.dept_name, e.emp_name
 		return
 
 	case http.MethodPost:
+
 		var req empCreateReq
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			bad(w, 400, "bad json")
@@ -837,25 +908,11 @@ ORDER BY d.dept_name, e.emp_name
 			return
 		}
 
-		var exists int
-		if err := db.QueryRow(`
-			SELECT 1 FROM departments WHERE dept_id=?
-		`, req.DeptID).Scan(&exists); err == sql.ErrNoRows {
-			bad(w, 400, "unknown department")
-			return
-		}
-
-		if err := db.QueryRow(`
-			SELECT 1 FROM employees WHERE emp_pin=?
-		`, req.PIN).Scan(&exists); err == nil {
-			bad(w, 409, "pin already in use")
-			return
-		}
-
 		res, err := db.Exec(`
-			INSERT INTO employees (emp_name, dept_id, emp_pin)
-			VALUES (?, ?, ?)
-		`, req.Name, req.DeptID, req.PIN)
+    INSERT INTO employees (emp_name, dept_id, pin, is_active, is_hidden)
+    VALUES (?, ?, ?, 1, 0)
+`, req.Name, req.DeptID, req.PIN)
+
 		if err != nil {
 			bad(w, 500, "insert")
 			return
@@ -868,7 +925,6 @@ ORDER BY d.dept_name, e.emp_name
 			DeptID: req.DeptID,
 		})
 		return
-
 	default:
 		bad(w, 405, "GET or POST only")
 		return
@@ -918,6 +974,168 @@ func handleEmployeeStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+type empHideReq struct {
+	EmpID int `json:"emp_id"`
+}
+type empChangePinReq struct {
+	EmpID int    `json:"emp_id"`
+	PIN   string `json:"pin"`
+}
+
+func handleEmployeeHide(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req empHideReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	_, err := db.Exec(`
+        UPDATE employees
+        SET is_hidden = 1,
+            is_active = 0,
+            current_uuid = NULL,
+            uuid_expires_at = NULL
+        WHERE emp_id = ?
+    `, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+func handleHiddenEmployees(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	rows, err := db.Query(`
+    SELECT e.emp_id,
+           e.emp_name,
+           e.dept_id,
+           d.dept_name,
+           e.is_active,
+           e.pin,
+           e.is_hidden
+    FROM employees e
+    JOIN departments d ON d.dept_id = e.dept_id
+WHERE e.is_hidden = 1
+    ORDER BY d.dept_name, e.emp_name
+`)
+
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	var out []empListRow
+
+	for rows.Next() {
+		var rr empListRow
+		if err := rows.Scan(
+			&rr.EmpID,
+			&rr.Name,
+			&rr.DeptID,
+			&rr.Dept,
+			&rr.IsActive,
+			&rr.PIN,
+			&rr.IsHidden,
+		); err != nil {
+			continue
+		}
+		out = append(out, rr)
+	}
+
+	writeJSON(w, map[string]any{"employees": out})
+}
+
+func handleEmployeeChangePin(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req empChangePinReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	if req.EmpID <= 0 || len(req.PIN) != 5 {
+		bad(w, 400, "need emp_id and 5-digit pin")
+		return
+	}
+
+	_, err := db.Exec(`
+        UPDATE employees
+        SET pin = ?
+        WHERE emp_id = ?
+    `, req.PIN, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "update failed")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func handleEmployeeUUIDHistory(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	empIDStr := r.URL.Query().Get("emp_id")
+	empID, err := strconv.Atoi(empIDStr)
+	if err != nil || empID <= 0 {
+		bad(w, 400, "invalid emp_id")
+		return
+	}
+
+	rows, err := db.Query(`
+        SELECT uuid_value, generated_at, expires_at, closed_at
+        FROM uuid_logs
+        WHERE emp_id = ?
+        ORDER BY generated_at DESC
+    `, empID)
+
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	type row struct {
+		UUID      string     `json:"uuid"`
+		Generated time.Time  `json:"generated_at"`
+		Expires   *time.Time `json:"expires_at"`
+		Closed    *time.Time `json:"closed_at"`
+	}
+
+	var out []row
+	for rows.Next() {
+		var rr row
+		if err := rows.Scan(&rr.UUID, &rr.Generated, &rr.Expires, &rr.Closed); err != nil {
+			continue
+		}
+		out = append(out, rr)
+	}
+
+	writeJSON(w, map[string]any{"uuids": out})
+}
+
 /* ---------- UUID CREATE (legacy) ---------- */
 
 type createReq struct {
@@ -955,7 +1173,8 @@ func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
 SELECT 1 FROM employees
 WHERE emp_id=?
   AND dept_id=?
-  AND is_active = 1
+  AND is_active=1
+  AND is_hidden=0
 	`, req.EmpID, req.DeptID).Scan(&tmp)
 
 	if err == sql.ErrNoRows {
@@ -1018,8 +1237,29 @@ WHERE emp_id=?
 		binID = *req.BinID
 	}
 
+	// 🔒 Prevent multiple active sessions (legacy endpoint)
+	var existingUUID string
+	var existingExpiry sql.NullTime
+
+	err = db.QueryRow(`
+    SELECT uuid_value, expires_at
+    FROM uuid_logs
+    WHERE emp_id = ?
+      AND action = 'clock_in'
+      AND closed_at IS NULL
+    ORDER BY generated_at DESC
+    LIMIT 1
+`, req.EmpID).Scan(&existingUUID, &existingExpiry)
+
+	if err == nil {
+		if existingExpiry.Valid && utcNow().Before(existingExpiry.Time) {
+			bad(w, 409, "already clocked in")
+			return
+		}
+	}
+
 	code := uuid.New().String()
-	exp := utcNow().Add(48 * time.Hour)
+	exp := utcNow().Add(8 * time.Hour)
 
 	// ✅ Transaction: uuid_logs + uuid_daily_stats
 	tx, err := db.Begin()
@@ -1096,8 +1336,9 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	err := db.QueryRow(`
     SELECT emp_id, emp_name, dept_id
     FROM employees
-    WHERE emp_pin = ?
+    WHERE pin = ?
       AND is_active = 1
+      AND is_hidden = 0
     LIMIT 1
 `, req.PIN).Scan(&empID, &empName, &deptID)
 
@@ -1110,6 +1351,28 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 🔒 Prevent multiple active sessions
+	var existingUUID string
+	var existingExpiry sql.NullTime
+
+	err = db.QueryRow(`
+    SELECT uuid_value, expires_at
+    FROM uuid_logs
+    WHERE emp_id = ?
+      AND action = 'clock_in'
+      AND closed_at IS NULL
+    ORDER BY generated_at DESC
+    LIMIT 1
+`, empID).Scan(&existingUUID, &existingExpiry)
+
+	if err == nil {
+		// If still valid → block new session
+		if existingExpiry.Valid && utcNow().Before(existingExpiry.Time) {
+			bad(w, 409, "already clocked in")
+			return
+		}
+	}
+
 	var streamID int
 	err = db.QueryRow(`
 		SELECT waste_stream_id
@@ -1118,12 +1381,8 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		LIMIT 1
 	`, req.StreamCode).Scan(&streamID)
 
-	if err == sql.ErrNoRows {
-		bad(w, 400, "unknown stream_code")
-		return
-	}
 	if err != nil {
-		bad(w, 500, "db")
+		bad(w, 400, "unknown stream_code")
 		return
 	}
 
@@ -1136,56 +1395,39 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		LIMIT 1
 	`, streamID).Scan(&binID)
 
-	if err == sql.ErrNoRows {
-		bad(w, 404, "no bin for that stream")
-		return
-	}
 	if err != nil {
-		bad(w, 500, "db")
+		bad(w, 404, "no bin for that stream")
 		return
 	}
 
 	code := uuid.New().String()
-	exp := utcNow().Add(48 * time.Hour)
+	exp := utcNow().Add(8 * time.Hour)
 
-	// ✅ Transaction: uuid_logs + uuid_daily_stats
-	tx, err := db.Begin()
-	if err != nil {
-		bad(w, 500, "tx")
-		return
-	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(`
-    INSERT INTO uuid_logs (
-        uuid_value,
-        emp_id,
-        bin_id,
-        generated_at,
-        expires_at,
-        is_used,
-        action
-    )
-    VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in')
-`, code, empID, binID, exp)
+	_, err = db.Exec(`
+		INSERT INTO uuid_logs (
+			uuid_value,
+			emp_id,
+			bin_id,
+			generated_at,
+			expires_at,
+			is_used,
+			action
+		)
+		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in')
+	`, code, empID, binID, exp)
 
 	if err != nil {
 		bad(w, 500, "insert")
 		return
 	}
 
-	if err := tx.Commit(); err != nil {
-		bad(w, 500, "commit")
-		return
-	}
-
 	broadcastActiveUUIDCount()
+
 	writeJSON(w, createFromPinResp{
 		UUID:      code,
 		BinID:     binID,
 		EmpName:   empName,
 		DeptID:    deptID,
-		PIN:       req.PIN,
 		ExpiresAt: exp,
 	})
 }
@@ -1219,15 +1461,18 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1️⃣ Ensure active clock-in exists
+	// 1️⃣ Ensure active clock-in exists
 	var empID int
+	var expiresAt sql.NullTime
+
 	err := db.QueryRow(`
-	SELECT emp_id
-	FROM uuid_logs
-	WHERE uuid_value = ?
-	  AND action = 'clock_in'
-	  AND closed_at IS NULL
-	LIMIT 1
-`, req.UUID).Scan(&empID)
+    SELECT emp_id, expires_at
+    FROM uuid_logs
+    WHERE uuid_value = ?
+      AND action = 'clock_in'
+      AND closed_at IS NULL
+    LIMIT 1
+`, req.UUID).Scan(&empID, &expiresAt)
 
 	if err == sql.ErrNoRows {
 		bad(w, 409, "no active clock-in")
@@ -1235,6 +1480,12 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		bad(w, 500, "db")
+		return
+	}
+
+	// 🔥 EXPIRY CHECK
+	if expiresAt.Valid && utcNow().After(expiresAt.Time) {
+		bad(w, 409, "uuid expired")
 		return
 	}
 
@@ -2461,6 +2712,33 @@ func handleManagerUUIDList(w http.ResponseWriter, r *http.Request) {
 		"uuids": out,
 	})
 }
+func handleEmployeeUnhide(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req empHideReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	_, err := db.Exec(`
+        UPDATE employees
+        SET is_hidden = 0,
+            is_active = 1
+        WHERE emp_id = ?
+    `, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
 
 // ========== MAIN ==========
 func main() {
@@ -2511,6 +2789,11 @@ func main() {
 	// employees
 	http.HandleFunc("/employees", handleEmployees)
 	http.HandleFunc("/employees/status", handleEmployeeStatus)
+	http.HandleFunc("/employees/hide", handleEmployeeHide)
+	http.HandleFunc("/employees/unhide", handleEmployeeUnhide)
+	http.HandleFunc("/employees/change-pin", handleEmployeeChangePin)
+	http.HandleFunc("/employees/uuids", handleEmployeeUUIDHistory)
+	http.HandleFunc("/employees/hidden", handleHiddenEmployees)
 
 	// auth + uuid
 	http.HandleFunc("/auth/pin", handleAuthPIN)
