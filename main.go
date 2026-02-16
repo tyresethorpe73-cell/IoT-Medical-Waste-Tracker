@@ -91,7 +91,8 @@ func getActiveUUIDCount() int {
 	err := db.QueryRow(`
         SELECT COUNT(*)
         FROM uuid_logs
-        WHERE is_used = 0
+        WHERE action = 'clock_in'
+          AND closed_at IS NULL
           AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
     `).Scan(&n)
 	if err != nil {
@@ -247,17 +248,36 @@ func buildFilters(r *http.Request) (string, []any) {
 	}
 
 	switch r.URL.Query().Get("status") {
+
 	case "active":
-		where += " AND ul.is_used = 0 AND (ul.expires_at IS NULL OR UTC_TIMESTAMP() < ul.expires_at) "
+		where += `
+      AND ul.action = 'clock_in'
+      AND ul.closed_at IS NULL
+      AND (ul.expires_at IS NULL OR UTC_TIMESTAMP() < ul.expires_at)
+    `
+
 	case "used":
-		where += " AND ul.is_used = 1 "
+		where += `
+      AND ul.action IN ('consume','override')
+    `
+
 	case "expired":
-		where += " AND ul.is_used = 0 AND ul.expires_at IS NOT NULL AND UTC_TIMESTAMP() > ul.expires_at "
+		where += `
+      AND ul.action = 'clock_in'
+      AND ul.expires_at IS NOT NULL
+      AND UTC_TIMESTAMP() > ul.expires_at
+    `
 	}
 
-	if days := r.URL.Query().Get("days"); days != "" {
-		where += " AND ul.generated_at >= (UTC_TIMESTAMP() - INTERVAL ? DAY) "
-		args = append(args, days)
+	if d := r.URL.Query().Get("dept"); d != "" {
+		where += `
+        AND (
+            (ul.uuid_type = 'SESSION' AND d.dept_id = ?)
+            OR
+            (ul.uuid_type = 'CREDENTIAL' AND md.dept_id = ?)
+        )
+    `
+		args = append(args, d, d)
 	}
 
 	return where, args
@@ -778,16 +798,17 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 	sessionUUID := uuid.New().String()
 	expires := utcNow().Add(8 * time.Hour)
 	_, err = db.Exec(`
-    INSERT INTO uuid_logs (
-        uuid_value,
-        emp_id,
-        bin_id,
-        generated_at,
-        expires_at,
-        is_used,
-        action
-    )
-    VALUES (?, ?, 0, UTC_TIMESTAMP(), ?, 0, 'clock_in')
+INSERT INTO uuid_logs (
+    uuid_value,
+    emp_id,
+    bin_id,
+    generated_at,
+    expires_at,
+    is_used,
+    action,
+    uuid_type
+)
+VALUES (?, ?, NULL, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
 `, sessionUUID, empID, expires)
 
 	if err != nil {
@@ -1269,7 +1290,7 @@ WHERE emp_id=?
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec(`
+	_, err = db.Exec(`
 INSERT INTO uuid_logs (
   uuid_value,
   emp_id,
@@ -1277,9 +1298,11 @@ INSERT INTO uuid_logs (
   generated_at,
   expires_at,
   is_used,
-  action
+  action,
+  uuid_type
 )
-VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in')
+VALUES (?, ?, NULL, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
+
 
 	`, code, req.EmpID, binID, exp)
 	if err != nil {
@@ -1404,17 +1427,18 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	exp := utcNow().Add(8 * time.Hour)
 
 	_, err = db.Exec(`
-		INSERT INTO uuid_logs (
-			uuid_value,
-			emp_id,
-			bin_id,
-			generated_at,
-			expires_at,
-			is_used,
-			action
-		)
-		VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in')
-	`, code, empID, binID, exp)
+INSERT INTO uuid_logs (
+  uuid_value,
+  emp_id,
+  bin_id,
+  generated_at,
+  expires_at,
+  is_used,
+  action,
+  uuid_type
+)
+VALUES (?, ?, NULL, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
+`, code, empID, exp)
 
 	if err != nil {
 		bad(w, 500, "insert")
@@ -1444,6 +1468,7 @@ type okResp struct {
 }
 
 func handleBinConsume(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		bad(w, 405, "POST only")
 		return
@@ -1460,70 +1485,87 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1️⃣ Ensure active clock-in exists
-	// 1️⃣ Ensure active clock-in exists
+	// 🔵 1️⃣ Try employee session first
 	var empID int
 	var expiresAt sql.NullTime
 
 	err := db.QueryRow(`
-    SELECT emp_id, expires_at
-    FROM uuid_logs
-    WHERE uuid_value = ?
-      AND action = 'clock_in'
-      AND closed_at IS NULL
-    LIMIT 1
-`, req.UUID).Scan(&empID, &expiresAt)
-
-	if err == sql.ErrNoRows {
-		bad(w, 409, "no active clock-in")
-		return
-	}
-	if err != nil {
-		bad(w, 500, "db")
-		return
-	}
-
-	// 🔥 EXPIRY CHECK
-	if expiresAt.Valid && utcNow().After(expiresAt.Time) {
-		bad(w, 409, "uuid expired")
-		return
-	}
-
-	// 2️⃣ Ensure NOT already consumed
-	var exists int
-	err = db.QueryRow(`
-	SELECT 1
-	FROM uuid_logs
-	WHERE uuid_value = ?
-	  AND action = 'consume'
-	LIMIT 1
-`, req.UUID).Scan(&exists)
+        SELECT emp_id, expires_at
+        FROM uuid_logs
+        WHERE uuid_value = ?
+          AND action = 'clock_in'
+          AND closed_at IS NULL
+        LIMIT 1
+    `, req.UUID).Scan(&empID, &expiresAt)
 
 	if err == nil {
-		bad(w, 409, "already consumed")
+
+		if expiresAt.Valid && utcNow().After(expiresAt.Time) {
+			bad(w, 409, "uuid expired")
+			return
+		}
+
+		_, err = db.Exec(`
+            INSERT INTO uuid_logs (
+                uuid_value,
+                emp_id,
+                bin_id,
+                is_used,
+                used_at,
+                action,
+                uuid_type
+            )
+            VALUES (?, ?, ?, 1, UTC_TIMESTAMP(), 'consume', 'SESSION')
+        `, req.UUID, empID, req.BinID)
+
+		if err != nil {
+			bad(w, 500, "insert consume failed")
+			return
+		}
+
+		writeJSON(w, okResp{OK: true})
 		return
 	}
 
-	// 3️⃣ Insert consume row
-	_, err = db.Exec(`
-	INSERT INTO uuid_logs (
-		uuid_value,
-		emp_id,
-		bin_id,
-		is_used,
-		used_at,
-		action
-	)
-	VALUES (?, ?, ?, 1, UTC_TIMESTAMP(), 'consume')
-`, req.UUID, empID, req.BinID)
+	// 🟣 2️⃣ Try manager UUID
+	var managerID int
 
-	if err != nil {
-		bad(w, 500, "insert consume failed")
+	err = db.QueryRow(`
+        SELECT mu.manager_id
+        FROM manager_uuids mu
+        JOIN managers m ON m.manager_id = mu.manager_id
+        WHERE mu.uuid_value = ?
+          AND mu.is_revoked = 0
+          AND m.is_active = 1
+        LIMIT 1
+    `, req.UUID).Scan(&managerID)
+
+	if err == nil {
+
+		_, err = db.Exec(`
+            INSERT INTO uuid_logs (
+                uuid_value,
+                emp_id,
+                bin_id,
+                is_used,
+                used_at,
+                action,
+                uuid_type
+            )
+VALUES (?, NULL, ?, 1, UTC_TIMESTAMP(), 'override', 'CREDENTIAL')
+        `, req.UUID, req.BinID)
+
+		if err != nil {
+			bad(w, 500, "manager insert failed")
+			return
+		}
+
+		writeJSON(w, okResp{OK: true})
 		return
 	}
 
-	writeJSON(w, okResp{OK: true})
-
+	// ❌ If neither employee nor manager
+	bad(w, 409, "invalid uuid")
 }
 
 /* ---------- TELEMETRY ---------- */
@@ -1783,15 +1825,28 @@ type adminCounts struct {
 
 type adminRow struct {
 	UUID        string `json:"uuid"`
-	IsUsed      bool   `json:"is_used"`
-	Expired     bool   `json:"expired"`
+	Action      string `json:"action"`
+	UUIDType    string `json:"uuid_type"`
 	Employee    string `json:"employee"`
 	Department  string `json:"department"`
-	Stream      string `json:"stream"`
 	BinName     string `json:"bin_name"`
 	GeneratedAt string `json:"generated_at"`
-	UsedAt      string `json:"used_at"`
 	ExpiresAt   string `json:"expires_at"`
+}
+
+func formatActionLabel(action string) string {
+	switch action {
+	case "clock_in":
+		return "Shift Started"
+	case "consume":
+		return "Waste Disposed"
+	case "clock_out":
+		return "Shift Ended"
+	case "override":
+		return "Manager Disposal Authorized"
+	default:
+		return action
+	}
 }
 
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
@@ -1829,29 +1884,42 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	q := `
 SELECT
     ul.uuid_value,
-    ul.is_used,
-    IF(ul.expires_at IS NOT NULL AND UTC_TIMESTAMP() > ul.expires_at, 1, 0) AS expired,
-    e.emp_name,
-    d.dept_name,
-    ws.code,
-    b.bin_name,
-    DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'),
-                '%Y-%m-%d %l:%i %p'),
-    IFNULL(
-        DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'),
-                    '%Y-%m-%d %l:%i %p'),
-        ''
-    ),
+    ul.action,
+    IFNULL(ul.uuid_type,'SESSION'),
+
+    CASE
+        WHEN ul.uuid_type = 'CREDENTIAL' THEN m.name
+        ELSE e.emp_name
+    END AS person_name,
+
+    CASE
+        WHEN ul.uuid_type = 'CREDENTIAL' THEN IFNULL(md.dept_name, 'Manager')
+        ELSE IFNULL(d.dept_name, '')
+    END AS department_name,
+
+    IFNULL(b.bin_name, ''),
+
+IFNULL(
+  DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'),
+              '%Y-%m-%d %l:%i %p'),
+  ''
+),
+
     IFNULL(
         DATE_FORMAT(CONVERT_TZ(ul.expires_at, '+00:00', '-05:00'),
                     '%Y-%m-%d %l:%i %p'),
         ''
     )
+
 FROM uuid_logs ul
-JOIN employees e   ON e.emp_id  = ul.emp_id
-JOIN departments d ON d.dept_id = e.dept_id
-JOIN bins b        ON b.bin_id  = ul.bin_id
-JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
+LEFT JOIN employees e   ON e.emp_id  = ul.emp_id
+LEFT JOIN departments d ON d.dept_id = e.dept_id
+LEFT JOIN manager_uuids mu ON mu.uuid_value = ul.uuid_value
+LEFT JOIN managers m ON m.manager_id = mu.manager_id
+LEFT JOIN departments md ON md.dept_id = m.dept_id
+LEFT JOIN bins b ON b.bin_id = ul.bin_id
+
+
 ` + where + `
 ORDER BY ul.uuid_id DESC
 LIMIT ?
@@ -1861,7 +1929,7 @@ LIMIT ?
 
 	rows, err := db.Query(q, args...)
 	if err != nil {
-		bad(w, 500, "db")
+		bad(w, 500, err.Error())
 		return
 	}
 	defer rows.Close()
@@ -1870,19 +1938,28 @@ LIMIT ?
 
 	for rows.Next() {
 		var ar adminRow
-		var isUsedInt, expiredInt int
 
 		if err := rows.Scan(
-			&ar.UUID, &isUsedInt, &expiredInt,
-			&ar.Employee, &ar.Department, &ar.Stream,
-			&ar.BinName, &ar.GeneratedAt, &ar.UsedAt, &ar.ExpiresAt,
+			&ar.UUID,
+			&ar.Action,
+			&ar.UUIDType,
+			&ar.Employee,
+			&ar.Department,
+			&ar.BinName,
+			&ar.GeneratedAt,
+			&ar.ExpiresAt,
 		); err != nil {
+
 			bad(w, 500, "scan")
 			return
 		}
 
-		ar.IsUsed = isUsedInt == 1
-		ar.Expired = expiredInt == 1
+		ar.Action = formatActionLabel(ar.Action)
+		if ar.UUIDType == "CREDENTIAL" {
+			ar.UUIDType = "🟣 MGR"
+		} else {
+			ar.UUIDType = "🔵 EMP"
+		}
 
 		recent = append(recent, ar)
 	}
@@ -1904,28 +1981,64 @@ LIMIT ?
 /* ---------- EXPORT CSV ---------- */
 
 func handleAdminExport(w http.ResponseWriter, r *http.Request) {
+
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/csv")
-	w.Header().Set("Content-Disposition", `attachment; filename="UHWI UUID_logs.csv"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="UHWI_UUID_logs.csv"`)
 
 	where, args := buildFilters(r)
 
 	q := `
-		SELECT
-			ul.uuid_value, ul.is_used, ul.expires_at,
-			e.emp_name, d.dept_name, ws.code, b.bin_name,
-			DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'),
-			IFNULL(DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'), ''),
-			IFNULL(DATE_FORMAT(CONVERT_TZ(ul.expires_at, '+00:00', '-05:00'), '%Y-%m-%d %l:%i %p'), '')
-		FROM uuid_logs ul
-		JOIN employees e   ON e.emp_id  = ul.emp_id
-		JOIN departments d ON d.dept_id = e.dept_id
-		JOIN bins b        ON b.bin_id  = ul.bin_id
-		JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
-	` + where + `
-		ORDER BY ul.uuid_id DESC
-		LIMIT 5000
-	`
+SELECT
+    ul.uuid_value,
+    ul.action,
+    IFNULL(ul.uuid_type,'SESSION'),
+
+    CASE
+        WHEN ul.uuid_type = 'CREDENTIAL' THEN m.name
+        ELSE e.emp_name
+    END AS person_name,
+
+IFNULL(
+  CASE
+      WHEN ul.uuid_type = 'CREDENTIAL' THEN md.dept_name
+      ELSE d.dept_name
+  END,
+  ''
+) AS department_name,
+
+IFNULL(b.bin_name,''),
+
+    DATE_FORMAT(CONVERT_TZ(ul.generated_at, '+00:00', '-05:00'),
+                '%Y-%m-%d %l:%i %p'),
+
+    IFNULL(
+        DATE_FORMAT(CONVERT_TZ(ul.used_at, '+00:00', '-05:00'),
+                    '%Y-%m-%d %l:%i %p'),
+        ''
+    ),
+
+    IFNULL(
+        DATE_FORMAT(CONVERT_TZ(ul.expires_at, '+00:00', '-05:00'),
+                    '%Y-%m-%d %l:%i %p'),
+        ''
+    )
+
+FROM uuid_logs ul
+
+LEFT JOIN employees e   ON e.emp_id  = ul.emp_id
+LEFT JOIN departments d ON d.dept_id = e.dept_id
+
+LEFT JOIN manager_uuids mu ON mu.uuid_value = ul.uuid_value
+LEFT JOIN managers m ON m.manager_id = mu.manager_id
+LEFT JOIN departments md ON md.dept_id = m.dept_id
+
+LEFT JOIN bins b ON b.bin_id = ul.bin_id
+
+` + where + `
+ORDER BY ul.uuid_id DESC
+LIMIT 5000
+`
 
 	rows, err := db.Query(q, args...)
 	if err != nil {
@@ -1938,34 +2051,54 @@ func handleAdminExport(w http.ResponseWriter, r *http.Request) {
 	defer cw.Flush()
 
 	_ = cw.Write([]string{
-		"uuid", "status", "employee", "department",
-		"stream", "bin", "generated_at", "used_at", "expires_at",
+		"uuid",
+		"activity",
+		"role",
+		"name",
+		"department",
+		"bin",
+		"event_time",
+		"used_at",
+		"expires_at",
 	})
 
 	for rows.Next() {
-		var uuidVal, empName, deptName, streamCode, binName, genAt, usedAt, expAt string
-		var isUsed int
-		var expires sql.NullTime
+
+		var uuidVal, action, uuidType, name, dept, binName string
+		var eventTime, usedAt, expiresAt string
 
 		if err := rows.Scan(
-			&uuidVal, &isUsed, &expires,
-			&empName, &deptName, &streamCode, &binName,
-			&genAt, &usedAt, &expAt,
+			&uuidVal,
+			&action,
+			&uuidType,
+			&name,
+			&dept,
+			&binName,
+			&eventTime,
+			&usedAt,
+			&expiresAt,
 		); err != nil {
 			bad(w, 500, "scan")
 			return
 		}
 
-		status := "active"
-		if isUsed == 1 {
-			status = "used"
-		} else if expires.Valid && utcNow().After(expires.Time.UTC()) {
-			status = "expired"
+		role := "🔵 EMP"
+		if uuidType == "CREDENTIAL" {
+			role = "🟣 MGR"
 		}
 
+		action = formatActionLabel(action)
+
 		_ = cw.Write([]string{
-			uuidVal, status, empName, deptName,
-			streamCode, binName, genAt, usedAt, expAt,
+			uuidVal,
+			action,
+			role,
+			name,
+			dept,
+			binName,
+			eventTime,
+			usedAt,
+			expiresAt,
 		})
 	}
 }
@@ -1985,18 +2118,18 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
 	start := jamTodayMidnight().AddDate(0, 0, -days+1)
 
 	rows, err := db.Query(`
-  SELECT
+SELECT
     DATE(CONVERT_TZ(generated_at,'+00:00','-05:00')) AS day,
-    COUNT(*) AS generated_cnt,
-    SUM(CASE WHEN is_used = 1 THEN 1 ELSE 0 END) AS used_cnt,
-    SUM(
-      CASE
-        WHEN is_used = 0
-         AND expires_at IS NOT NULL
-         AND UTC_TIMESTAMP() > expires_at
-        THEN 1 ELSE 0
-      END
-    ) AS expired_cnt
+SUM(CASE WHEN action = 'clock_in' THEN 1 ELSE 0 END) AS generated_cnt,
+SUM(CASE WHEN action IN ('consume','override') THEN 1 ELSE 0 END) AS used_cnt,
+SUM(
+  CASE
+    WHEN action = 'clock_in'
+     AND expires_at IS NOT NULL
+     AND UTC_TIMESTAMP() > expires_at
+    THEN 1 ELSE 0
+  END
+) AS expired_cnt
   FROM uuid_logs
   GROUP BY DATE(CONVERT_TZ(generated_at,'+00:00','-05:00'))
   ORDER BY DATE(CONVERT_TZ(generated_at,'+00:00','-05:00'))
@@ -2036,7 +2169,8 @@ func handleAdminChartJSON(w http.ResponseWriter, r *http.Request) {
       FROM uuid_logs ul
       WHERE
         DATE(CONVERT_TZ(ul.generated_at,'+00:00','-05:00')) <= d.day
-        AND ul.is_used = 0
+AND ul.action = 'clock_in'
+AND ul.closed_at IS NULL
         AND (
           ul.expires_at IS NULL
           OR DATE(CONVERT_TZ(ul.expires_at,'+00:00','-05:00')) > d.day
@@ -2223,10 +2357,11 @@ func updateStatsForDay(day time.Time) error {
 	// ✅ GENERATED during that day (generated_at inside the UTC window)
 	var generated int
 	if err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM uuid_logs
-		WHERE generated_at >= ?
-		  AND generated_at < ?
+SELECT COUNT(*)
+FROM uuid_logs
+WHERE action = 'clock_in'
+  AND generated_at >= ?
+  AND generated_at < ?
 	`, startUTC, endUTC).Scan(&generated); err != nil {
 		return err
 	}
@@ -2236,8 +2371,8 @@ func updateStatsForDay(day time.Time) error {
 	if err := db.QueryRow(`
 		SELECT COUNT(*)
 		FROM uuid_logs
-		WHERE is_used = 1
-		  AND used_at IS NOT NULL
+WHERE action IN ('consume','override')
+  AND used_at IS NOT NULL
 		  AND used_at >= ?
 		  AND used_at < ?
 	`, startUTC, endUTC).Scan(&used); err != nil {
@@ -2274,8 +2409,9 @@ func markNewlyExpired() {
 	_, _ = db.Exec(`
 		UPDATE uuid_logs
 		SET expired_at = UTC_TIMESTAMP()
-		WHERE is_used = 0
-		  AND expires_at IS NOT NULL
+WHERE action = 'clock_in'
+  AND closed_at IS NULL
+  AND expires_at IS NOT NULL
 		  AND expires_at < UTC_TIMESTAMP()
 		  AND expired_at IS NULL
 	`)
@@ -2360,10 +2496,30 @@ LIMIT 1
 UPDATE uuid_logs
 SET closed_at = UTC_TIMESTAMP()
 WHERE uuid_id = ?
-	`, uuidID)
+`, uuidID)
 
 	if err != nil {
 		bad(w, 500, "db(update)")
+		return
+	}
+
+	// 3️⃣ Insert clock_out event for audit trail
+	_, err = db.Exec(`
+INSERT INTO uuid_logs (
+    uuid_value,
+    emp_id,
+    bin_id,
+    generated_at,
+    action,
+    uuid_type
+)
+SELECT uuid_value, emp_id, NULL, UTC_TIMESTAMP(), 'clock_out', 'SESSION'
+FROM uuid_logs
+WHERE uuid_id = ?
+`, uuidID)
+
+	if err != nil {
+		bad(w, 500, "db(insert clock_out)")
 		return
 	}
 
@@ -2386,11 +2542,14 @@ type managerDeleteReq struct {
 	ManagerID int `json:"manager_id"`
 }
 
-type managerUUIDReq struct {
-	ManagerID int    `json:"manager_id"`
-	UUID      string `json:"uuid,omitempty"`
+type managerUUIDCreateReq struct {
+	PIN string `json:"pin"`
 }
+
 type managerValidateReq struct {
+	UUID string `json:"uuid"`
+}
+type managerUUIDRevokeReq struct {
 	UUID string `json:"uuid"`
 }
 
@@ -2586,6 +2745,82 @@ func handleManagerChangePin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+/* ---------- CREATE MANAGER UUID (6 MONTHS) ---------- */
+func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerUUIDCreateReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	if len(req.PIN) != 5 {
+		bad(w, 400, "5-digit pin required")
+		return
+	}
+
+	// 1️⃣ Find manager by PIN
+	var managerID int
+
+	err := db.QueryRow(`
+        SELECT manager_id
+        FROM managers
+        WHERE pin = ?
+          AND is_active = 1
+        LIMIT 1
+    `, req.PIN).Scan(&managerID)
+
+	if err == sql.ErrNoRows {
+		bad(w, 401, "invalid pin")
+		return
+	}
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	// 2️⃣ Check if active UUID already exists
+	var exists int
+	err = db.QueryRow(`
+        SELECT 1
+        FROM manager_uuids
+        WHERE manager_id = ?
+          AND is_revoked = 0
+          AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
+        LIMIT 1
+    `, managerID).Scan(&exists)
+
+	if err == nil {
+		bad(w, 409, "manager already has active credential")
+		return
+	}
+
+	// 3️⃣ Generate new UUID
+	newUUID := uuid.New().String()
+	expires := utcNow().AddDate(0, 6, 0)
+
+	_, err = db.Exec(`
+        INSERT INTO manager_uuids
+        (uuid_value, manager_id, is_revoked, created_at, expires_at)
+        VALUES (?, ?, 0, UTC_TIMESTAMP(), ?)
+    `, newUUID, managerID, expires)
+
+	if err != nil {
+		bad(w, 500, "insert failed")
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"uuid":       newUUID,
+		"expires_at": expires,
+	})
+}
+
 /* ---------- REVOKE MANAGER UUID ---------- */
 
 func handleManagerUUIDRevoke(w http.ResponseWriter, r *http.Request) {
@@ -2595,18 +2830,18 @@ func handleManagerUUIDRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req managerUUIDReq
+	var req managerUUIDRevokeReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		bad(w, 400, "bad json")
 		return
 	}
 
 	_, err := db.Exec(`
-    UPDATE manager_uuids
-    SET is_revoked = 1,
-        revoked_at = UTC_TIMESTAMP()
-    WHERE uuid_value = ?
-`, req.UUID)
+        UPDATE manager_uuids
+        SET is_revoked = 1,
+            revoked_at = UTC_TIMESTAMP()
+        WHERE uuid_value = ?
+    `, req.UUID)
 
 	if err != nil {
 		bad(w, 500, "db")
@@ -2636,9 +2871,10 @@ func handleManagerValidate(w http.ResponseWriter, r *http.Request) {
 		SELECT 1
 		FROM manager_uuids mu
 		JOIN managers m ON m.manager_id = mu.manager_id
-		WHERE mu.uuid_value = ?
-		  AND mu.is_revoked = 0
-		  AND m.is_active = 1
+WHERE mu.uuid_value = ?
+  AND mu.is_revoked = 0
+  AND m.is_active = 1
+  AND (mu.expires_at IS NULL OR UTC_TIMESTAMP() < mu.expires_at)
 		LIMIT 1
 	`, req.UUID).Scan(&exists)
 
@@ -2678,10 +2914,10 @@ func handleManagerUUIDList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-        SELECT uuid_value, is_revoked, created_at, revoked_at
-        FROM manager_uuids
-        WHERE manager_id = ?
-        ORDER BY created_at DESC
+SELECT uuid_value, is_revoked, created_at, revoked_at, expires_at
+FROM manager_uuids
+WHERE manager_id = ?
+ORDER BY created_at DESC
     `, managerID)
 
 	if err != nil {
@@ -2695,16 +2931,25 @@ func handleManagerUUIDList(w http.ResponseWriter, r *http.Request) {
 		IsRevoked int        `json:"is_revoked"`
 		CreatedAt time.Time  `json:"created_at"`
 		RevokedAt *time.Time `json:"revoked_at"`
+		ExpiresAt *time.Time `json:"expires_at"`
 	}
 
 	var out []row
 
 	for rows.Next() {
 		var rr row
-		if err := rows.Scan(&rr.UUIDValue, &rr.IsRevoked, &rr.CreatedAt, &rr.RevokedAt); err != nil {
+
+		if err := rows.Scan(
+			&rr.UUIDValue,
+			&rr.IsRevoked,
+			&rr.CreatedAt,
+			&rr.RevokedAt,
+			&rr.ExpiresAt,
+		); err != nil {
 			bad(w, 500, "scan")
 			return
 		}
+
 		out = append(out, rr)
 	}
 
@@ -2772,7 +3017,7 @@ func main() {
 	http.HandleFunc("/admin/departments.json", handleDepartmentsAdminJSON)
 
 	// bins
-	http.HandleFunc("/bins", handleListBins)
+	http.HandleFunc("/bins/", handleListBins)
 	http.HandleFunc("/bins/summary", handleBinsSummary)
 	http.HandleFunc("/bins/live.json", handleBinsLiveJSON)
 	http.HandleFunc("/bins/live.sse", handleBinsLiveSSE)
@@ -2803,6 +3048,7 @@ func main() {
 
 	// managers (new full system)
 	http.HandleFunc("/managers", handleManagers)
+	http.HandleFunc("/managers/uuid", handleManagerUUIDCreate)
 	http.HandleFunc("/managers/", handleManagerUUIDList)
 	http.HandleFunc("/managers/status", handleManagerStatus)
 	http.HandleFunc("/managers/delete", handleManagerDelete)

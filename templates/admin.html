@@ -34,6 +34,14 @@
       --shadow: 0 20px 40px rgba(0,0,0,.45);
       --radius: 14px;
     }
+.expires-cell {
+  text-align: right;
+}
+
+.expires-cell.empty {
+  text-align: center;
+  color: var(--muted);
+}
 
     /* Improve dropdown option visibility */
     select option {
@@ -232,6 +240,26 @@
   color: #f87171;
   border-color: #f87171;
 }
+.activity-badge {
+  font-weight: 600;
+}
+
+.activity-clockin { color: #fbbf24; }
+.activity-consume { color: #f87171; }
+.activity-override { color: #c084fc; }
+.activity-clockout { color: #4ade80; }
+
+/* ROLE COLORS */
+.role-emp {
+  color: #60a5fa;
+  font-weight: 700;
+}
+
+.role-mgr {
+  color: #c084fc;
+  font-weight: 700;
+}
+
 
 
     /* For other pills used elsewhere (door open/closed, etc.) */
@@ -494,44 +522,21 @@ dialog .toast{
 
       <div class="table-wrap">
         <table id="recentTable">
-          <thead>
-            <tr>
-              <th>When (Local)</th>
-              <th>UUID</th>
-              <th>Status</th>
-              <th>Employee</th>
-              <th>Department</th>
-              <th>Stream</th>
-              <th>Bin</th>
-              <th>Used At</th>
-              <th>Expires</th>
-            </tr>
-          </thead>
+<thead>
+  <tr>
+    <th>Time</th>
+    <th>UUID</th>
+    <th>Name</th>
+    <th>Role</th>
+    <th>Department</th>
+    <th>Bin</th>
+    <th>Activity</th>
+    <th>Expires</th>
+  </tr>
+</thead>
           <tbody id="recentTbody">
 
-{{range .Recent}}
-<tr>
-  <td>{{.GeneratedAt}}</td>
-    <td><code>{{.UUID}}</code></td>
 
-    <td>
-      {{if .IsUsed}}
-        <span class="pill pill-used">used</span>
-      {{else if .Expired}}
-        <span class="pill pill-expired">expired</span>
-      {{else}}
-        <span class="pill pill-active">active</span>
-      {{end}}
-    </td>
-
-    <td>{{.Employee}}</td>
-    <td>{{.Department}}</td>
-    <td>{{.Stream}}</td>
-    <td>{{.BinName}}</td>
-    <td>{{if .UsedAt}}{{.UsedAt}}{{else}}—{{end}}</td>
-    <td>{{.ExpiresAt}}</td>
-  </tr>
-{{end}}
 
           </tbody>
         </table>
@@ -736,15 +741,16 @@ dialog .toast{
 
   <div class="table-wrap" style="max-height:55vh; overflow:auto">
     <table>
-      <thead>
-        <tr>
-          <th>UUID</th>
-          <th>Status</th>
-          <th>Created</th>
-          <th>Revoked</th>
-          <th>Action</th>
-        </tr>
-      </thead>
+<thead>
+  <tr>
+    <th>UUID</th>
+    <th>Status</th>
+    <th>Created</th>
+    <th>Expires</th>   
+    <th>Revoked</th>
+    <th>Action</th>
+  </tr>
+</thead>
       <tbody id="managerUUIDTable"></tbody>
     </table>
   </div>
@@ -999,17 +1005,17 @@ const labels = data.labels.map(formatDayLabel);
 
     const datasets = [
       {
-        label: "Active",
+label: "Active Sessions",
         data: data.active,
         backgroundColor: "#16a34a",
       },
       {
-        label: "Used",
+label: "Waste Events",
         data: data.used,
         backgroundColor: "#f87171",
       },
       {
-        label: "Expired",
+label: "Expired Sessions",
         data: data.expired,
         backgroundColor: "#fbbf24",
       }
@@ -1096,48 +1102,74 @@ const labels = data.labels.map(formatDayLabel);
         const url = "/admin/export.csv" + (qs? "?"+qs : "");
         const resp = await fetch(url, {cache:"no-store"});
         const csv = await resp.text();
-        const rows = parseCSV(csv);
+const rows = parseCSV(csv);
 
-        if (!rows || rows.length <= 1) return;
+if (!rows || rows.length <= 1) return;
 
-        const header = rows[0].map(h => h.trim().toLowerCase());
-        const idx = Object.fromEntries(header.map((h,i)=>[h,i]));
-        const bodyRows = rows.slice(1).filter(r => r.length >= header.length);
+// 🔥 THIS MUST EXIST
+const header = rows[0].map(h => h.trim().toLowerCase());
+const idx = Object.fromEntries(
+  header.map((h,i)=>[h,i])
+);
+
+const bodyRows = rows.slice(1).filter(r => r.length >= header.length);
+
 
         recentTbody.innerHTML = bodyRows.map(r=>{
-          const uuid = r[idx.uuid] || "";
-          const rawStatus = (r[idx.status] || "").toLowerCase();
+      
+const uuid       = r[idx.uuid] || "";
+const employee   = r[idx.name] || "";
+const department = r[idx.department] || "";
+const bin        = r[idx.bin] || "";
+const genRaw     = r[idx.event_time] || "";
+const expRaw     = r[idx.expires_at] || "";
+const roleRaw    = r[idx.role] || "";
+const activityRaw= r[idx.activity] || "";
 
-          const employee   = r[idx.employee]   || "";
-          const department = r[idx.department] || "";
-          const stream     = r[idx.stream]     || "";
-          const bin        = r[idx.bin]        || "";
 
-          const genRaw     = r[idx.generated_at] || "";
-          const usedRaw    = r[idx.used_at]      || "";
-          const expRaw     = r[idx.expires_at]   || "";
+const genFmt = genRaw ? formatLocal(genRaw) : "";
+const expFmt = expRaw ? formatLocal(expRaw) : "-";
 
-          const genFmt  = formatLocal(genRaw);
-          const usedFmt = usedRaw ? formatLocal(usedRaw) : "—";
-          const expFmt  = expRaw ? formatLocal(expRaw) : "";
+let role = r[idx.role] || "";
 
-          const pill =
-            rawStatus === "used"    ? `<span class="pill pill-used">used</span>` :
-            rawStatus === "expired" ? `<span class="pill pill-expired">expired</span>` :
-                                       `<span class="pill pill-active">active</span>`;
+if (role.includes("EMP")) {
+  role = `<span class="role-emp">${role}</span>`;
+}
+if (role.includes("MGR")) {
+  role = `<span class="role-mgr">${role}</span>`;
+}
+let activity = r[idx.activity] || "";
 
-          return `
-            <tr>
-              <td>${genFmt}</td>
-              <td><code>${uuid}</code></td>
-              <td>${pill}</td>
-              <td>${employee}</td>
-              <td>${department}</td>
-              <td>${stream}</td>
-              <td>${bin}</td>
-              <td>${usedFmt}</td>
-              <td>${expFmt}</td>
-            </tr>`;
+let activityClass = "";
+
+if (activity.toLowerCase().includes("shift started"))
+  activityClass = "activity-clockin";
+
+if (activity.toLowerCase().includes("waste disposed"))
+  activityClass = "activity-consume";
+
+if (activity.toLowerCase().includes("manager"))
+  activityClass = "activity-override";
+
+if (activity.toLowerCase().includes("shift ended"))
+  activityClass = "activity-clockout";
+
+activity = `<span class="activity-badge ${activityClass}">${activity}</span>`;
+
+return `
+  <tr>
+    <td>${genFmt}</td>
+    <td><code>${uuid}</code></td>
+    <td>${employee}</td>
+    <td>${role}</td>
+    <td>${department}</td>
+    <td>${bin}</td>
+    <td>${activity}</td>
+<td class="expires-cell ${expFmt === "-" ? "empty" : ""}">
+  ${expFmt}
+</td>
+  </tr>`;
+
         }).join('');
 
         if (recentCount) recentCount.textContent = bodyRows.length;
@@ -2037,7 +2069,7 @@ document.getElementById("closeManagerUUIDModal")
 window.openManagerUUIDs = async function(managerID){
   uuidTable.setAttribute("data-manager", managerID);
 
-  uuidTable.innerHTML = "<tr><td colspan='5'>Loading...</td></tr>";
+uuidTable.innerHTML = "<tr><td colspan='6'>Loading...</td></tr>";
 
   try{
 const res = await fetch(`/managers/${managerID}/uuids`);
@@ -2050,9 +2082,17 @@ const res = await fetch(`/managers/${managerID}/uuids`);
 
     uuidTable.innerHTML = (data.uuids || []).map(u=>{
 
-const status = u.is_revoked === 1
-  ? `<span class="pill pill-revoked">revoked</span>`
-  : `<span class="pill pill-active">active</span>`;
+let status;
+
+if (u.is_revoked === 1) {
+  status = `<span class="pill pill-revoked">revoked</span>`;
+}
+else if (u.expires_at && new Date(u.expires_at) < new Date()) {
+  status = `<span class="pill pill-expired">expired</span>`;
+}
+else {
+  status = `<span class="pill pill-active">active</span>`;
+}
 
 
       const revokeBtn = u.is_revoked === 0
@@ -2062,21 +2102,22 @@ const status = u.is_revoked === 1
            </button>`
         : "—";
 
-      return `
-        <tr>
-          <td><code>${u.uuid_value}</code></td>
-          <td>${status}</td>
-          <td>${formatLocal(u.created_at)}</td>
-          <td>${u.revoked_at ? formatLocal(u.revoked_at) : "—"}</td>
-          <td>${revokeBtn}</td>
-        </tr>
-      `;
+return `
+  <tr>
+    <td><code>${u.uuid_value}</code></td>
+    <td>${status}</td>
+    <td>${formatLocal(u.created_at)}</td>
+    <td>${u.expires_at ? formatLocal(u.expires_at) : "—"}</td>   <!-- NEW -->
+    <td>${u.revoked_at ? formatLocal(u.revoked_at) : "—"}</td>
+    <td>${revokeBtn}</td>
+  </tr>
+`;
     }).join("");
 
     uuidModal.showModal();
 
   } catch(e){
-    uuidTable.innerHTML = "<tr><td colspan='5'>Network error</td></tr>";
+uuidTable.innerHTML = "<tr><td colspan='6'>Network error</td></tr>";
   }
 };
 
