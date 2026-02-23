@@ -9,6 +9,8 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 )
 
 // --- embed templates ---
@@ -26,6 +29,7 @@ var templateFS embed.FS
 var tpl = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 
 var db *sql.DB
+var pinRegex = regexp.MustCompile(`^\d{5}$`)
 
 // ================= TIMEZONE HELPERS =================
 // Jamaica is UTC-5 (no DST in your setup). If you ever change DST handling,
@@ -748,22 +752,43 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.PIN) != 5 {
+	if !pinRegex.MatchString(req.PIN) {
 		http.Error(w, "need 5-digit pin", http.StatusBadRequest)
 		return
 	}
-	var empID, deptID int
-	var empName string
-	role := "employee"
+
+	// 1️⃣ Resolve PIN → user
+	var userType string
+	var userID int
 
 	err := db.QueryRow(`
-    SELECT emp_id, emp_name, dept_id
-    FROM employees
-    WHERE pin = ?
-      AND is_active = 1
-      AND is_hidden = 0
-    LIMIT 1
-`, req.PIN).Scan(&empID, &empName, &deptID)
+        SELECT user_type, user_id
+        FROM pin_registry
+        WHERE pin = ?
+        LIMIT 1
+    `, req.PIN).Scan(&userType, &userID)
+
+	if err == sql.ErrNoRows || userType != "employee" {
+		http.Error(w, "Access denied", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// 2️⃣ Load employee
+	var empID, deptID int
+	var empName string
+
+	err = db.QueryRow(`
+        SELECT emp_id, emp_name, dept_id
+        FROM employees
+        WHERE emp_id = ?
+          AND is_active = 1
+          AND is_hidden = 0
+        LIMIT 1
+    `, userID).Scan(&empID, &empName, &deptID)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "Access denied", http.StatusUnauthorized)
@@ -774,66 +799,97 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 🔒 Prevent multiple active sessions
-	var existingUUID string
-	var existingExpiry sql.NullTime
+	// ===========================
+	// 🔒 BEGIN ATOMIC TRANSACTION
+	// ===========================
 
-	err = db.QueryRow(`
-    SELECT uuid_value, expires_at
-    FROM uuid_logs
-    WHERE emp_id = ?
-      AND action = 'clock_in'
-      AND closed_at IS NULL
-    ORDER BY generated_at DESC
-    LIMIT 1
-`, empID).Scan(&existingUUID, &existingExpiry)
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "db error", 500)
+		return
+	}
+
+	// 🔒 Lock employee row
+	_, err = tx.Exec(`
+        SELECT emp_id
+        FROM employees
+        WHERE emp_id = ?
+        FOR UPDATE
+    `, empID)
+
+	if err != nil {
+		tx.Rollback()
+		http.Error(w, "lock failed", 500)
+		return
+	}
+
+	// 🔎 Check for active session (lock it if exists)
+	var existingUUID string
+
+	err = tx.QueryRow(`
+        SELECT uuid_value
+        FROM uuid_logs
+        WHERE emp_id = ?
+          AND action = 'clock_in'
+          AND closed_at IS NULL
+        LIMIT 1
+        FOR UPDATE
+    `, empID).Scan(&existingUUID)
 
 	if err == nil {
-		if existingExpiry.Valid && utcNow().Before(existingExpiry.Time) {
-			http.Error(w, "already clocked in", http.StatusConflict)
-			return
-		}
+		tx.Rollback()
+		http.Error(w, "already clocked in", http.StatusConflict)
+		return
 	}
+
+	if err != sql.ErrNoRows {
+		tx.Rollback()
+		http.Error(w, "db error", 500)
+		return
+	}
+
+	// ===========================
+	// 🟢 NO ACTIVE SESSION → CLOCK IN
+	// ===========================
 
 	sessionUUID := uuid.New().String()
 	expires := utcNow().Add(8 * time.Hour)
-	_, err = db.Exec(`
-INSERT INTO uuid_logs (
-    uuid_value,
-    emp_id,
-    bin_id,
-    generated_at,
-    expires_at,
-    is_used,
-    action,
-    uuid_type
-)
-VALUES (?, ?, NULL, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
-`, sessionUUID, empID, expires)
+
+	_, err = tx.Exec(`
+        INSERT INTO uuid_logs (
+            uuid_value,
+            emp_id,
+            generated_at,
+            expires_at,
+            action,
+            uuid_type
+        )
+        VALUES (?, ?, UTC_TIMESTAMP(), ?, 'clock_in', 'SESSION')
+    `, sessionUUID, empID, expires)
 
 	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
+		tx.Rollback()
+
+		// If unique constraint hit, treat as already clocked in
+		if strings.Contains(err.Error(), "one_open_session") {
+			http.Error(w, "already clocked in", 409)
+			return
+		}
+
+		http.Error(w, "clock in failed", 500)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "commit failed", 500)
 		return
 	}
 
 	broadcastActiveUUIDCount()
 
-	_, err = db.Exec(`
-		UPDATE employees
-		SET current_uuid = ?,
-			uuid_issued_at = UTC_TIMESTAMP(),
-			uuid_expires_at = ?
-		WHERE emp_id = ?
-	`, sessionUUID, expires, empID)
-
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
 	writeJSON(w, pinResp{
 		Valid:        true,
-		Role:         role,
+		Role:         "employee",
 		EmployeeID:   empID,
 		EmployeeName: empName,
 		SessionUUID:  sessionUUID,
@@ -864,8 +920,8 @@ type empListRow struct {
 	Name     string `json:"name"`
 	DeptID   int    `json:"dept_id"`
 	Dept     string `json:"dept"`
-	IsActive int    `json:"is_active"`
 	PIN      string `json:"pin"`
+	IsActive int    `json:"is_active"`
 	IsHidden int    `json:"is_hidden"`
 }
 
@@ -875,19 +931,18 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 
 		rows, err := db.Query(`
-    SELECT e.emp_id,
-           e.emp_name,
-           e.dept_id,
-           d.dept_name,
-           e.is_active,
-           e.pin,
-           e.is_hidden
-    FROM employees e
-    JOIN departments d ON d.dept_id = e.dept_id
-    WHERE e.is_hidden = 0
-    ORDER BY d.dept_name, e.emp_name
-`)
-
+SELECT e.emp_id,
+       e.emp_name,
+       e.dept_id,
+       d.dept_name,
+       e.pin,
+       e.is_active,
+       e.is_hidden
+			FROM employees e
+			JOIN departments d ON d.dept_id = e.dept_id
+			WHERE e.is_hidden = 0
+			ORDER BY d.dept_name, e.emp_name
+		`)
 		if err != nil {
 			bad(w, 500, "db(employees)")
 			return
@@ -895,21 +950,22 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 		defer rows.Close()
 
 		var out []empListRow
-
 		for rows.Next() {
 			var rr empListRow
+
 			if err := rows.Scan(
 				&rr.EmpID,
 				&rr.Name,
 				&rr.DeptID,
 				&rr.Dept,
-				&rr.IsActive,
 				&rr.PIN,
+				&rr.IsActive,
 				&rr.IsHidden,
 			); err != nil {
 				bad(w, 500, "scan")
 				return
 			}
+
 			out = append(out, rr)
 		}
 
@@ -924,31 +980,54 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if req.Name == "" || req.DeptID == 0 || len(req.PIN) != 5 {
-			bad(w, 400, "need name, dept_id, and 5-digit pin")
+		if req.Name == "" || req.DeptID == 0 || !pinRegex.MatchString(req.PIN) {
+			bad(w, 400, "need name, dept_id, and 5-digit numeric pin")
+			return
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			bad(w, 500, "tx")
 			return
 		}
 
-		res, err := db.Exec(`
-    INSERT INTO employees (emp_name, dept_id, pin, is_active, is_hidden)
-    VALUES (?, ?, ?, 1, 0)
-`, req.Name, req.DeptID, req.PIN)
+		res, err := tx.Exec(`
+			INSERT INTO employees (emp_name, dept_id, pin, is_active, is_hidden)
+			VALUES (?, ?, ?, 1, 0)
+		`, req.Name, req.DeptID, req.PIN)
 
 		if err != nil {
-			bad(w, 500, "insert")
+			tx.Rollback()
+			bad(w, 409, "pin already in use")
 			return
 		}
 
 		id64, _ := res.LastInsertId()
+
+		_, err = tx.Exec(`
+			INSERT INTO pin_registry (pin, user_type, user_id)
+			VALUES (?, 'employee', ?)
+		`, req.PIN, id64)
+
+		if err != nil {
+			tx.Rollback()
+			bad(w, 409, "pin already registered")
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			bad(w, 500, "commit")
+			return
+		}
+
 		writeJSON(w, empCreateResp{
 			EmpID:  int(id64),
 			Name:   req.Name,
 			DeptID: req.DeptID,
 		})
 		return
+
 	default:
 		bad(w, 405, "GET or POST only")
-		return
 	}
 }
 
@@ -1004,6 +1083,7 @@ type empChangePinReq struct {
 }
 
 func handleEmployeeHide(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		bad(w, 405, "POST only")
 		return
@@ -1015,7 +1095,14 @@ func handleEmployeeHide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.Exec(`
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+
+	// 1️⃣ mark employee hidden + inactive
+	_, err = tx.Exec(`
         UPDATE employees
         SET is_hidden = 1,
             is_active = 0,
@@ -1025,12 +1112,32 @@ func handleEmployeeHide(w http.ResponseWriter, r *http.Request) {
     `, req.EmpID)
 
 	if err != nil {
-		bad(w, 500, "db")
+		tx.Rollback()
+		bad(w, 500, "update failed")
+		return
+	}
+
+	// 2️⃣ remove pin from registry
+	_, err = tx.Exec(`
+        DELETE FROM pin_registry
+        WHERE user_type = 'employee'
+          AND user_id = ?
+    `, req.EmpID)
+
+	if err != nil {
+		tx.Rollback()
+		bad(w, 500, "registry delete failed")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
 		return
 	}
 
 	writeJSON(w, map[string]bool{"ok": true})
 }
+
 func handleHiddenEmployees(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodGet {
@@ -1039,13 +1146,13 @@ func handleHiddenEmployees(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-    SELECT e.emp_id,
-           e.emp_name,
-           e.dept_id,
-           d.dept_name,
-           e.is_active,
-           e.pin,
-           e.is_hidden
+SELECT e.emp_id,
+       e.emp_name,
+       e.dept_id,
+       d.dept_name,
+       e.pin,
+       e.is_active,
+       e.is_hidden
     FROM employees e
     JOIN departments d ON d.dept_id = e.dept_id
 WHERE e.is_hidden = 1
@@ -1067,8 +1174,8 @@ WHERE e.is_hidden = 1
 			&rr.Name,
 			&rr.DeptID,
 			&rr.Dept,
-			&rr.IsActive,
 			&rr.PIN,
+			&rr.IsActive,
 			&rr.IsHidden,
 		); err != nil {
 			continue
@@ -1092,19 +1199,44 @@ func handleEmployeeChangePin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.EmpID <= 0 || len(req.PIN) != 5 {
+	if req.EmpID <= 0 || !pinRegex.MatchString(req.PIN) {
 		bad(w, 400, "need emp_id and 5-digit pin")
 		return
 	}
 
-	_, err := db.Exec(`
-        UPDATE employees
-        SET pin = ?
-        WHERE emp_id = ?
-    `, req.PIN, req.EmpID)
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+
+	_, err = tx.Exec(`
+    UPDATE employees
+    SET pin = ?
+    WHERE emp_id = ?
+`, req.PIN, req.EmpID)
 
 	if err != nil {
-		bad(w, 500, "update failed")
+		tx.Rollback()
+		bad(w, 409, "pin in use")
+		return
+	}
+
+	_, err = tx.Exec(`
+    UPDATE pin_registry
+    SET pin = ?
+    WHERE user_type = 'employee'
+      AND user_id = ?
+`, req.PIN, req.EmpID)
+
+	if err != nil {
+		tx.Rollback()
+		bad(w, 500, "registry update failed")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
 		return
 	}
 
@@ -1290,7 +1422,7 @@ WHERE emp_id=?
 	}
 	defer tx.Rollback()
 
-	_, err = db.Exec(`
+	_, err = tx.Exec(`
 INSERT INTO uuid_logs (
   uuid_value,
   emp_id,
@@ -1301,8 +1433,7 @@ INSERT INTO uuid_logs (
   action,
   uuid_type
 )
-VALUES (?, ?, NULL, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
-
+VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
 
 	`, code, req.EmpID, binID, exp)
 	if err != nil {
@@ -1348,7 +1479,7 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.PIN) != 5 || req.StreamCode == "" {
+	if !pinRegex.MatchString(req.PIN) || req.StreamCode == "" {
 		bad(w, 400, "need 5-digit pin and stream_code")
 		return
 	}
@@ -1356,14 +1487,39 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	var empID, deptID int
 	var empName string
 
+	var userType string
+	var userID int
+
 	err := db.QueryRow(`
+    SELECT user_type, user_id
+    FROM pin_registry
+    WHERE pin = ?
+    LIMIT 1
+`, req.PIN).Scan(&userType, &userID)
+
+	if err == sql.ErrNoRows {
+		time.Sleep(500 * time.Millisecond)
+		http.Error(w, "Access denied", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	if userType != "employee" {
+		http.Error(w, "Access denied", http.StatusUnauthorized)
+		return
+	}
+
+	err = db.QueryRow(`
     SELECT emp_id, emp_name, dept_id
     FROM employees
-    WHERE pin = ?
+    WHERE emp_id = ?
       AND is_active = 1
       AND is_hidden = 0
     LIMIT 1
-`, req.PIN).Scan(&empID, &empName, &deptID)
+`, userID).Scan(&empID, &empName, &deptID)
 
 	if err == sql.ErrNoRows {
 		bad(w, 401, "invalid pin")
@@ -1379,11 +1535,12 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
 	var existingExpiry sql.NullTime
 
 	err = db.QueryRow(`
-    SELECT uuid_value, expires_at
-    FROM uuid_logs
-    WHERE emp_id = ?
-      AND action = 'clock_in'
-      AND closed_at IS NULL
+SELECT uuid_value, expires_at
+FROM uuid_logs
+WHERE emp_id = ?
+  AND action = 'clock_in'
+  AND closed_at IS NULL
+  AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
     ORDER BY generated_at DESC
     LIMIT 1
 `, empID).Scan(&existingUUID, &existingExpiry)
@@ -1437,8 +1594,8 @@ INSERT INTO uuid_logs (
   action,
   uuid_type
 )
-VALUES (?, ?, NULL, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
-`, code, empID, exp)
+VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
+`, code, empID, binID, exp)
 
 	if err != nil {
 		bad(w, 500, "insert")
@@ -2502,26 +2659,7 @@ WHERE uuid_id = ?
 		bad(w, 500, "db(update)")
 		return
 	}
-
-	// 3️⃣ Insert clock_out event for audit trail
-	_, err = db.Exec(`
-INSERT INTO uuid_logs (
-    uuid_value,
-    emp_id,
-    bin_id,
-    generated_at,
-    action,
-    uuid_type
-)
-SELECT uuid_value, emp_id, NULL, UTC_TIMESTAMP(), 'clock_out', 'SESSION'
-FROM uuid_logs
-WHERE uuid_id = ?
-`, uuidID)
-
-	if err != nil {
-		bad(w, 500, "db(insert clock_out)")
-		return
-	}
+	broadcastActiveUUIDCount()
 
 	writeJSON(w, map[string]bool{"ok": true})
 }
@@ -2566,7 +2704,7 @@ func handleManagers(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 
 		rows, err := db.Query(`
-			SELECT manager_id, name, pin, is_active
+SELECT manager_id, name, pin, is_active
 			FROM managers
 			ORDER BY name
 		`)
@@ -2584,7 +2722,6 @@ func handleManagers(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var out []row
-
 		for rows.Next() {
 			var rr row
 			if err := rows.Scan(&rr.ManagerID, &rr.Name, &rr.PIN, &rr.IsActive); err != nil {
@@ -2605,30 +2742,45 @@ func handleManagers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if req.Name == "" || len(req.PIN) != 5 {
+		if req.Name == "" || !pinRegex.MatchString(req.PIN) {
 			bad(w, 400, "need name + 5-digit pin")
 			return
 		}
 
-		var exists int
-		if err := db.QueryRow(`
-			SELECT 1 FROM managers WHERE pin=?
-		`, req.PIN).Scan(&exists); err == nil {
-			bad(w, 409, "pin already in use")
+		tx, err := db.Begin()
+		if err != nil {
+			bad(w, 500, "tx")
 			return
 		}
 
-		res, err := db.Exec(`
+		res, err := tx.Exec(`
 			INSERT INTO managers (name, pin)
 			VALUES (?, ?)
 		`, req.Name, req.PIN)
 
 		if err != nil {
-			bad(w, 500, "insert")
+			tx.Rollback()
+			bad(w, 409, "pin already in use")
 			return
 		}
 
 		id64, _ := res.LastInsertId()
+
+		_, err = tx.Exec(`
+			INSERT INTO pin_registry (pin, user_type, user_id)
+			VALUES (?, 'manager', ?)
+		`, req.PIN, id64)
+
+		if err != nil {
+			tx.Rollback()
+			bad(w, 409, "pin already registered")
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			bad(w, 500, "commit")
+			return
+		}
 
 		writeJSON(w, map[string]any{
 			"manager_id": int(id64),
@@ -2640,8 +2792,6 @@ func handleManagers(w http.ResponseWriter, r *http.Request) {
 		bad(w, 405, "GET or POST only")
 	}
 }
-
-/* ---------- MANAGER STATUS TOGGLE ---------- */
 
 func handleManagerStatus(w http.ResponseWriter, r *http.Request) {
 
@@ -2656,14 +2806,25 @@ func handleManagerStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.Exec(`
+	if req.ManagerID <= 0 || (req.IsActive != 0 && req.IsActive != 1) {
+		bad(w, 400, "invalid request")
+		return
+	}
+
+	res, err := db.Exec(`
 		UPDATE managers
 		SET is_active = ?
 		WHERE manager_id = ?
 	`, req.IsActive, req.ManagerID)
 
 	if err != nil {
-		bad(w, 500, "update")
+		bad(w, 500, "db(update manager status)")
+		return
+	}
+
+	aff, _ := res.RowsAffected()
+	if aff == 0 {
+		bad(w, 404, "manager not found")
 		return
 	}
 
@@ -2687,6 +2848,13 @@ func handleManagerDelete(w http.ResponseWriter, r *http.Request) {
 
 	// delete UUIDs first
 	_, _ = db.Exec(`DELETE FROM manager_uuids WHERE manager_id=?`, req.ManagerID)
+
+	// remove pin from registry
+	_, _ = db.Exec(`
+DELETE FROM pin_registry
+WHERE user_type = 'manager'
+  AND user_id = ?
+`, req.ManagerID)
 
 	_, err := db.Exec(`DELETE FROM managers WHERE manager_id=?`, req.ManagerID)
 	if err != nil {
@@ -2717,28 +2885,44 @@ func handleManagerChangePin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ManagerID <= 0 || len(req.PIN) != 5 {
+	if req.ManagerID <= 0 || !pinRegex.MatchString(req.PIN) {
 		bad(w, 400, "need manager_id and 5-digit pin")
 		return
 	}
 
-	// ensure PIN not already used
-	var exists int
-	if err := db.QueryRow(`
-		SELECT 1 FROM managers WHERE pin=? AND manager_id<>?
-	`, req.PIN, req.ManagerID).Scan(&exists); err == nil {
-		bad(w, 409, "pin already in use")
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
 		return
 	}
 
-	_, err := db.Exec(`
+	_, err = tx.Exec(`
 		UPDATE managers
 		SET pin = ?
 		WHERE manager_id = ?
 	`, req.PIN, req.ManagerID)
 
 	if err != nil {
-		bad(w, 500, "update")
+		tx.Rollback()
+		bad(w, 409, "pin in use")
+		return
+	}
+
+	_, err = tx.Exec(`
+		UPDATE pin_registry
+		SET pin = ?
+		WHERE user_type = 'manager'
+		  AND user_id = ?
+	`, req.PIN, req.ManagerID)
+
+	if err != nil {
+		tx.Rollback()
+		bad(w, 500, "registry update failed")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
 		return
 	}
 
@@ -2759,23 +2943,23 @@ func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.PIN) != 5 {
-		bad(w, 400, "5-digit pin required")
+	if !pinRegex.MatchString(req.PIN) {
+		bad(w, 400, "PIN must be 5 digits")
 		return
 	}
 
 	// 1️⃣ Find manager by PIN
-	var managerID int
+	var userType string
+	var userID int
 
 	err := db.QueryRow(`
-        SELECT manager_id
-        FROM managers
-        WHERE pin = ?
-          AND is_active = 1
-        LIMIT 1
-    `, req.PIN).Scan(&managerID)
+    SELECT user_type, user_id
+    FROM pin_registry
+    WHERE pin = ?
+    LIMIT 1
+`, req.PIN).Scan(&userType, &userID)
 
-	if err == sql.ErrNoRows {
+	if err == sql.ErrNoRows || userType != "manager" {
 		bad(w, 401, "invalid pin")
 		return
 	}
@@ -2783,6 +2967,8 @@ func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
 		bad(w, 500, "db")
 		return
 	}
+
+	managerID := userID
 
 	// 2️⃣ Check if active UUID already exists
 	var exists int
@@ -2970,7 +3156,14 @@ func handleEmployeeUnhide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.Exec(`
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+
+	// 1️⃣ Unhide employee
+	_, err = tx.Exec(`
         UPDATE employees
         SET is_hidden = 0,
             is_active = 1
@@ -2978,18 +3171,97 @@ func handleEmployeeUnhide(w http.ResponseWriter, r *http.Request) {
     `, req.EmpID)
 
 	if err != nil {
-		bad(w, 500, "db")
+		tx.Rollback()
+		bad(w, 500, "update failed")
+		return
+	}
+
+	// 2️⃣ Get employee PIN
+	var pin string
+	err = tx.QueryRow(`
+        SELECT pin
+        FROM employees
+        WHERE emp_id = ?
+    `, req.EmpID).Scan(&pin)
+
+	if err != nil {
+		tx.Rollback()
+		bad(w, 500, "pin lookup failed")
+		return
+	}
+
+	// 3️⃣ Re-register PIN
+	_, err = tx.Exec(`
+        INSERT INTO pin_registry (pin, user_type, user_id)
+        VALUES (?, 'employee', ?)
+    `, pin, req.EmpID)
+
+	if err != nil {
+		tx.Rollback()
+		bad(w, 409, "pin already in use")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
 		return
 	}
 
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+func handleManagerUUIDListAll(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	rows, err := db.Query(`
+        SELECT uuid_value
+        FROM manager_uuids mu
+        JOIN managers m ON m.manager_id = mu.manager_id
+        WHERE mu.is_revoked = 0
+          AND m.is_active = 1
+          AND (mu.expires_at IS NULL OR UTC_TIMESTAMP() < mu.expires_at)
+    `)
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	var list []string
+
+	for rows.Next() {
+		var uuid string
+		if err := rows.Scan(&uuid); err != nil {
+			bad(w, 500, "scan")
+			return
+		}
+		list = append(list, uuid)
+	}
+
+	if err := rows.Err(); err != nil {
+		bad(w, 500, "rows error")
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"managers": list,
+	})
+}
+
 // ========== MAIN ==========
 func main() {
 	var err error
 
-	dsn := "tracker:Rootpass2025@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=UTC"
+	_ = godotenv.Load()
+
+	dsn := os.Getenv("DB_DSN")
+	if dsn == "" {
+		log.Fatal("❌ DB_DSN environment variable not set")
+	}
 
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
@@ -3017,7 +3289,7 @@ func main() {
 	http.HandleFunc("/admin/departments.json", handleDepartmentsAdminJSON)
 
 	// bins
-	http.HandleFunc("/bins/", handleListBins)
+	http.HandleFunc("/bins", handleListBins)
 	http.HandleFunc("/bins/summary", handleBinsSummary)
 	http.HandleFunc("/bins/live.json", handleBinsLiveJSON)
 	http.HandleFunc("/bins/live.sse", handleBinsLiveSSE)
@@ -3042,11 +3314,11 @@ func main() {
 
 	// auth + uuid
 	http.HandleFunc("/auth/pin", handleAuthPIN)
-	http.HandleFunc("/uuid/create/from-pin", handleUUIDCreateFromPIN)
 	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)
 	http.HandleFunc("/uuid/clock-out", handleUUIDClockOut)
 
 	// managers (new full system)
+	http.HandleFunc("/managers/list", handleManagerUUIDListAll)
 	http.HandleFunc("/managers", handleManagers)
 	http.HandleFunc("/managers/uuid", handleManagerUUIDCreate)
 	http.HandleFunc("/managers/", handleManagerUUIDList)
@@ -3059,6 +3331,12 @@ func main() {
 	// bin module
 	http.HandleFunc("/bin/consume", handleBinConsume)
 	http.HandleFunc("/bin/telemetry", handleBinTelemetry)
+
+	// health check for ESP32
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
 
 	// static + demo
 	http.HandleFunc("/static/live.js", handleLiveJS)
