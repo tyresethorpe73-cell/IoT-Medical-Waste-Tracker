@@ -343,11 +343,7 @@ dialog{
   pointer-events: none;
   z-index: 999999;   /* force front layer */
 }
-dialog .toast{
-  position: absolute;
-  right: 20px;
-  bottom: 20px;
-}
+
 
 
     .toast .t{
@@ -378,6 +374,7 @@ dialog .toast{
             <button class="btn" id="openBinClasses">🗂️ Bin Classifications</button>
             <button class="btn" id="openDeptClasses">🏥 Department Classifications</button>
             <button class="btn" id="openManagerPanel">🧑‍💼 Manage Managers</button>
+            <button class="btn" id="openTagPanel">🏷️ Manage Bag Tags</button>
 
           </div>
         </details>
@@ -629,18 +626,37 @@ dialog .toast{
       <h3>Bin Classifications</h3>
       <p class="muted">Configured medical waste streams / categories.</p>
 
+<div class="panel" style="margin:10px 0;">
+  <div class="filters" style="grid-template-columns: 1fr 1fr auto;">
+    <div>
+      <label>Bin Name</label>
+      <input id="newBinName" type="text" placeholder="e.g. Infectious Bin - Ward C">
+    </div>
+    <div>
+      <label>ESP32 MAC ID</label>
+      <input id="newBinMAC" type="text" placeholder="AA:BB:CC:DD:EE:FF">
+    </div>
+    <div style="display:flex;align-items:end;">
+      <button class="button btn-primary" id="btnAddBin" type="button">
+        ➕ Add
+      </button>
+    </div>
+  </div>
+  <p id="binAddMsg" class="muted" style="margin-top:.5rem;"></p>
+</div>
+
       <div class="table-wrap" style="max-height:55vh; overflow:auto">
         <table id="binClassesTable">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>ESP32 MAC ID</th>
-              <th>Temp (°C)</th>
-              <th>Humidity (%)</th>
-              <th>Lid Status</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
+<thead>
+  <tr>
+    <th>Name</th>
+    <th>ESP32 MAC ID</th>
+    <th>Temp (°C)</th>
+    <th>Humidity (%)</th>
+    <th>Lid</th>
+    <th>Action</th>
+  </tr>
+</thead>          <tbody></tbody>
         </table>
       </div>
 
@@ -735,6 +751,50 @@ dialog .toast{
     <button id="closeManagerModal">Close</button>
   </div>
 
+</dialog>
+<!-- BAG TAG MANAGEMENT MODAL -->
+<dialog id="tagModal">
+  <h3>Bag Tags</h3>
+  <p class="muted">Register and remove RFID bag tags.</p>
+
+  <!-- ADD TAG -->
+  <div class="panel" style="margin-bottom:12px;">
+    <div class="filters" style="grid-template-columns: 1fr 160px auto;">
+      <div>
+        <label>Tag UID</label>
+        <input id="tagUID" type="text" placeholder="e.g. ABC12345">
+      </div>
+      <div>
+        <label>Waste Stream ID</label>
+        <input id="tagStreamID" type="number" min="1">
+      </div>
+      <div style="display:flex;align-items:end;">
+        <button class="button btn-primary" id="btnAddTag" type="button">
+          ➕ Add
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAG TABLE -->
+  <div class="table-wrap" style="max-height:55vh; overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Tag UID</th>
+          <th>Waste Stream ID</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="tagTableBody"></tbody>
+    </table>
+  </div>
+
+  <p id="tagMsg" class="muted" style="margin-top:10px;"></p>
+
+  <div class="dialog-actions">
+    <button id="closeTagModal">Close</button>
+  </div>
 </dialog>
 <dialog id="managerUUIDModal">
   <h3>Manager UUIDs</h3>
@@ -915,18 +975,29 @@ loadHiddenEmployees();
     const $  = (sel, root=document) => root.querySelector(sel);
     const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
 
+    function escapeHTML(str){
+  return String(str)
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#039;");
+}
+
 function toast(msg, timeout = 2400){
 
-  // Always attach toast to Manager Modal if open
-const container = document.body;
+  const openDialog = document.querySelector("dialog[open]");
+  const container = openDialog || document.body;
 
-  let box = container.querySelector(".toast");
+  // Always reuse a single toast root
+  let box = document.querySelector(".toast-root");
 
   if (!box){
     box = document.createElement("div");
-    box.className = "toast";
-    container.appendChild(box);
+    box.className = "toast toast-root";
+    document.body.appendChild(box); // ALWAYS attach to body
   }
+
 
   const t = document.createElement("div");
   t.className = "t";
@@ -1159,15 +1230,15 @@ activity = `<span class="activity-badge ${activityClass}">${activity}</span>`;
 return `
   <tr>
     <td>${genFmt}</td>
-    <td><code>${uuid}</code></td>
-    <td>${employee}</td>
+    <td><code>${escapeHTML(uuid)}</code></td>
+    <td>${escapeHTML(employee)}</td>
     <td>${role}</td>
-    <td>${department}</td>
-    <td>${bin}</td>
+    <td>${escapeHTML(department)}</td>
+    <td>${escapeHTML(bin)}</td>
     <td>${activity}</td>
-<td class="expires-cell ${expFmt === "-" ? "empty" : ""}">
-  ${expFmt}
-</td>
+    <td class="expires-cell ${expFmt === "-" ? "empty" : ""}">
+      ${expFmt}
+    </td>
   </tr>`;
 
         }).join('');
@@ -1475,14 +1546,20 @@ tr.innerHTML = `
         if (r.door === "open")   doorCell = `<span class="pill pill-warn">open</span>`;
         if (r.door === "closed") doorCell = `<span class="pill pill-ok">closed</span>`;
 
-        return `
-          <tr>
-            <td>${r.name}</td>
-            <td>${r.mac || "—"}</td>
-            <td>${tempTxt}</td>
-            <td>${rhTxt}</td>
-            <td>${doorCell}</td>
-          </tr>`;
+return `
+  <tr>
+    <td>${r.name}</td>
+    <td>${r.mac || "—"}</td>
+    <td>${tempTxt}</td>
+    <td>${rhTxt}</td>
+    <td>${doorCell}</td>
+    <td>
+      <button class="button btn-secondary"
+        onclick="deleteBin('${r.mac}')">
+        🗑️ Delete
+      </button>
+    </td>
+  </tr>`;
       }).join('');
     }
 
@@ -1749,6 +1826,111 @@ es.addEventListener("counts", (evt) => {
     } catch {
       startLivePolling();
     }
+
+
+    /* ============================================================
+   ================== TAG PANEL LOGIC =========================
+   ============================================================ */
+
+const tagModal = document.getElementById("tagModal");
+const openTagPanel = document.getElementById("openTagPanel");
+const closeTagModal = document.getElementById("closeTagModal");
+const tagTableBody = document.getElementById("tagTableBody");
+const tagMsg = document.getElementById("tagMsg");
+
+openTagPanel?.addEventListener("click", ()=>{
+  tagModal.showModal();
+  loadTags();
+});
+
+closeTagModal?.addEventListener("click", ()=>{
+  tagModal.close();
+});
+
+async function loadTags(){
+  tagTableBody.innerHTML = "<tr><td colspan='3'>Loading...</td></tr>";
+
+  try{
+    const res = await fetch("/tags/list");
+    const data = await res.json();
+
+    if (!res.ok){
+      tagTableBody.innerHTML = "<tr><td colspan='3'>Failed to load</td></tr>";
+      return;
+    }
+
+    tagTableBody.innerHTML = (data.tags || []).map(t => `
+      <tr>
+        <td>${t.tag_uid}</td>
+        <td>${t.waste_stream_id}</td>
+        <td>
+          <button class="button btn-secondary"
+            onclick="deleteTag('${t.tag_uid}')">
+            🗑️ Delete
+          </button>
+        </td>
+      </tr>
+    `).join("");
+
+  } catch {
+    tagTableBody.innerHTML = "<tr><td colspan='3'>Network error</td></tr>";
+  }
+}
+
+document.getElementById("btnAddTag")?.addEventListener("click", async ()=>{
+const uid = document.getElementById("tagUID").value.trim().toUpperCase();
+  const streamID = parseInt(document.getElementById("tagStreamID").value, 10);
+
+  if (!uid || !streamID){
+    toast("Tag UID and Stream ID required");
+    return;
+  }
+
+  try{
+    const res = await fetch("/tags/register", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        tag_uid: uid,
+        waste_stream_id: streamID
+      })
+    });
+
+    if (!res.ok){
+      const txt = await res.text();
+      toast(txt || "Failed to add tag");
+      return;
+    }
+
+    toast("Tag added");
+    document.getElementById("tagUID").value="";
+    document.getElementById("tagStreamID").value="";
+    loadTags();
+
+  } catch {
+    toast("Network error");
+  }
+});
+
+window.deleteTag = async function(uid){
+  if (!confirm("Delete this tag?")) return;
+
+  try{
+    const res = await fetch("/tags/delete", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({tag_uid: uid})
+    });
+
+    if (!res.ok) throw new Error();
+
+    toast("Tag deleted");
+    loadTags();
+
+  } catch {
+    toast("Failed to delete tag");
+  }
+};
 /* ============================================================
    ================== MANAGER PANEL LOGIC =====================
    ============================================================ */
@@ -1884,15 +2066,24 @@ window.toggleManagerStatus = async function(id, active){
 window.deleteManager = async function(id){
   if (!confirm("Delete this manager?")) return;
 
-  await fetch("/managers/delete", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({manager_id: id})
-  });
+  try {
+    const res = await fetch("/managers/delete", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({manager_id: id})
+    });
 
-  toast("Manager deleted");
-  loadManagers();
+    if (!res.ok) throw new Error();
+
+    toast("Manager deleted");
+    loadManagers();
+
+  } catch {
+    toast("Failed to delete manager");
+  }
 };
+
+
 window.togglePin = function(id){
   const el = document.getElementById(`pin-${id}`);
   if (!el) return;
@@ -2076,7 +2267,7 @@ const res = await fetch(`/managers/${managerID}/uuids`);
     const data = await res.json();
 
     if (!res.ok){
-      uuidTable.innerHTML = "<tr><td colspan='5'>Failed to load</td></tr>";
+uuidTable.innerHTML = "<tr><td colspan='6'>Failed to load</td></tr>";
       return;
     }
 
@@ -2146,7 +2337,57 @@ window.revokeManagerUUID = async function(uuid){
   }
 };
 
+/* ================= BIN ADD + DELETE ================= */
 
+document.getElementById("btnAddBin")?.addEventListener("click", async ()=>{
+  const name = document.getElementById("newBinName").value.trim();
+  const mac  = document.getElementById("newBinMAC").value.trim();
+  const msg  = document.getElementById("binAddMsg");
+
+  if (!name || !mac){
+    msg.textContent = "Name and MAC required.";
+    return;
+  }
+
+  try{
+    const res = await fetch("/bins", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ name, mac })
+    });
+
+    if (!res.ok) throw new Error();
+
+    toast("Bin added");
+    document.getElementById("newBinName").value="";
+    document.getElementById("newBinMAC").value="";
+    loadBinClasses();
+
+  } catch{
+    msg.textContent = "Failed to add bin.";
+  }
+});
+
+window.deleteBin = async function(mac){
+
+  if (!confirm("Delete this bin?")) return;
+
+  try{
+    const res = await fetch("/bins/delete", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ mac })
+    });
+
+    if (!res.ok) throw new Error();
+
+    toast("Bin deleted");
+    loadBinClasses();
+
+  } catch{
+    toast("Failed to delete bin");
+  }
+};
 
     /* ESC closes all dialogs — FIXED */
     window.addEventListener("keydown", e=>{

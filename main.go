@@ -1662,24 +1662,53 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		_, err = db.Exec(`
-            INSERT INTO uuid_logs (
-                uuid_value,
-                emp_id,
-                bin_id,
-                is_used,
-                used_at,
-                action,
-                uuid_type
-            )
-            VALUES (?, ?, ?, 1, UTC_TIMESTAMP(), 'consume', 'SESSION')
-        `, req.UUID, empID, req.BinID)
+		tx, err := db.Begin()
+		if err != nil {
+			bad(w, 500, "tx failed")
+			return
+		}
+
+		// 1️⃣ Insert consume log
+		_, err = tx.Exec(`
+        INSERT INTO uuid_logs (
+            uuid_value,
+            emp_id,
+            bin_id,
+            is_used,
+            used_at,
+            action,
+            uuid_type
+        )
+        VALUES (?, ?, ?, 1, UTC_TIMESTAMP(), 'consume', 'SESSION')
+    `, req.UUID, empID, req.BinID)
 
 		if err != nil {
+			tx.Rollback()
 			bad(w, 500, "insert consume failed")
 			return
 		}
 
+		// 2️⃣ Close original session
+		_, err = tx.Exec(`
+        UPDATE uuid_logs
+        SET closed_at = UTC_TIMESTAMP()
+        WHERE uuid_value = ?
+          AND action = 'clock_in'
+          AND closed_at IS NULL
+    `, req.UUID)
+
+		if err != nil {
+			tx.Rollback()
+			bad(w, 500, "close session failed")
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			bad(w, 500, "commit failed")
+			return
+		}
+
+		broadcastActiveUUIDCount()
 		writeJSON(w, okResp{OK: true})
 		return
 	}
@@ -2627,7 +2656,7 @@ func handleUUIDClockOut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1️⃣ Ensure UUID exists and is aUPDATE uuid_log valid active clock-in
+	// 1️⃣ Ensure UUID exists and is a valid active clock-in
 	var uuidID int
 	err := db.QueryRow(`
 SELECT uuid_id
@@ -3252,6 +3281,306 @@ func handleManagerUUIDListAll(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ===== BAG TAG REGISTRATION =====
+
+type tagRegisterReq struct {
+	TagUID        string `json:"tag_uid"`
+	WasteStreamID int    `json:"waste_stream_id"`
+}
+
+func handleTagRegister(w http.ResponseWriter, r *http.Request) {
+
+	if allowCORS(w, r) {
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req tagRegisterReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Println("❌ JSON decode failed:", err)
+		bad(w, 400, "bad json")
+		return
+	}
+
+	req.TagUID = strings.TrimSpace(req.TagUID)
+
+	log.Printf("📥 TAG REGISTER REQUEST → UID=%s STREAM=%d\n",
+		req.TagUID, req.WasteStreamID)
+
+	if req.TagUID == "" || req.WasteStreamID <= 0 {
+		bad(w, 400, "tag_uid and waste_stream_id required")
+		return
+	}
+
+	// Ensure waste stream exists
+	var exists int
+	err := db.QueryRow(`
+        SELECT 1
+        FROM waste_streams
+        WHERE waste_stream_id = ?
+        LIMIT 1
+    `, req.WasteStreamID).Scan(&exists)
+
+	if err == sql.ErrNoRows {
+		bad(w, 400, "invalid waste_stream_id")
+		return
+	}
+	if err != nil {
+		log.Println("❌ DB error checking stream:", err)
+		bad(w, 500, "db error")
+		return
+	}
+
+	// Insert tag
+	_, err = db.Exec(`
+        INSERT INTO bag_tags (tag_uid, waste_stream_id)
+        VALUES (?, ?)
+    `, req.TagUID, req.WasteStreamID)
+
+	if err != nil {
+		log.Println("❌ INSERT FAILED:", err)
+		bad(w, 409, "tag already exists")
+		return
+	}
+
+	log.Println("✅ TAG REGISTERED SUCCESSFULLY")
+
+	writeJSON(w, map[string]any{
+		"ok":              true,
+		"tag_uid":         req.TagUID,
+		"waste_stream_id": req.WasteStreamID,
+	})
+}
+
+func handleTagList(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	rows, err := db.Query(`
+        SELECT t.tag_uid, ws.waste_stream_id, ws.code
+        FROM bag_tags t
+        JOIN waste_streams ws
+          ON ws.waste_stream_id = t.waste_stream_id
+        ORDER BY ws.code, t.tag_uid
+    `)
+	if err != nil {
+		bad(w, 500, "db error")
+		return
+	}
+	defer rows.Close()
+
+	type row struct {
+		TagUID        string `json:"tag_uid"`
+		WasteStreamID int    `json:"waste_stream_id"`
+		StreamCode    string `json:"stream_code"`
+	}
+
+	var out []row
+
+	for rows.Next() {
+		var rr row
+		if err := rows.Scan(&rr.TagUID, &rr.WasteStreamID, &rr.StreamCode); err != nil {
+			bad(w, 500, "scan")
+			return
+		}
+		out = append(out, rr)
+	}
+
+	if out == nil {
+		out = []row{}
+	}
+
+	writeJSON(w, map[string]any{
+		"tags": out,
+	})
+}
+
+type tagDeleteReq struct {
+	TagUID string `json:"tag_uid"`
+}
+
+func handleTagDelete(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req tagDeleteReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	req.TagUID = strings.TrimSpace(req.TagUID)
+
+	if req.TagUID == "" {
+		bad(w, 400, "tag_uid required")
+		return
+	}
+
+	res, err := db.Exec(`
+        DELETE FROM bag_tags
+        WHERE tag_uid = ?
+    `, req.TagUID)
+
+	if err != nil {
+		bad(w, 500, "db error")
+		return
+	}
+
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		bad(w, 404, "tag not found")
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// ===== BIN SNAPSHOT (FOR OUTDOOR) =====
+
+func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		bad(w, 405, "GET only")
+		return
+	}
+
+	// Expect: /bin/{id}/snapshot
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "bin" || parts[2] != "snapshot" {
+		bad(w, 404, "invalid path")
+		return
+	}
+
+	binID, err := strconv.Atoi(parts[1])
+	if err != nil || binID <= 0 {
+		bad(w, 400, "invalid bin id")
+		return
+	}
+
+	// 1️⃣ Get bin's waste stream
+	var streamID int
+	var streamCode string
+
+	err = db.QueryRow(`
+        SELECT ws.waste_stream_id, ws.code
+        FROM bins b
+        JOIN waste_streams ws
+          ON ws.waste_stream_id = b.waste_stream_id
+        WHERE b.bin_id = ?
+    `, binID).Scan(&streamID, &streamCode)
+
+	if err != nil {
+		bad(w, 404, "bin not found")
+		return
+	}
+
+	// 2️⃣ Get allowed tag UIDs
+	tagRows, err := db.Query(`
+        SELECT tag_uid
+        FROM bag_tags
+        WHERE waste_stream_id = ?
+    `, streamID)
+
+	if err != nil {
+		bad(w, 500, "db error")
+		return
+	}
+	defer tagRows.Close()
+
+	var tags []string
+	for tagRows.Next() {
+		var uid string
+		tagRows.Scan(&uid)
+		tags = append(tags, uid)
+	}
+
+	// 3️⃣ Get active sessions
+	sessionRows, err := db.Query(`
+SELECT uuid_value, expires_at
+FROM uuid_logs
+WHERE action = 'clock_in'
+  AND closed_at IS NULL
+  AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
+    `)
+
+	if err != nil {
+		bad(w, 500, "db error")
+		return
+	}
+	defer sessionRows.Close()
+
+	type sessionRow struct {
+		UUID      string     `json:"uuid"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+
+	var sessions []sessionRow
+
+	for sessionRows.Next() {
+		var sr sessionRow
+		if err := sessionRows.Scan(&sr.UUID, &sr.ExpiresAt); err != nil {
+			continue
+		}
+		sessions = append(sessions, sr)
+	}
+
+	if sessions == nil {
+		sessions = []sessionRow{}
+	}
+	// 4️⃣ Get active manager UUIDs
+	managerRows, err := db.Query(`
+SELECT mu.uuid_value, mu.expires_at
+FROM manager_uuids mu
+JOIN managers m ON m.manager_id = mu.manager_id
+WHERE mu.is_revoked = 0
+  AND m.is_active = 1
+  AND (mu.expires_at IS NULL OR UTC_TIMESTAMP() < mu.expires_at)
+`)
+	if err != nil {
+		bad(w, 500, "db error")
+		return
+	}
+	defer managerRows.Close()
+
+	type managerRow struct {
+		UUID      string     `json:"uuid"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+
+	var managers []managerRow
+
+	for managerRows.Next() {
+		var mr managerRow
+		if err := managerRows.Scan(&mr.UUID, &mr.ExpiresAt); err != nil {
+			continue
+		}
+		managers = append(managers, mr)
+	}
+
+	if managers == nil {
+		managers = []managerRow{}
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	writeJSON(w, map[string]any{
+		"waste_stream_code": streamCode,
+		"allowed_tags":      tags,
+		"active_sessions":   sessions,
+		"manager_uuids":     managers,
+	})
+}
+
 // ========== MAIN ==========
 func main() {
 	var err error
@@ -3331,6 +3660,10 @@ func main() {
 	// bin module
 	http.HandleFunc("/bin/consume", handleBinConsume)
 	http.HandleFunc("/bin/telemetry", handleBinTelemetry)
+	http.HandleFunc("/bin/", handleBinSnapshot)
+	http.HandleFunc("/tags/register", handleTagRegister)
+	http.HandleFunc("/tags/list", handleTagList)
+	http.HandleFunc("/tags/delete", handleTagDelete)
 
 	// health check for ESP32
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
