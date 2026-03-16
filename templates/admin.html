@@ -492,10 +492,11 @@ dialog{
               <th>Bin</th>
               <th>Location</th>
               <th>Stream</th>
-              <th>Temp (°C)</th>
-              <th>Humidity (%)</th>
-              <th>Lid</th>
-              <th>Last Seen (Local)</th>
+<th>Temp (°C)</th>
+<th>Humidity (%)</th>
+<th>Fill (%)</th>
+<th>Lid</th>
+<th>Last Seen (Local)</th>
             </tr>
           </thead>
 
@@ -953,23 +954,10 @@ loadHiddenEmployees();
 
 
     /* ==== Timestamp Formatter (Local Jamaica Time) ==== */
-    function formatLocal(ts) {
-      if (!ts) return "";
-      const d = new Date(ts);
-
-      let hours = d.getHours();
-      const minutes = String(d.getMinutes()).padStart(2, "0");
-      const ampm = hours >= 12 ? "PM" : "AM";
-
-      hours = hours % 12;
-      if (hours === 0) hours = 12;
-
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      const yyyy = d.getFullYear();
-
-      return `${hours}:${minutes} ${ampm} ${mm}/${dd}/${yyyy}`;
-    }
+function formatLocal(ts) {
+  if (!ts || ts === "0000-00-00 00:00:00") return "—";
+  return ts;  
+}
 
     /* ===== DOM Helpers ===== */
     const $  = (sel, root=document) => root.querySelector(sel);
@@ -1167,86 +1155,68 @@ label: "Expired Sessions",
       return rows;
     }
 
-    async function refreshRecent(){
-      try {
-        const qs = formQS();
-        const url = "/admin/export.csv" + (qs? "?"+qs : "");
-        const resp = await fetch(url, {cache:"no-store"});
-        const csv = await resp.text();
-const rows = parseCSV(csv);
-
-if (!rows || rows.length <= 1) return;
-
-// 🔥 THIS MUST EXIST
-const header = rows[0].map(h => h.trim().toLowerCase());
-const idx = Object.fromEntries(
-  header.map((h,i)=>[h,i])
-);
-
-const bodyRows = rows.slice(1).filter(r => r.length >= header.length);
 
 
-        recentTbody.innerHTML = bodyRows.map(r=>{
-      
-const uuid       = r[idx.uuid] || "";
-const employee   = r[idx.name] || "";
-const department = r[idx.department] || "";
-const bin        = r[idx.bin] || "";
-const genRaw     = r[idx.event_time] || "";
-const expRaw     = r[idx.expires_at] || "";
-const roleRaw    = r[idx.role] || "";
-const activityRaw= r[idx.activity] || "";
+
+async function refreshRecent(){
+  try {
+    const qs = formQS();
+    const url = "/admin/recent.json" + (qs ? "?" + qs : "");
+
+    const resp = await fetch(url, {cache:"no-store"});
+    const data = await resp.json();
+
+    const list = data.recent || [];
+
+    recentTbody.innerHTML = list.map(r => {
+
+      const roleClass =
+        r.role.includes("MGR") ? "role-mgr" : "role-emp";
+
+      const activityMap = {
+        "shift started": "activity-clockin",
+        "waste disposed": "activity-consume",
+        "shift ended": "activity-clockout",
+        "manager override": "activity-override"
+      };
+
+      let activityClass = "";
+      for (const key in activityMap){
+        if (r.activity.toLowerCase().includes(key)){
+          activityClass = activityMap[key];
+        }
+      }
+
+      return `
+        <tr>
+<td>${escapeHTML(r.event_time)}</td>
+          <td><code>${escapeHTML(r.uuid)}</code></td>
+          <td>${escapeHTML(r.name)}</td>
+          <td><span class="${roleClass}">${r.role}</span></td>
+          <td>${escapeHTML(r.department)}</td>
+          <td>${escapeHTML(r.bin)}</td>
+          <td>
+            <span class="activity-badge ${activityClass}">
+              ${escapeHTML(r.activity)}
 
 
-const genFmt = genRaw ? formatLocal(genRaw) : "";
-const expFmt = expRaw ? formatLocal(expRaw) : "-";
+            </span>
+          </td>
+          <td>
+            ${r.expires_at ? formatLocal(r.expires_at) : "—"}
+          </td>
+        </tr>
+      `;
+    }).join("");
 
-let role = r[idx.role] || "";
+    recentCount.textContent = list.length;
 
-if (role.includes("EMP")) {
-  role = `<span class="role-emp">${role}</span>`;
+  } catch (e){
+    console.error("recent refresh failed", e);
+  }
 }
-if (role.includes("MGR")) {
-  role = `<span class="role-mgr">${role}</span>`;
-}
-let activity = r[idx.activity] || "";
 
-let activityClass = "";
 
-if (activity.toLowerCase().includes("shift started"))
-  activityClass = "activity-clockin";
-
-if (activity.toLowerCase().includes("waste disposed"))
-  activityClass = "activity-consume";
-
-if (activity.toLowerCase().includes("manager"))
-  activityClass = "activity-override";
-
-if (activity.toLowerCase().includes("shift ended"))
-  activityClass = "activity-clockout";
-
-activity = `<span class="activity-badge ${activityClass}">${activity}</span>`;
-
-return `
-  <tr>
-    <td>${genFmt}</td>
-    <td><code>${escapeHTML(uuid)}</code></td>
-    <td>${escapeHTML(employee)}</td>
-    <td>${role}</td>
-    <td>${escapeHTML(department)}</td>
-    <td>${escapeHTML(bin)}</td>
-    <td>${activity}</td>
-    <td class="expires-cell ${expFmt === "-" ? "empty" : ""}">
-      ${expFmt}
-    </td>
-  </tr>`;
-
-        }).join('');
-
-        if (recentCount) recentCount.textContent = bodyRows.length;
-
-      } catch(e){ console.warn("recent refresh failed", e); }
-    }
 
     /* Initial load + intervals */
     refreshRecent();
@@ -1554,10 +1524,10 @@ return `
     <td>${rhTxt}</td>
     <td>${doorCell}</td>
     <td>
-      <button class="button btn-secondary"
-        onclick="deleteBin('${r.mac}')">
-        🗑️ Delete
-      </button>
+<button class="button btn-secondary"
+  data-mac="${r.mac}">
+  🗑️ Delete
+</button>
     </td>
   </tr>`;
       }).join('');
@@ -1707,8 +1677,9 @@ return `
           <td>${r.bin_name || ("Bin " + r.bin_id)}</td>
           <td>${r.location || ""}</td>
           <td>${r.stream_code || ""}</td>
-          <td>${fmtNum(r.temp_c)}</td>
-          <td>${fmtNum(r.humidity_pct)}</td>
+<td>${fmtNum(r.temp_c)}</td>
+<td>${fmtNum(r.humidity_pct)}</td>
+<td>${r.fill_pct != null ? r.fill_pct.toFixed(0) + "%" : "—"}</td>
 
           <!-- 🔥 Door Status Pills -->
           <td>
@@ -1743,16 +1714,17 @@ return `
         liveTsEl.textContent = "seeded at " + tsFmt;
 
         (j.bins||[]).forEach(b=>{
-          liveState.set(b.bin_id, {
-            bin_id: b.bin_id,
-            bin_name: b.bin_name,
-            location: b.location,
-            stream_code: b.stream_code,
-            temp_c: b.temp_c ?? null,
-            humidity_pct: b.humidity_pct ?? null,
-            door_status: b.door_status || "",
-            last_seen: b.last_seen || ""
-          });
+liveState.set(b.bin_id, {
+  bin_id: b.bin_id,
+  bin_name: b.bin_name,
+  location: b.location,
+  stream_code: b.stream_code,
+  temp_c: b.temp_c ?? null,
+  humidity_pct: b.humidity_pct ?? null,
+  fill_pct: b.fill_pct ?? null,
+  door_status: b.door_status || "",
+  last_seen: b.last_seen || ""
+});
         });
 
         renderLive();
@@ -1768,6 +1740,7 @@ return `
       const r = liveState.get(msg.bin_id) || {bin_id: msg.bin_id, bin_name: "Bin "+msg.bin_id};
       if (msg.temp_c      !== undefined) r.temp_c = msg.temp_c;
       if (msg.humidity_pct!== undefined) r.humidity_pct = msg.humidity_pct;
+      if (msg.fill_pct !== undefined) r.fill_pct = msg.fill_pct;
       if (msg.door_status)              r.door_status = msg.door_status;
       if (msg.last_seen)                r.last_seen   = msg.last_seen;
 
@@ -1851,7 +1824,7 @@ async function loadTags(){
   tagTableBody.innerHTML = "<tr><td colspan='3'>Loading...</td></tr>";
 
   try{
-    const res = await fetch("/tags/list");
+    const res = await fetch("/admin/bag-tags.json");
     const data = await res.json();
 
     if (!res.ok){
@@ -1887,8 +1860,8 @@ const uid = document.getElementById("tagUID").value.trim().toUpperCase();
   }
 
   try{
-    const res = await fetch("/tags/register", {
-      method:"POST",
+const res = await fetch("/admin/bag-tags", {
+        method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({
         tag_uid: uid,
@@ -1916,8 +1889,8 @@ window.deleteTag = async function(uid){
   if (!confirm("Delete this tag?")) return;
 
   try{
-    const res = await fetch("/tags/delete", {
-      method:"POST",
+const res = await fetch("/admin/bag-tags/delete", {
+        method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({tag_uid: uid})
     });
@@ -2399,6 +2372,5 @@ window.deleteBin = async function(mac){
   })();
   </script>
 
-  <script src="/static/live.js"></script>
     </body>
 </html> 
