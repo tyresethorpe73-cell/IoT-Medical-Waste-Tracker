@@ -356,6 +356,43 @@ dialog{
       box-shadow: var(--shadow);
       transition: opacity .25s ease, transform .25s ease;
     }
+    /* ===== BIN FILL GAUGE ===== */
+
+.fill-wrap{
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+
+.fill-gauge{
+  width:120px;
+  height:10px;
+  background: rgba(0,0,0,0.35);
+  border-radius:4px;
+  overflow:hidden;
+  border:1px solid rgba(255,255,255,0.1);
+}
+
+.fill-bar{
+  height:100%;
+  width:0%;
+  transition:width .35s ease;
+}
+
+/* NORMAL <65% */
+.fill-normal{
+  background: linear-gradient(90deg,#00e08e,#00c97f);
+}
+
+/* WARNING 65-85% */
+.fill-warn{
+  background: linear-gradient(90deg,#00e08e,#ff6b3d);
+}
+
+/* DANGER >85% */
+.fill-danger{
+  background: linear-gradient(90deg,#ff6b3d,#ff3b5c);
+}
   </style>
 </head>
 
@@ -1679,8 +1716,30 @@ return `
           <td>${r.stream_code || ""}</td>
 <td>${fmtNum(r.temp_c)}</td>
 <td>${fmtNum(r.humidity_pct)}</td>
-<td>${r.fill_pct != null ? r.fill_pct.toFixed(0) + "%" : "—"}</td>
+<td>
+${
+(function(){
 
+  const v = r.fill_pct;
+
+  if (v === null || v === undefined) return "—";
+
+  let cls = "fill-normal";
+  if (v >= 85) cls = "fill-danger";
+  else if (v >= 65) cls = "fill-warn";
+
+  return `
+    <div class="fill-wrap">
+      <div class="fill-gauge">
+        <div class="fill-bar ${cls}" style="width:${v}%"></div>
+      </div>
+      <span style="font-size:12px;">${v.toFixed(0)}%</span>
+    </div>
+  `;
+
+})()
+}
+</td>
           <!-- 🔥 Door Status Pills -->
           <td>
             ${
