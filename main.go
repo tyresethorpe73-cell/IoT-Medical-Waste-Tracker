@@ -41,13 +41,13 @@ func jamTodayMidnight() time.Time {
 
 // ========== LIVE (in-memory only; NOT persisted) ==========
 type liveReading struct {
-	BinID      int       `json:"bin_id"`
-	Temp       *float64  `json:"temp_c"`
-	Humidity   *float64  `json:"humidity_pct"`
-	FillLevel  *float64  `json:"fill_pct"`   
-	DoorOpen   *int      `json:"door_open"`
-	LastSeen   time.Time `json:"-"`
-	LastSeenS  string    `json:"last_seen"`
+	BinID     int       `json:"bin_id"`
+	Temp      *float64  `json:"temp_c"`
+	Humidity  *float64  `json:"humidity_pct"`
+	FillLevel *float64  `json:"fill_pct"`
+	DoorOpen  *int      `json:"door_open"`
+	LastSeen  time.Time `json:"-"`
+	LastSeenS string    `json:"last_seen"`
 }
 
 var (
@@ -184,26 +184,26 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 	// initial snapshot
 	go func() {
 		liveMu.RLock()
-type snapRow struct {
-	BinID      int      `json:"bin_id"`
-	Temp       *float64 `json:"temp_c"`
-	Humidity   *float64 `json:"humidity_pct"`
-	FillLevel  *float64 `json:"fill_pct"`   // <<< ADD
-	DoorOpen   *int     `json:"door_open"`
-	DoorStatus string   `json:"door_status"`
-	LastSeen   string   `json:"last_seen"`
-}
+		type snapRow struct {
+			BinID      int      `json:"bin_id"`
+			Temp       *float64 `json:"temp_c"`
+			Humidity   *float64 `json:"humidity_pct"`
+			FillLevel  *float64 `json:"fill_pct"` // <<< ADD
+			DoorOpen   *int     `json:"door_open"`
+			DoorStatus string   `json:"door_status"`
+			LastSeen   string   `json:"last_seen"`
+		}
 		var all []snapRow
 		for _, lr := range liveByBin {
-all = append(all, snapRow{
-	BinID:      lr.BinID,
-	Temp:       lr.Temp,
-	Humidity:   lr.Humidity,
-	FillLevel:  lr.FillLevel,   // <<< ADD
-	DoorOpen:   lr.DoorOpen,
-	DoorStatus: doorText(lr.DoorOpen),
-	LastSeen:   lr.LastSeenS,
-})
+			all = append(all, snapRow{
+				BinID:      lr.BinID,
+				Temp:       lr.Temp,
+				Humidity:   lr.Humidity,
+				FillLevel:  lr.FillLevel, // <<< ADD
+				DoorOpen:   lr.DoorOpen,
+				DoorStatus: doorText(lr.DoorOpen),
+				LastSeen:   lr.LastSeenS,
+			})
 		}
 		liveMu.RUnlock()
 
@@ -772,6 +772,17 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 🔥 FORCE CLOSE ANY EXPIRED SESSIONS FIRST
+	_, _ = db.Exec(`
+	UPDATE uuid_logs
+	SET closed_at = UTC_TIMESTAMP()
+	WHERE emp_id = ?
+	  AND action = 'clock_in'
+	  AND closed_at IS NULL
+	  AND expires_at IS NOT NULL
+	  AND expires_at < UTC_TIMESTAMP()
+`, empID)
+
 	// 🔒 Prevent multiple active sessions
 	var existingUUID string
 	var existingExpiry sql.NullTime
@@ -806,7 +817,7 @@ AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
 	}
 
 	sessionUUID := uuid.New().String()
-	expires := utcNow().Add(8 * time.Hour)
+	expires := utcNow().Add(8 * time.Hour).Format("2006-01-02 15:04:05")
 	_, err = db.Exec(`
 INSERT INTO uuid_logs (
     uuid_value,
@@ -822,10 +833,15 @@ VALUES (?, ?, NULL, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
 `, sessionUUID, empID, expires)
 
 	if err != nil {
+
+		if strings.Contains(err.Error(), "one_open_session") {
+			http.Error(w, "already clocked in", http.StatusConflict)
+			return
+		}
+
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
-
 	broadcastActiveUUIDCount()
 
 	_, err = db.Exec(`
@@ -1604,7 +1620,7 @@ type TelemetryReq struct {
 	BinID     int      `json:"bin_id"`
 	Temp      *float64 `json:"temp"`
 	Humidity  *float64 `json:"humidity"`
-	FillLevel *float64 `json:"fill_pct"`  
+	FillLevel *float64 `json:"fill_pct"`
 	DoorOpen  *int     `json:"door_open"`
 }
 
@@ -1634,32 +1650,32 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 
 	nowUTC := utcNow()
 
-lr := liveReading{
-	BinID:      req.BinID,
-	Temp:       req.Temp,
-	Humidity:   req.Humidity,
-	FillLevel:  req.FillLevel,  
-	DoorOpen:   req.DoorOpen,
-	LastSeen:   nowUTC,
-	LastSeenS:  formatLocal(nowUTC),
-}
+	lr := liveReading{
+		BinID:     req.BinID,
+		Temp:      req.Temp,
+		Humidity:  req.Humidity,
+		FillLevel: req.FillLevel,
+		DoorOpen:  req.DoorOpen,
+		LastSeen:  nowUTC,
+		LastSeenS: formatLocal(nowUTC),
+	}
 
 	liveMu.Lock()
 	liveByBin[req.BinID] = lr
 	liveMu.Unlock()
 
-sseBroadcast(sseMsg{
-	Type: "telemetry",
-	Data: map[string]any{
-		"bin_id":       lr.BinID,
-		"temp_c":       lr.Temp,
-		"humidity_pct": lr.Humidity,
-		"fill_pct":     lr.FillLevel,  
-		"door_open":    lr.DoorOpen,
-		"door_status":  doorText(lr.DoorOpen),
-		"last_seen":    lr.LastSeenS,
-	},
-})
+	sseBroadcast(sseMsg{
+		Type: "telemetry",
+		Data: map[string]any{
+			"bin_id":       lr.BinID,
+			"temp_c":       lr.Temp,
+			"humidity_pct": lr.Humidity,
+			"fill_pct":     lr.FillLevel,
+			"door_open":    lr.DoorOpen,
+			"door_status":  doorText(lr.DoorOpen),
+			"last_seen":    lr.LastSeenS,
+		},
+	})
 
 	if req.Temp != nil || req.Humidity != nil {
 		_, err := db.Exec(`
@@ -1703,19 +1719,19 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-type outRow struct {
-	BinID           int      `json:"bin_id"`
-	BinName         string   `json:"bin_name"`
-	Location        string   `json:"location"`
-	StreamCode      string   `json:"stream_code"`
-	Temp            *float64 `json:"temp_c"`
-	Humidity        *float64 `json:"humidity_pct"`
-	FillLevel       *float64 `json:"fill_pct"`  
-	DoorOpen        *int     `json:"door_open"`
-	DoorStatus      string   `json:"door_status"`
-	DoorStatusCamel string   `json:"doorStatus"`
-	LastSeenUTC     string   `json:"last_seen"`
-}
+	type outRow struct {
+		BinID           int      `json:"bin_id"`
+		BinName         string   `json:"bin_name"`
+		Location        string   `json:"location"`
+		StreamCode      string   `json:"stream_code"`
+		Temp            *float64 `json:"temp_c"`
+		Humidity        *float64 `json:"humidity_pct"`
+		FillLevel       *float64 `json:"fill_pct"`
+		DoorOpen        *int     `json:"door_open"`
+		DoorStatus      string   `json:"door_status"`
+		DoorStatusCamel string   `json:"doorStatus"`
+		LastSeenUTC     string   `json:"last_seen"`
+	}
 	liveMu.RLock()
 	defer liveMu.RUnlock()
 
@@ -1733,15 +1749,15 @@ type outRow struct {
 			Location:   loc,
 			StreamCode: code,
 		}
-if lr, ok := liveByBin[id]; ok {
-	row.Temp = lr.Temp
-	row.Humidity = lr.Humidity
-	row.FillLevel = lr.FillLevel   // <<< ADD THIS
-	row.DoorOpen = lr.DoorOpen
-	row.DoorStatus = doorText(lr.DoorOpen)
-	row.DoorStatusCamel = row.DoorStatus
-	row.LastSeenUTC = lr.LastSeenS
-}
+		if lr, ok := liveByBin[id]; ok {
+			row.Temp = lr.Temp
+			row.Humidity = lr.Humidity
+			row.FillLevel = lr.FillLevel // <<< ADD THIS
+			row.DoorOpen = lr.DoorOpen
+			row.DoorStatus = doorText(lr.DoorOpen)
+			row.DoorStatusCamel = row.DoorStatus
+			row.LastSeenUTC = lr.LastSeenS
+		}
 
 		out = append(out, row)
 	}
@@ -2530,10 +2546,12 @@ WHERE action IN ('consume','override')
 func markNewlyExpired() {
 	_, _ = db.Exec(`
 		UPDATE uuid_logs
-		SET expired_at = UTC_TIMESTAMP()
-WHERE action = 'clock_in'
-  AND closed_at IS NULL
-  AND expires_at IS NOT NULL
+		SET 
+			expired_at = UTC_TIMESTAMP(),
+			closed_at = UTC_TIMESTAMP()   
+		WHERE action = 'clock_in'
+		  AND closed_at IS NULL
+		  AND expires_at IS NOT NULL
 		  AND expires_at < UTC_TIMESTAMP()
 		  AND expired_at IS NULL
 	`)
@@ -2553,8 +2571,8 @@ func startUUIDDailyRollupJob() {
 			_ = updateStatsForDay(today.AddDate(0, 0, -i))
 		}
 
-		// then keep updating
-		ticker := time.NewTicker(60 * time.Second)
+		// background scheduler
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -3027,91 +3045,59 @@ WHERE mu.uuid_value = ?
 
 func handleManagerUUIDList(w http.ResponseWriter, r *http.Request) {
 
-	if r.Method != http.MethodGet {
-		bad(w, 405, "GET only")
+	w.Header().Set("Content-Type", "application/json")
+
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 4 {
+		http.Error(w, "Invalid path", 400)
 		return
 	}
 
-	// Expecting path: /managers/{id}/uuids
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 3 || parts[0] != "managers" || parts[2] != "uuids" {
-		bad(w, 404, "invalid path")
-		return
-	}
-
-	managerID, err := strconv.Atoi(parts[1])
-	if err != nil || managerID <= 0 {
-		bad(w, 400, "invalid manager id")
+	managerID, err := strconv.Atoi(parts[2])
+	if err != nil {
+		http.Error(w, "Invalid manager ID", 400)
 		return
 	}
 
 	rows, err := db.Query(`
-SELECT 
-    uuid_value,
-    is_revoked,
-    created_at,
-    revoked_at,
-    expires_at
-FROM manager_uuidsWHERE manager_id = ?
-ORDER BY created_at DESC
+        SELECT uuid_value, created_at, expires_at, revoked_at, is_revoked
+        FROM manager_uuids
+        WHERE manager_id = ?
+        ORDER BY created_at DESC
     `, managerID)
 
 	if err != nil {
-		bad(w, 500, "db")
+		log.Println("DB ERROR:", err)
+
+		// 🔥 FIX: RETURN JSON, NOT TEXT
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": "database error",
+		})
 		return
 	}
 	defer rows.Close()
 
-	type row struct {
-		UUIDValue string `json:"uuid_value"`
-		IsRevoked int    `json:"is_revoked"`
-		CreatedAt string `json:"created_at"`
-		RevokedAt string `json:"revoked_at"`
-		ExpiresAt string `json:"expires_at"`
-	}
-
-	var out []row
+	var uuids []map[string]interface{}
 
 	for rows.Next() {
+		var uuid string
+		var created, expires, revoked sql.NullTime
+		var isRevoked int
 
-		var (
-			uuidVal   string
-			revoked   int
-			created   time.Time
-			revokedAt *time.Time
-			expiresAt *time.Time
-		)
+		rows.Scan(&uuid, &created, &expires, &revoked, &isRevoked)
 
-		if err := rows.Scan(
-			&uuidVal,
-			&revoked,
-			&created,
-			&revokedAt,
-			&expiresAt,
-		); err != nil {
-			bad(w, 500, "scan")
-			return
-		}
-
-		r := row{
-			UUIDValue: uuidVal,
-			IsRevoked: revoked,
-			CreatedAt: formatLocal(created),
-		}
-
-		if revokedAt != nil {
-			r.RevokedAt = formatLocal(*revokedAt)
-		}
-
-		if expiresAt != nil {
-			r.ExpiresAt = formatLocal(*expiresAt)
-		}
-
-		out = append(out, r)
+		uuids = append(uuids, map[string]interface{}{
+			"uuid_value": uuid,
+			"created_at": created.Time,
+			"expires_at": expires.Time,
+			"revoked_at": revoked.Time,
+			"is_revoked": isRevoked,
+		})
 	}
 
-	writeJSON(w, map[string]any{
-		"uuids": out,
+	// ✅ FINAL RESPONSE
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"uuids": uuids,
 	})
 }
 func handleEmployeeUnhide(w http.ResponseWriter, r *http.Request) {
@@ -3278,6 +3264,112 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
+	if allowCORS(w, r) {
+		return
+	}
+
+	// /bin/{id}/snapshot
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "bin" || parts[2] != "snapshot" {
+		bad(w, 404, "invalid path")
+		return
+	}
+
+	binID, err := strconv.Atoi(parts[1])
+	if err != nil {
+		bad(w, 400, "invalid bin id")
+		return
+	}
+
+	// 1️⃣ Get stream
+	var streamID int
+	err = db.QueryRow(`
+		SELECT waste_stream_id
+		FROM bins
+		WHERE bin_id = ?
+	`, binID).Scan(&streamID)
+
+	if err != nil {
+		bad(w, 500, "bin lookup failed")
+		return
+	}
+
+	// 2️⃣ Get allowed tags
+	rows, err := db.Query(`
+		SELECT tag_uid
+		FROM bag_tags
+		WHERE waste_stream_id = ?
+	`, streamID)
+
+	if err != nil {
+		bad(w, 500, "tag query failed")
+		return
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err == nil {
+			tags = append(tags, strings.ToUpper(strings.TrimSpace(t)))
+		}
+	}
+
+	// 3️⃣ Active sessions
+	sRows, _ := db.Query(`
+		SELECT uuid_value
+		FROM uuid_logs
+		WHERE action = 'clock_in'
+		  AND closed_at IS NULL
+		  AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
+	`)
+	defer sRows.Close()
+
+	var sessions []string
+	for sRows.Next() {
+		var u string
+		if err := sRows.Scan(&u); err == nil {
+			sessions = append(sessions, strings.ToUpper(u))
+		}
+	}
+
+	// 4️⃣ Manager UUIDs
+	mRows, _ := db.Query(`
+		SELECT uuid_value
+		FROM manager_uuids
+		WHERE is_revoked = 0
+		  AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
+	`)
+	defer mRows.Close()
+
+	var managers []string
+	for mRows.Next() {
+		var u string
+		if err := mRows.Scan(&u); err == nil {
+			managers = append(managers, strings.ToUpper(u))
+		}
+	}
+
+	if sessions == nil {
+		sessions = []string{}
+	}
+
+	if tags == nil {
+		tags = []string{}
+	}
+
+	if managers == nil {
+		managers = []string{}
+	}
+
+	writeJSON(w, map[string]any{
+		"allowed_tags":    tags,
+		"active_sessions": sessions,
+		"manager_uuids":   managers,
+	})
+}
+
 // ========== MAIN ==========
 func main() {
 	var err error
@@ -3357,6 +3449,7 @@ func main() {
 	// --- Bin Module ---
 	http.HandleFunc("/bin/consume", handleBinConsume)
 	http.HandleFunc("/bin/telemetry", handleBinTelemetry)
+	http.HandleFunc("/bin/", handleBinSnapshot)
 
 	// --- System ---
 	http.HandleFunc("/health", handleHealth)

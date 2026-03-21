@@ -2290,33 +2290,55 @@ document.getElementById("closeManagerUUIDModal")
   ?.addEventListener("click", ()=> uuidModal.close());
 
 window.openManagerUUIDs = async function(managerID){
-  uuidTable.setAttribute("data-manager", managerID);
 
-uuidTable.innerHTML = "<tr><td colspan='6'>Loading...</td></tr>";
+  console.log("Clicked manager:", managerID); // 🔥 DEBUG
+
+  uuidTable.setAttribute("data-manager", managerID);
+  uuidTable.innerHTML = "<tr><td colspan='6'>Loading...</td></tr>";
 
   try{
-const res = await fetch(`/managers/${managerID}/uuids`);
-    const data = await res.json();
+    const res = await fetch(`/managers/${managerID}/uuids`);
 
+    console.log("Status:", res.status); // 🔥 DEBUG
+
+    const text = await res.text();
+    console.log("Response:", text); // 🔥 DEBUG
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error("Invalid JSON");
+    }
+
+    // ❌ If backend failed
     if (!res.ok){
-uuidTable.innerHTML = "<tr><td colspan='6'>Failed to load</td></tr>";
+      uuidTable.innerHTML = `<tr><td colspan='6'>Error: ${text}</td></tr>`;
+      uuidModal.showModal();   // 🔥 FORCE OPEN
       return;
     }
 
-    uuidTable.innerHTML = (data.uuids || []).map(u=>{
+    // ❌ No UUIDs case (VERY COMMON)
+    if (!data.uuids || data.uuids.length === 0){
+      uuidTable.innerHTML = "<tr><td colspan='6'>No UUIDs found</td></tr>";
+      uuidModal.showModal();   // 🔥 FORCE OPEN
+      return;
+    }
 
-let status;
+    // ✅ Normal case
+    uuidTable.innerHTML = data.uuids.map(u=>{
 
-if (u.is_revoked === 1) {
-  status = `<span class="pill pill-revoked">revoked</span>`;
-}
-else if (u.expires_at && new Date(u.expires_at) < new Date()) {
-  status = `<span class="pill pill-expired">expired</span>`;
-}
-else {
-  status = `<span class="pill pill-active">active</span>`;
-}
+      let status;
 
+      if (u.is_revoked === 1) {
+        status = `<span class="pill pill-revoked">revoked</span>`;
+      }
+      else if (u.expires_at && new Date(u.expires_at) < new Date()) {
+        status = `<span class="pill pill-expired">expired</span>`;
+      }
+      else {
+        status = `<span class="pill pill-active">active</span>`;
+      }
 
       const revokeBtn = u.is_revoked === 0
         ? `<button class="button btn-secondary"
@@ -2325,22 +2347,25 @@ else {
            </button>`
         : "—";
 
-return `
-  <tr>
-    <td><code>${u.uuid_value}</code></td>
-    <td>${status}</td>
-    <td>${formatLocal(u.created_at)}</td>
-    <td>${u.expires_at ? formatLocal(u.expires_at) : "—"}</td>   <!-- NEW -->
-    <td>${u.revoked_at ? formatLocal(u.revoked_at) : "—"}</td>
-    <td>${revokeBtn}</td>
-  </tr>
-`;
+      return `
+        <tr>
+          <td><code>${u.uuid_value}</code></td>
+          <td>${status}</td>
+          <td>${formatLocal(u.created_at)}</td>
+          <td>${u.expires_at ? formatLocal(u.expires_at) : "—"}</td>
+          <td>${u.revoked_at ? formatLocal(u.revoked_at) : "—"}</td>
+          <td>${revokeBtn}</td>
+        </tr>
+      `;
     }).join("");
 
-    uuidModal.showModal();
+    uuidModal.showModal(); // 🔥 ALWAYS OPEN
 
   } catch(e){
-uuidTable.innerHTML = "<tr><td colspan='6'>Network error</td></tr>";
+    console.error("UUID load error:", e);
+
+    uuidTable.innerHTML = "<tr><td colspan='6'>Network error</td></tr>";
+    uuidModal.showModal(); // 🔥 FORCE OPEN
   }
 };
 
