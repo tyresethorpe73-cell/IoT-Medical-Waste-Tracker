@@ -1,0 +1,1060 @@
+#include <Adafruit_STMPE610.h>
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <HardwareSerial.h>
+#include <DHT.h>
+#include <Wire.h>
+#include "RTClib.h"
+#include <Preferences.h>
+#include "SPIFFS.h"
+#include <ArduinoJson.h>
+
+RTC_DS3231 rtc;
+Preferences prefs;
+
+/* ================= WIFI ================= */
+const char* WIFI_SSID = "irPLrl";
+const char* WIFI_PASS = "test12345";
+
+/* ================= NTP ================= */
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET = -5 * 3600;   // Jamaica UTC-5
+const int DST_OFFSET = 0;
+
+unsigned long lastNTPSync = 0;
+const unsigned long NTP_SYNC_INTERVAL = 600000; // 10 min
+
+/* ================= SERVER ================= */
+/* ================= SERVER ================= */
+const int BIN_ID = 2;
+const char* SERVER_HOST = "waste";
+const int SERVER_PORT = 8080;
+const char* SERVER_API_KEY = "bin-secret";
+
+String buildServerURL(const String& path) {
+  return "http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) + path;
+}
+
+bool resolveServerHost(IPAddress &resolvedIP) {
+  Serial.print("Resolving host: ");
+  Serial.println(SERVER_HOST);
+
+  if (!WiFi.hostByName(SERVER_HOST, resolvedIP)) {
+    Serial.println("DNS resolve failed");
+    return false;
+  }
+
+  Serial.print("Resolved IP: ");
+  Serial.println(resolvedIP);
+  return true;
+}
+
+
+
+/* ================= UART ================= */
+HardwareSerial ESP1(2);
+
+/* ================= DHT22 ================= */
+#define DHT_PIN   32
+#define DHT_TYPE  DHT22
+DHT dht(DHT_PIN, DHT_TYPE);
+
+/* ================= ULTRASONIC ================= */
+#define TRIG_PIN  26
+#define ECHO_PIN  27
+
+#define BATTERY_PIN 35   // ADC for battery voltage
+
+/* ================= STATUS LEDS ================= */
+#define LED_GREEN 21   // D21
+#define LED_RED   22   // D22
+#define LED_BLUE  33   // D33
+#define LATCH_PIN 25
+#define OVERRIDE_BTN 4 
+
+const float EMPTY_DISTANCE = 72.1;  // cm (bin empty)
+const float FULL_DISTANCE  = 20.0;  // cm (bin full)
+/* ================= TIMING ================= */
+unsigned long lastSend = 0;
+unsigned long lastUploadAttempt = 0;
+const unsigned long UPLOAD_INTERVAL = 5000;
+const unsigned long SEND_INTERVAL = 300;
+unsigned long blueUntil  = 0;
+unsigned long greenUntil = 0;
+unsigned long redUntil   = 0;
+
+unsigned long latchUntil = 0;
+const unsigned long LATCH_PULSE_TIME = 300; // ms latch fire
+unsigned long lastBlueStatusPulse = 0;
+unsigned long lastRedStatusPulse  = 0;
+
+const unsigned long STATUS_PULSE_INTERVAL = 1000;
+const unsigned long STROBE_TIME = 150;
+
+// ---- Battery Timing ----
+unsigned long lastBatteryRead = 0;
+const unsigned long BATTERY_INTERVAL = 3000; // read every 3 sec
+
+// ---- Telemetry Timing ----
+const unsigned long TELEMETRY_INTERVAL = 1000;  // send every 1 second
+unsigned long lastTelemetry = 0;
+
+float battV = 0;
+int battPct = 0;
+
+/* ================= WIFI RECONNECT ================= */
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 5000; // 5 seconds
+bool wifiWasConnected = false;
+
+bool rtcAvailable = false;
+
+/* ================= STATE ================= */
+bool doorOpen = false;   // 0 = closed, 1 = open
+bool lastDoorState = false;
+
+uint8_t ultrasonicFailCount = 0;
+
+const uint8_t SENSOR_FAIL_LIMIT = 5;
+
+
+// ===== AUTH STORAGE =====
+
+#define MAX_TAGS 60
+#define MAX_SESSIONS 120
+#define MAX_MANAGERS 40
+
+String allowedTags[MAX_TAGS];
+int allowedTagCount = 0;
+
+struct Entry {
+  String uuid;
+  uint32_t expires;
+};
+
+Entry sessions[MAX_SESSIONS];
+int sessionCount = 0;
+
+Entry managers[MAX_MANAGERS];
+int managerCount = 0;
+
+enum SystemMode {
+  MODE_NORMAL,
+  MODE_MANAGER_OVERRIDE
+};
+
+SystemMode currentMode = MODE_NORMAL;
+
+enum AuthStage {
+  WAITING_FOR_BAG,
+  WAITING_FOR_USER,
+  WAITING_FOR_MANAGER
+};
+
+AuthStage currentStage = WAITING_FOR_BAG;
+String currentBagUID = "";
+
+unsigned long stageStartTime = 0;
+const unsigned long STAGE_TIMEOUT = 15000;
+
+/* ================= HELPERS ================= */
+int smoothRSSI(int newRSSI) {
+  static int lastRSSI = newRSSI;
+  lastRSSI = (lastRSSI * 0.7) + (newRSSI * 0.3);
+  return lastRSSI;
+}
+
+uint8_t rssiToBars(int rssi) {
+  if (rssi > -55) return 3;
+  if (rssi > -70) return 2;
+  if (rssi > -85) return 1;
+  return 0;
+}
+
+void sendLine(const String &msg) {
+  ESP1.println(msg);
+  Serial.println("TX → " + msg);
+}
+void strobeBlue() {
+  digitalWrite(LED_BLUE, HIGH);
+  blueUntil = millis() + STROBE_TIME;
+}
+void strobeGreen() {
+  digitalWrite(LED_GREEN, HIGH);
+  greenUntil = millis() + STROBE_TIME;
+}
+void fireLatch() {
+    digitalWrite(LATCH_PIN, HIGH);
+    latchUntil = millis() + LATCH_PULSE_TIME;
+    Serial.println("LATCH FIRED");
+}
+
+
+void strobeRed() {
+  digitalWrite(LED_RED, HIGH);
+  redUntil = millis() + STROBE_TIME;
+}
+
+void updateStrobes() {
+  unsigned long now = millis();
+
+if (blueUntil && now > blueUntil) {
+
+  // ONLY turn off if WiFi is connected (blinking mode)
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_BLUE, LOW);
+  }
+
+  blueUntil = 0;
+}
+  if (greenUntil && now > greenUntil) {
+    digitalWrite(LED_GREEN, LOW);
+    greenUntil = 0;
+  }
+  if (redUntil && now > redUntil) {
+    digitalWrite(LED_RED, LOW);
+    redUntil = 0;
+  }
+    // Auto turn off latch
+  if (latchUntil && now > latchUntil) {
+      digitalWrite(LATCH_PIN, LOW);
+      latchUntil = 0;
+  }
+}
+
+
+
+
+float readUltrasonicCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(20);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 8000);
+
+  // HARD FAIL: no echo
+  if (duration == 0) return -1;
+
+  float distance = (duration * 0.0343) / 2.0;
+
+  // HARD FAIL: out-of-physical-range
+  if (distance < 5 || distance > 500) return -1;
+
+  return distance;
+}
+
+
+float smoothDistance(float newVal) {
+  static float lastVal = newVal;  // remembers previous value
+
+  if (newVal < 0) return lastVal; // ignore invalid readings
+
+  lastVal = (lastVal * 0.7) + (newVal * 0.3);
+  return lastVal;
+}
+
+
+int calculateFillPercent(float distance) {
+  if (distance < 0) return 0;
+  if (distance <= FULL_DISTANCE) return 100;
+  if (distance >= EMPTY_DISTANCE) return 0;
+
+  float usable = EMPTY_DISTANCE - FULL_DISTANCE;
+  float filled = EMPTY_DISTANCE - distance;
+  return constrain((filled / usable) * 100, 0, 100);
+}
+
+float readBatteryVoltage() {
+  long total = 0;
+
+  for (int i = 0; i < 20; i++) {
+    total += analogRead(BATTERY_PIN);
+    delayMicroseconds(200);
+  }
+
+  float raw = total / 20.0;
+  float adcVoltage = (raw / 4095.0) * 3.3;
+
+  // Calibrated multiplier
+  float batteryVoltage = adcVoltage * 5.682;
+
+  Serial.print("ADC raw = ");
+  Serial.print(raw);
+  Serial.print(" | ADC V = ");
+  Serial.print(adcVoltage, 3);
+  Serial.print(" | Batt V = ");
+  Serial.println(batteryVoltage, 3);
+
+  return batteryVoltage;
+}
+
+int batteryPercent(float v) {
+
+  if (v >= 13.0) return 100;
+  if (v >= 12.3) return 100;
+  if (v >= 11.8) return 60;
+  if (v >= 11.3) return 40;
+  if (v >= 10.8) return 20;
+  if (v >= 10.0) return 10;
+
+  return 0;   // <= 10.8V
+}
+
+float smoothBattery(float newVal) {
+    static bool firstRun = true;
+    static float lastVal;
+
+    if (firstRun) {
+        lastVal = newVal;
+        firstRun = false;
+        return newVal;
+    }
+
+    lastVal = (lastVal * 0.7) + (newVal * 0.3);
+    return lastVal;
+}
+
+void sendTelemetry(float temp, float hum, int fill, int batt) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  IPAddress resolvedIP;
+  if (!resolveServerHost(resolvedIP)) return;
+
+  WiFiClient client;
+  HTTPClient http;
+
+  String url = buildServerURL("/bin/telemetry");
+
+  Serial.print("POST URL -> ");
+  Serial.println(url);
+
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-KEY", SERVER_API_KEY);
+
+  String payload = "{";
+  payload += "\"bin_id\":" + String(BIN_ID) + ",";
+  payload += "\"temp\":" + String(temp, 1) + ",";
+  payload += "\"humidity\":" + String(hum, 0) + ",";
+  payload += "\"door_open\":" + String(doorOpen ? 1 : 0) + ",";
+  payload += "\"fill_pct\":" + String(fill) + ",";
+  payload += "\"battery_pct\":" + String(batt);
+  payload += "}";
+
+  Serial.print("TELEM PAYLOAD -> ");
+  Serial.println(payload);
+
+  int code = http.POST(payload);
+
+  Serial.print("TELEM POST -> ");
+  Serial.println(code);
+
+  if (code > 0) {
+    String resp = http.getString();
+    Serial.print("TELEM RESP -> ");
+    Serial.println(resp);
+  } else {
+    Serial.print("HTTP ERROR -> ");
+    Serial.println(http.errorToString(code));
+  }
+
+  http.end();
+}
+
+
+bool validateAndConsume(String uuid, String tagUID) {
+
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  IPAddress resolvedIP;
+  if (!resolveServerHost(resolvedIP)) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+
+  String url = buildServerURL("/bin/consume");
+
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-KEY", SERVER_API_KEY);
+
+  String payload = "{";
+  payload += "\"bin_id\":" + String(BIN_ID) + ",";
+  payload += "\"uuid\":\"" + uuid + "\",";
+  payload += "\"tag_uid\":\"" + tagUID + "\"";
+  payload += "}";
+
+  int code = http.POST(payload);
+
+  if (code != 200) {
+    http.end();
+    return false;
+  }
+
+  String response = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(512);
+  if (deserializeJson(doc, response)) return false;
+
+  return doc["ok"] == true;
+}
+
+
+
+void fetchSnapshot() {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  IPAddress resolvedIP;
+  if (!resolveServerHost(resolvedIP)) return;
+
+  String url = buildServerURL("/bin/" + String(BIN_ID) + "/snapshot");
+
+  WiFiClient client;
+  HTTPClient http;
+
+  http.begin(client, url);
+  http.addHeader("X-API-KEY", SERVER_API_KEY);
+
+  int code = http.GET();
+
+  if (code != 200) {
+    Serial.print("Snapshot failed: HTTP ");
+    Serial.println(code);
+    String body = http.getString();
+    Serial.println(body);
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+
+  if (payload.length() > 19000) {
+    Serial.println("Snapshot too large");
+    http.end();
+    return;
+  }
+
+  http.end();
+
+  DynamicJsonDocument doc(20000);
+  if (deserializeJson(doc, payload)) {
+    Serial.println("JSON parse failed");
+    return;
+  }
+
+  allowedTagCount = 0;
+  for (JsonVariant v : doc["allowed_tags"].as<JsonArray>()) {
+    if (allowedTagCount < MAX_TAGS) {
+      String t = v.as<String>();
+      t.trim();
+      t.toUpperCase();
+      allowedTags[allowedTagCount++] = t;
+    }
+  }
+
+  sessionCount = 0;
+  for (JsonVariant v : doc["active_sessions"].as<JsonArray>()) {
+    if (sessionCount < MAX_SESSIONS) {
+      String u = v["uuid"].as<String>();
+      uint32_t exp = v["expires_at"] | 0;
+
+      u.trim();
+      u.toUpperCase();
+
+      sessions[sessionCount].uuid = u;
+      sessions[sessionCount].expires = exp;
+      sessionCount++;
+    }
+  }
+
+  managerCount = 0;
+  for (JsonVariant v : doc["manager_uuids"].as<JsonArray>()) {
+    if (managerCount < MAX_MANAGERS) {
+      String m = v.as<String>();
+      m.trim();
+      m.toUpperCase();
+
+      managers[managerCount].uuid = m;
+      managers[managerCount].expires = 0;
+      managerCount++;
+    }
+  }
+
+  Serial.println("Snapshot Updated");
+}
+
+void syncRTCFromNTP() {
+
+if (!rtcAvailable) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    Serial.println("Syncing RTC from NTP...");
+
+    struct tm timeinfo;
+
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("NTP failed");
+        return;
+    }
+
+    DateTime ntpTime(
+        timeinfo.tm_year + 1900,
+        timeinfo.tm_mon + 1,
+        timeinfo.tm_mday,
+        timeinfo.tm_hour,
+        timeinfo.tm_min,
+        timeinfo.tm_sec
+    );
+
+    DateTime rtcNow = rtc.now();
+
+long difference = labs((long)ntpTime.unixtime() - (long)rtcNow.unixtime());
+
+    if (difference > 5) {
+        rtc.adjust(ntpTime);
+        Serial.println("RTC Updated from NTP");
+    } else {
+        Serial.println("RTC already accurate");
+    }
+
+    lastNTPSync = millis();
+}
+
+uint32_t parseISOToEpoch(const char* iso) {
+  if (!iso) return 0;
+
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  strptime(iso, "%Y-%m-%dT%H:%M:%S", &t);
+  return (uint32_t)mktime(&t);
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+Wire.begin(18, 19);
+
+rtcAvailable = rtc.begin();
+
+if (!rtcAvailable) {
+  Serial.println("RTC NOT FOUND — continuing without RTC");
+}
+
+
+prefs.begin("session", false);
+
+if (!SPIFFS.begin(true)) {
+  Serial.println("SPIFFS Mount Failed");
+}
+
+
+
+Serial.println("Booting…");
+
+WiFi.setAutoReconnect(true);
+WiFi.persistent(true);
+WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+Serial.print("Connecting to WiFi");
+
+unsigned long wifiStart = millis();
+const unsigned long wifiTimeout = 10000;
+
+while (WiFi.status() != WL_CONNECTED &&
+       millis() - wifiStart < wifiTimeout) {
+    delay(500);
+    Serial.print(".");
+}
+
+if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+
+    wifiWasConnected = true;
+
+    configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER);
+    syncRTCFromNTP();
+    fetchSnapshot();
+} else {
+    Serial.println("\nWiFi not available — continuing offline mode");
+    wifiWasConnected = false;
+}
+
+
+
+
+  Serial.print("ESP32 MAC → ");
+  Serial.println(WiFi.macAddress());
+
+  ESP1.begin(115200, SERIAL_8N1, 16, 17);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+  pinMode(OVERRIDE_BTN, INPUT_PULLUP);
+
+digitalWrite(LATCH_PIN, LOW);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(LED_BLUE, LOW);
+
+  dht.begin();
+
+// ---- Battery ADC Setup ----
+analogReadResolution(12);  
+analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
+}
+
+
+void handleUART() {
+  static String line = "";
+
+  while (ESP1.available()) {
+    char c = ESP1.read();
+
+if (c == '\n' || c == '\r') {
+        line.trim();
+
+      // ================= DOOR =================
+      if (line == "DOOR:OPEN") {
+        doorOpen = true;
+        Serial.println("LID → OPEN");
+      }
+      else if (line == "DOOR:CLOSED") {
+        doorOpen = false;
+        Serial.println("LID → CLOSED");
+      }
+
+
+
+else if (line.indexOf("CARD:") != -1) {
+
+
+    int idx = line.indexOf("CARD:");
+String scanned = line.substring(idx + 5);
+
+// CLEAN
+scanned.trim();
+
+// 🔥 KEEP ONLY HEX CHARACTERS
+String clean = "";
+for (int i = 0; i < scanned.length(); i++) {
+    char c = scanned[i];
+
+    if (isxdigit(c)) {   // only 0-9 A-F
+        clean += c;
+    } else {
+        break; // stop at first garbage
+    }
+}
+
+scanned = clean;
+scanned.toUpperCase();
+
+scanned.trim();
+
+// remove anything after first colon (important!)
+int colonPos = scanned.indexOf(':');
+if (colonPos != -1) {
+    scanned = scanned.substring(0, colonPos);
+}
+
+scanned.toUpperCase();
+
+Serial.println("CLEAN UID: " + scanned);
+    Serial.println("SCAN CLEAN: " + scanned);
+if (scanned == "PINGCARD" || scanned.length() < 4) {
+    Serial.println("IGNORED BAD INPUT");
+    return;
+}
+
+    Serial.println("Comparing against allowed tags:");
+for (int i = 0; i < allowedTagCount; i++) {
+    Serial.println(allowedTags[i]);
+}
+
+// 🔥 FORCE RESET IF STUCK
+if (currentStage != WAITING_FOR_BAG && millis() - stageStartTime > STAGE_TIMEOUT) {
+    Serial.println("FORCED RESET → WAITING_FOR_BAG");
+    currentStage = WAITING_FOR_BAG;
+    stageStartTime = 0;
+}
+
+uint32_t nowEpoch = 0;
+
+if (rtcAvailable) {
+    nowEpoch = rtc.now().unixtime();
+}
+    // =========================
+    // MANAGER OVERRIDE MODE
+    // =========================
+    if (currentMode == MODE_MANAGER_OVERRIDE &&
+        currentStage == WAITING_FOR_MANAGER) {
+Serial.println("Manager stage active");
+
+
+bool success = validateAndConsume(scanned, "MANAGER_OVERRIDE");
+
+if (success) {
+
+    Serial.println("MANAGER ACCESS GRANTED");
+
+    fireLatch();
+    strobeGreen();
+    sendLine("ACCESS:GRANTED");
+
+} else {
+
+    Serial.println("MANAGER ACCESS DENIED");
+
+    strobeRed();
+    sendLine("ACCESS:DENIED");
+}
+
+        currentMode = MODE_NORMAL;
+        currentStage = WAITING_FOR_BAG;
+        stageStartTime = 0;
+        return;
+    }
+
+    // =========================
+    // NORMAL MODE – BAG FLOW
+    // =========================
+if (currentMode == MODE_NORMAL && currentStage != WAITING_FOR_MANAGER) {
+
+        // WAITING FOR BAG
+if (currentStage == WAITING_FOR_BAG) {
+
+    Serial.println("STATE → WAITING_FOR_BAG");
+
+    bool tagValid = false;
+
+    for (int i = 0; i < allowedTagCount; i++) {
+        if (allowedTags[i] == scanned) {
+            tagValid = true;
+            Serial.println("MATCH FOUND → BAG TAG");
+            break;
+        }
+    }
+
+    if (!tagValid) {
+        Serial.println("INVALID BAG TAG");
+        strobeRed();
+        ESP1.println("INVALID TAG");
+        return;
+    }
+
+    // ✅ SAVE BAG UID
+    currentBagUID = scanned;
+
+    Serial.println("VALID BAG → MOVE TO USER");
+
+    currentStage = WAITING_FOR_USER;
+    stageStartTime = millis();
+
+    ESP1.println("SCAN USER CARD");
+    strobeGreen();
+
+    return;
+}
+
+        // WAITING FOR USER
+if (currentStage == WAITING_FOR_USER) {
+
+    Serial.println("STATE → WAITING_FOR_USER");
+
+    bool success = validateAndConsume(scanned, currentBagUID);
+
+    if (success) {
+
+        Serial.println("ACCESS GRANTED");
+
+        fireLatch();
+        strobeGreen();
+        ESP1.println("ACCESS:GRANTED");
+
+    } else {
+
+        Serial.println("ACCESS DENIED (SERVER)");
+
+        strobeRed();
+        ESP1.println("ACCESS:DENIED");
+    }
+
+    // RESET SYSTEM
+    currentStage = WAITING_FOR_BAG;
+    stageStartTime = 0;
+    currentBagUID = "";
+
+    return;
+}
+    }
+}
+
+      line = "";
+    }
+    else {
+      line += c;
+    }
+  }
+}
+void handleWiFiReconnect() {
+  unsigned long now = millis();
+
+  if (now - lastWiFiCheck < WIFI_CHECK_INTERVAL) return;
+  lastWiFiCheck = now;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiWasConnected) {
+      Serial.println("WiFi lost. Reconnecting...");
+      wifiWasConnected = false;
+    }
+
+WiFi.disconnect(false);
+WiFi.reconnect();
+  } 
+  else {
+    if (!wifiWasConnected) {
+      Serial.println("WiFi reconnected");
+      Serial.print("IP → ");
+      Serial.println(WiFi.localIP());
+
+      blueUntil = 0;
+
+configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER);
+syncRTCFromNTP();
+  
+      wifiWasConnected = true;
+      fetchSnapshot();
+      blueUntil = 0;   
+    }
+  }
+}
+void handleOverrideButton() {
+
+    static bool lastState = HIGH;
+    static unsigned long lastPressTime = 0;
+
+    bool currentState = digitalRead(OVERRIDE_BTN);
+
+    if (lastState == HIGH && currentState == LOW &&
+        millis() - lastPressTime > 300) {
+
+        lastPressTime = millis();
+
+        if (currentMode == MODE_NORMAL) {
+
+            currentMode = MODE_MANAGER_OVERRIDE;
+            currentStage = WAITING_FOR_MANAGER;
+            stageStartTime = millis();
+
+            ESP1.println("SCAN MANAGER CARD");
+            
+            Serial.println("Override mode (button) entered");
+        }
+    }
+
+    lastState = currentState;
+}
+
+
+/* ================= LOOP ================= */
+void loop() {
+static unsigned long lastSnapshot = 0;
+
+if (WiFi.status() == WL_CONNECTED &&
+    millis() - lastSnapshot > 1800000) {
+
+  lastSnapshot = millis();
+  fetchSnapshot();
+}
+if (currentMode == MODE_MANAGER_OVERRIDE &&
+    currentStage == WAITING_FOR_MANAGER &&
+    stageStartTime > 0 &&
+    millis() - stageStartTime > STAGE_TIMEOUT) {
+
+    ESP1.println("TIMEOUT");
+
+    currentMode = MODE_NORMAL;
+    currentStage = WAITING_FOR_BAG;
+    stageStartTime = 0;
+
+}
+
+if (currentMode == MODE_NORMAL &&
+    currentStage == WAITING_FOR_USER &&
+    stageStartTime > 0 &&
+    millis() - stageStartTime > STAGE_TIMEOUT) {
+
+    ESP1.println("TIMEOUT");
+
+    currentStage = WAITING_FOR_BAG;
+    stageStartTime = 0;
+}
+  handleWiFiReconnect();
+handleUART();   
+handleOverrideButton(); 
+
+  // 🔄 Periodic RTC sync
+if (WiFi.status() == WL_CONNECTED &&
+    millis() - lastNTPSync > NTP_SYNC_INTERVAL) {
+    syncRTCFromNTP();
+}
+
+
+
+
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+    /*strobeGreen();*/
+
+// ---- Time & Date (RTC) ----
+char timeBuf[6];
+char dateBuf[9];
+
+if (rtcAvailable) {
+
+    DateTime now = rtc.now();
+
+    sprintf(timeBuf, "%02d:%02d", now.hour(), now.minute());
+    sprintf(dateBuf, "%d/%d/%02d",
+            now.month(),
+            now.day(),
+            now.year() % 100);
+
+} else {
+
+    strcpy(timeBuf, "--:--");
+    strcpy(dateBuf, "--/--/--");
+}
+
+sendLine("TIME:" + String(timeBuf));
+sendLine("DATE:" + String(dateBuf));
+
+    // ---- Network ----
+if (WiFi.status() == WL_CONNECTED) {
+
+// 🔵 ensure OFF before blinking mode
+if (blueUntil == 0) {
+  digitalWrite(LED_BLUE, LOW);
+}
+
+// 🔵 BLINK when connected
+if (millis() - lastBlueStatusPulse >= STATUS_PULSE_INTERVAL) {
+  lastBlueStatusPulse = millis();
+  strobeBlue();
+}
+
+  sendLine("NET:OK");
+
+  int rssi = smoothRSSI(WiFi.RSSI());
+  uint8_t bars = rssiToBars(rssi);
+  sendLine("RSSI:" + String(bars));
+
+} else {
+
+  blueUntil = 0;              // cancel any blinking
+  lastBlueStatusPulse = 0;    // reset timing (important)
+
+  digitalWrite(LED_BLUE, HIGH);  // force solid ON
+
+  sendLine("NET:DOWN");
+}
+
+// ---- DHT22 ----
+float temp = dht.readTemperature();
+float hum  = dht.readHumidity();
+
+if (isnan(temp)) temp = 0;
+if (isnan(hum))  hum  = 0;
+
+// ---- Ultrasonic ----
+float rawDist = readUltrasonicCM();
+
+if (rawDist < 0) {
+  ultrasonicFailCount++;
+} else {
+  ultrasonicFailCount = 0;
+}
+
+float smoothDist = smoothDistance(rawDist);
+int fillPercent = calculateFillPercent(smoothDist);
+
+// ---- Door Transition Detection ----
+if (doorOpen != lastDoorState) {
+
+    if (doorOpen) {
+        Serial.println("Door just opened");
+  
+    } else {
+        Serial.println("Door just closed");
+    
+    }
+
+    lastDoorState = doorOpen;
+}
+
+// ---- Send Telemetry ----
+if (millis() - lastTelemetry > TELEMETRY_INTERVAL) {
+    sendTelemetry(temp, hum, fillPercent, battPct);
+    lastTelemetry = millis();
+}
+
+// ---- Serial debug ----
+Serial.print("RAW = ");
+Serial.print(rawDist, 1);
+Serial.print(" cm | SMOOTHED = ");
+Serial.print(smoothDist, 1);
+Serial.print(" cm | FILL = ");
+Serial.print(fillPercent);
+Serial.println(" %");
+
+// ---- Send to ESP1 ----
+sendLine("FILL:" + String(fillPercent));
+sendLine("TEMP:" + String(temp, 1));
+sendLine("HUM:" + String(hum, 0));
+sendLine("BATT:" + String(battPct));
+
+
+
+if (ultrasonicFailCount >= SENSOR_FAIL_LIMIT) {
+  sendLine("US:FAIL");
+} else {
+  sendLine("US:OK");
+}
+if (WiFi.status() != WL_CONNECTED || ultrasonicFailCount >= SENSOR_FAIL_LIMIT) {
+  if (millis() - lastRedStatusPulse >= STATUS_PULSE_INTERVAL) {
+    lastRedStatusPulse = millis();
+    strobeRed();
+  }
+}
+
+  }
+  // ---- Slow Battery Read ----
+if (millis() - lastBatteryRead > BATTERY_INTERVAL) {
+
+    lastBatteryRead = millis();
+
+    float rawBatt = readBatteryVoltage();
+    battV = smoothBattery(rawBatt);
+    battPct = batteryPercent(battV);
+
+    Serial.print("Battery V = ");
+    Serial.print(battV);
+    Serial.print(" | % = ");
+    Serial.println(battPct);
+}
+  updateStrobes();
+}
