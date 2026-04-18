@@ -17,6 +17,57 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
   <style>
+
+/* ===== FIX WHITE BUTTONS ===== */
+
+button {
+  background: #1f2937;
+  color: #e5e7eb;
+  border: 1px solid #374151;
+  border-radius: 10px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+button:hover {
+  background: #374151;
+}
+
+button:active {
+  transform: scale(0.96);
+}
+
+button:focus {
+  outline: none;
+}
+
+/* ===== PIN INPUT ===== */
+
+input {
+  background: #111827;
+  color: #e5e7eb;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  padding: 5px 10px;
+}
+
+/* ===== TABLE SCROLLBAR ===== */
+
+.table-wrap::-webkit-scrollbar {
+  height: 8px;
+}
+
+.table-wrap::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+
+.table-wrap::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 6px;
+}
+
     :root{
       --bg: #0b0f1a;
       --bg-soft: #0f1524;
@@ -207,7 +258,7 @@
 
     tbody td{
       border-bottom:1px solid rgba(255,255,255,.06);
-      padding:.6rem .8rem; white-space:nowrap;
+      padding:.6rem .8rem; white-space:normal;
     }
 
     tbody tr:hover{ background: rgba(255,255,255,.04); }
@@ -318,10 +369,14 @@ dialog{
   border:1px solid var(--border);
   border-radius: var(--radius);
   padding:1.1rem 1.2rem;
-  width: 1200px;
-  max-width: 98%;
+
+  width: 95%;
+  max-width: 1100px;
+
   max-height: 90vh;
-  overflow: auto;
+
+  overflow: auto; 
+
   background: var(--bg-soft);
   color: var(--text);
   box-shadow: var(--shadow);
@@ -406,8 +461,8 @@ dialog{
           <summary>☰ Menu</summary>
           <div class="menu-panel">
             <a class="btn" href="/admin">Dashboard</a>
-            <button class="btn" id="openAddEmployee">➕ Add Employee</button>
-            <button class="btn" id="openViewEmployees">👥 View Employees</button>
+            <button type="button" class="btn" id="openAddEmployee">➕ Add Employee</button>
+           <button type="button" class="btn" id="openViewEmployees">👥 View Employees</button>
             <button class="btn" id="openBinClasses">🗂️ Bin Classifications</button>
             <button class="btn" id="openDeptClasses">🏥 Department Classifications</button>
             <button class="btn" id="openManagerPanel">🧑‍💼 Manage Managers</button>
@@ -479,10 +534,12 @@ dialog{
       <p class="subtitle" style="text-align:center">Refine activity by department, status, time-window, and limits.</p>
 
       <form id="filterForm" class="filters" method="get" action="/admin">
-        <div>
-          <label for="dept">Department ID</label>
-          <input type="number" id="dept" name="dept" min="1" placeholder="e.g. 1">
-        </div>
+<div>
+  <label for="dept">Department</label>
+  <select id="dept" name="dept">
+    <option value="">(all)</option>
+  </select>
+</div>
 
         <div>
           <label for="status">Status</label>
@@ -525,16 +582,16 @@ dialog{
       <div class="table-wrap" style="margin-top:0;">
         <table id="live-bins">
           <thead>
-            <tr>
-              <th>Bin</th>
-              <th>Location</th>
-              <th>Stream</th>
-<th>Temp (°C)</th>
-<th>Humidity (%)</th>
-<th>Fill (%)</th>
-<th>Lid</th>
-<th>Last Seen (Local)</th>
-            </tr>
+<tr>
+  <th>Bin</th>
+  <th>Stream</th>
+  <th>Temp (°C)</th>
+  <th>Humidity (%)</th>
+  <th>Fill (%)</th>
+  <th>Battery (%)</th>
+  <th>Lid</th>
+  <th>Last Seen (Local)</th>
+</tr>
           </thead>
 
           <tbody id="live-bins-body"></tbody>
@@ -623,13 +680,14 @@ dialog{
 
 
     <!-- VIEW EMPLOYEES MODAL -->
-<dialog id="viewEmployeesModal" style="width:1400px;">
+<dialog id="viewEmployeesModal">
       <h3>All Employees</h3>
-      <button class="button btn-secondary"
+      <button class="button btn-secondary btn-view-hidden"
         style="margin-bottom:10px;"
         onclick="loadHiddenEmployees()">
   View Hidden
 </button>
+
 
       <div id="empListStatus" class="muted">Loading…</div>
 
@@ -665,11 +723,21 @@ dialog{
       <p class="muted">Configured medical waste streams / categories.</p>
 
 <div class="panel" style="margin:10px 0;">
-  <div class="filters" style="grid-template-columns: 1fr 1fr auto;">
+  <div class="filters" style="grid-template-columns: 1fr 1fr 1fr 1fr auto;">
     <div>
       <label>Bin Name</label>
       <input id="newBinName" type="text" placeholder="e.g. Infectious Bin - Ward C">
     </div>
+    <div>
+  <label>Waste Stream</label>
+  <select id="streamSelect">
+    <option value="">Select Stream</option>
+  </select>
+</div>
+<div>
+  <label>Location</label>
+  <input id="newBinLocation" type="text" placeholder="e.g. Ward A Utility Room">
+</div>
     <div>
       <label>ESP32 MAC ID</label>
       <input id="newBinMAC" type="text" placeholder="AA:BB:CC:DD:EE:FF">
@@ -686,15 +754,18 @@ dialog{
       <div class="table-wrap" style="max-height:55vh; overflow:auto">
         <table id="binClassesTable">
 <thead>
-  <tr>
-    <th>Name</th>
-    <th>ESP32 MAC ID</th>
-    <th>Temp (°C)</th>
-    <th>Humidity (%)</th>
-    <th>Lid</th>
-    <th>Action</th>
-  </tr>
-</thead>          <tbody></tbody>
+<tr>
+ <th>Bin</th>
+<th>ESP32 MAC ID</th>
+<th>Temp (°C)</th>
+<th>Humidity (%)</th>
+<th>Fill (%)</th>
+<th>Battery (%)</th>
+<th>Lid</th>
+<th>Action</th>
+</tr>
+</thead>          
+<tbody></tbody>
         </table>
       </div>
 
@@ -898,13 +969,122 @@ dialog{
   </div>
 
 
-
-
-
   <!-- SCRIPT SECTION -->
   <script>
   (function(){
-  
+/* ===== VIEW EMPLOYEES MODAL CONTROL ===== */
+
+const openAddEmployee = document.getElementById("openAddEmployee");
+const addEmployeeModal = document.getElementById("addEmployeeModal");
+const addEmployeeForm = document.getElementById("addEmployeeForm");
+const cancelAddEmp = document.getElementById("cancelAddEmp");
+const addEmpMsg = document.getElementById("addEmpMsg");
+
+const openViewEmployees = document.getElementById("openViewEmployees");
+const closeViewEmployees = document.getElementById("closeViewEmployees");
+const viewEmployeesModal = document.getElementById("viewEmployeesModal");
+
+openViewEmployees?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+
+  const menu = document.querySelector("details.menu");
+  if (menu) menu.open = false;
+
+  setTimeout(() => {
+    viewEmployeesModal.showModal();
+    loadEmployees();
+  }, 0);
+});
+
+openAddEmployee?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+
+  const menu = document.querySelector("details.menu");
+  if (menu) menu.open = false;
+
+  if (addEmpMsg) addEmpMsg.textContent = "";
+  document.getElementById("empName").value = "";
+  document.getElementById("empDept").value = "";
+  document.getElementById("empPin").value = "";
+
+  setTimeout(() => {
+    addEmployeeModal.showModal();
+  }, 0);
+});
+
+closeViewEmployees?.addEventListener("click", () => {
+  viewEmployeesModal.close();
+});
+cancelAddEmp?.addEventListener("click", (e) => {
+  e.preventDefault();
+  addEmployeeModal.close();
+});
+
+addEmployeeForm?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+
+  const name = document.getElementById("empName").value.trim();
+  const dept_id = parseInt(document.getElementById("empDept").value, 10);
+  const pin = document.getElementById("empPin").value.trim();
+
+  if (!name || !dept_id || !/^\d{5}$/.test(pin)) {
+    addEmpMsg.textContent = "Name, Department ID, and a 5-digit PIN are required.";
+    return;
+  }
+
+  addEmpMsg.textContent = "Saving...";
+
+  try {
+    const res = await fetch("/employees", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, dept_id, pin })
+    });
+
+    const text = await res.text();
+    let out;
+    try { out = JSON.parse(text); } catch { out = { error: text }; }
+
+    if (!res.ok) {
+      addEmpMsg.textContent = out.error || text || "Failed to add employee.";
+      return;
+    }
+
+    addEmpMsg.textContent = "Employee added successfully.";
+    toast("Employee added");
+
+    document.getElementById("empName").value = "";
+    document.getElementById("empDept").value = "";
+    document.getElementById("empPin").value = "";
+
+    if (viewEmployeesModal?.open) {
+      loadEmployees();
+    }
+
+    setTimeout(() => {
+      addEmployeeModal.close();
+    }, 500);
+
+  } catch (err) {
+    console.error("ADD EMPLOYEE ERROR:", err);
+    addEmpMsg.textContent = "Network error.";
+  }
+});
+
+
+const openBinBtn   = document.getElementById("openBinClasses");
+const openDeptBtn  = document.getElementById("openDeptClasses");
+
+const closeBinBtn  = document.getElementById("closeBinClasses");
+const closeDeptBtn = document.getElementById("closeDeptClasses");
+
+const dlgBin  = document.getElementById("binClassesModal");
+const dlgDept = document.getElementById("deptClassesModal");
+
+const binTableBody  = document.querySelector("#binClassesTable tbody");
+const deptTableBody = document.querySelector("#deptClassesTable tbody");
 
 window.toggleEmployeeStatus = async function(empId, isActive) {
   try {
@@ -920,7 +1100,7 @@ window.toggleEmployeeStatus = async function(empId, isActive) {
     if (!res.ok) throw new Error("Update failed");
 
    toast(isActive ? "Employee activated" : "Employee deactivated");
-loadEmployees(); // 🔥 force re-sync from backend
+loadEmployees();
   } catch (e) {
     toast("Failed to update employee status");
     console.error(e);
@@ -932,15 +1112,13 @@ window.toggleEmployeePin = function(empId) {
 
   const realPin = el.getAttribute("data-pin");
 
-  if (!realPin) {
-    console.warn("No pin found for employee:", empId);
-    return;
-  }
-
-  if (el.textContent === "•••••") {
-    el.textContent = realPin;
-  } else {
+  // 🔥 USE STATE INSTEAD OF TEXT COMPARISON
+  if (el.dataset.visible === "true") {
     el.textContent = "•••••";
+    el.dataset.visible = "false";
+  } else {
+    el.textContent = realPin;
+    el.dataset.visible = "true";
   }
 };
 
@@ -991,11 +1169,16 @@ loadHiddenEmployees();
 
 
     /* ==== Timestamp Formatter (Local Jamaica Time) ==== */
-function formatLocal(ts) {
+function formatLocal(ts){
   if (!ts || ts === "0000-00-00 00:00:00") return "—";
-  return ts;  
-}
 
+  const d = new Date(ts);
+
+  const datePart = d.toLocaleDateString();
+  const timePart = d.toLocaleTimeString();
+
+  return `${datePart}<br>${timePart}`;
+}
     /* ===== DOM Helpers ===== */
     const $  = (sel, root=document) => root.querySelector(sel);
     const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
@@ -1047,6 +1230,33 @@ function toast(msg, timeout = 2400){
       if (el && params.get(id)) el.value = params.get(id);
     }
 
+    async function loadDeptFilterOptions(){
+  const deptSelect = document.getElementById("dept");
+  if (!deptSelect) return;
+
+  const currentDept = params.get("dept") || "";
+
+  try{
+    const res = await fetch("/departments/classes", { cache: "no-store" });
+    const data = await res.json();
+
+    let list = data.departments || data;
+    if (!Array.isArray(list)) list = [];
+
+    deptSelect.innerHTML = `<option value="">(all)</option>` + list.map(d => `
+      <option value="${d.id ?? d.dept_id}">
+        ${(d.name ?? d.dept_name ?? d.dept ?? `Department ${d.id ?? d.dept_id}`)}
+      </option>
+    `).join("");
+
+    deptSelect.value = currentDept;
+  } catch (e) {
+    console.error("DEPT FILTER LOAD ERROR:", e);
+    deptSelect.innerHTML = `<option value="">(all)</option>`;
+    deptSelect.value = currentDept;
+  }
+}
+
     /* ===== Dynamic Export Link Update ===== */
     const filterForm = $("#filterForm");
     const exportBtn  = $("#exportBtn");
@@ -1054,14 +1264,19 @@ function toast(msg, timeout = 2400){
 
     function formQS(){ return new URLSearchParams(new FormData(filterForm)).toString(); }
 
-    function setExportHref(){
-      const qs = formQS();
-      const url = "/admin/export.csv" + (qs ? ("?" + qs) : "");
-      if (exportBtn)  exportBtn.href  = url;
-      if (exportLink) exportLink.href = url;
-    }
-    setExportHref();
-    filterForm?.addEventListener("input", setExportHref);
+function setExportHref(){
+  const qs = formQS();
+  const url = "/admin/export.csv" + (qs ? ("?" + qs) : "");
+  if (exportBtn)  exportBtn.href  = url;
+  if (exportLink) exportLink.href = url;
+}
+
+loadDeptFilterOptions().then(setExportHref);
+filterForm?.addEventListener("input", setExportHref);
+filterForm?.addEventListener("change", setExportHref);
+
+
+
 
     /* ============================================================
    ========== UUID LIFECYCLE BAR GRAPH (FIXED) =================
@@ -1076,12 +1291,13 @@ async function refreshChart(){
     if (dept) qs.set("dept", dept);
     if (days) qs.set("days", days);
 
-    const resp = await fetch("/admin/chart.json" + (qs.toString()? "?"+qs:""), {
-      cache: "no-store"
-    });
+const resp = await fetch('/admin/chart.json', {cache:"no-store"});
     const data = await resp.json();
 
-    const ctx = document.getElementById("usageChart").getContext("2d");
+const canvas = document.getElementById("usageChart");
+if (!canvas) return;
+
+const ctx = canvas.getContext("2d");
     function formatDayLabel(s){
   if (!s) return "";
   // If backend sends "YYYY-MM-DD", display it clean
@@ -1191,24 +1407,29 @@ label: "Expired Sessions",
       if (field.length || row.length){ row.push(field); rows.push(row); }
       return rows;
     }
-
-
-
-
-async function refreshRecent(){
+    async function refreshRecent(){
   try {
     const qs = formQS();
     const url = "/admin/recent.json" + (qs ? "?" + qs : "");
 
     const resp = await fetch(url, {cache:"no-store"});
-    const data = await resp.json();
+   const data = await resp.json();
+
+console.log("RECENT DATA:", data);
+
+if (!data || !Array.isArray(data.recent)) {
+  console.warn("Invalid recent data");
+  recentTbody.innerHTML = `<tr><td colspan="8">No recent activity</td></tr>`;
+  recentCount.textContent = "0";
+  return;
+}
 
     const list = data.recent || [];
 
     recentTbody.innerHTML = list.map(r => {
 
       const roleClass =
-        r.role.includes("MGR") ? "role-mgr" : "role-emp";
+        r.role && r.role.includes("MGR") ? "role-mgr" : "role-emp";
 
       const activityMap = {
         "shift started": "activity-clockin",
@@ -1219,14 +1440,14 @@ async function refreshRecent(){
 
       let activityClass = "";
       for (const key in activityMap){
-        if (r.activity.toLowerCase().includes(key)){
+        if (r.activity && r.activity.toLowerCase().includes(key)){
           activityClass = activityMap[key];
         }
       }
 
       return `
         <tr>
-<td>${escapeHTML(r.event_time)}</td>
+          <td>${formatLocal(r.event_time)}</td>
           <td><code>${escapeHTML(r.uuid)}</code></td>
           <td>${escapeHTML(r.name)}</td>
           <td><span class="${roleClass}">${r.role}</span></td>
@@ -1235,8 +1456,6 @@ async function refreshRecent(){
           <td>
             <span class="activity-badge ${activityClass}">
               ${escapeHTML(r.activity)}
-
-
             </span>
           </td>
           <td>
@@ -1255,384 +1474,233 @@ async function refreshRecent(){
 
 
 
-    /* Initial load + intervals */
-    refreshRecent();
-    refreshChart();
-    setInterval(refreshRecent, 5000);
 
-    filterForm?.addEventListener("submit", ()=>{
-      setTimeout(()=>{ refreshRecent(); refreshChart(); }, 150);
+async function loadBinClasses(){
+
+  window._binData = new Map();
+
+  const tbody = document.querySelector("#binClassesTable tbody");
+tbody.innerHTML = "<tr><td colspan='8'>Loading...</td></tr>";
+
+  try {
+    const resp = await fetch("/admin/bins.json", {cache:"no-store"});
+    const data = await resp.json();
+
+    console.log("BINS DATA:", data);
+
+    if (!data || !Array.isArray(data.bins)){
+tbody.innerHTML = `<tr><td colspan="8">No bins found</td></tr>`;
+      return;
+    }
+
+    // 🔥 GET LIVE DATA
+    const liveResp = await fetch("/bins/live.json", {cache:"no-store"});
+    const liveData = await liveResp.json();
+
+    const liveMap = new Map();
+    (liveData.bins || []).forEach(b => {
+      liveMap.set(b.bin_id, b);
     });
 
-    /* ============================================================
-       ==================== ADD EMPLOYEE ===========================
-       ============================================================ */
-    const dlgAdd = $("#addEmployeeModal");
-    const openAddBtn = $("#openAddEmployee");
-    const cancelAddBtn = $("#cancelAddEmp");
-    const addForm = $("#addEmployeeForm");
-    const addMsg  = $("#addEmpMsg");
+    const rows = data.bins.map(b => {
 
-    function openAdd(){ addMsg.textContent=""; addForm.reset(); dlgAdd.showModal(); }
-    openAddBtn?.addEventListener("click", openAdd);
-    cancelAddBtn?.addEventListener("click", ()=> dlgAdd.close());
+      const live = liveMap.get(b.bin_id);
 
-    addForm?.addEventListener("submit", async e=>{
-      e.preventDefault();
-      addMsg.textContent = "Saving...";
-
-      const payload = {
-        name: $("#empName").value.trim(),
-        dept_id: parseInt($("#empDept").value, 10),
-        pin: $("#empPin").value.trim()
-      };
-
-      if (!/^\d{5}$/.test(payload.pin)){
-        addMsg.textContent="PIN must be exactly 5 digits.";
-        return;
-      }
-
-      try{
-        const res  = await fetch("/employees", {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          body: JSON.stringify(payload)
-        });
-        const text = await res.text();
-        let data;
-        try { data = JSON.parse(text); }
-        catch { data = {error:text}; }
-
-        if (!res.ok){
-          addMsg.textContent = data.error || text || "Failed to add employee.";
-          return;
-        }
-
-        addMsg.textContent = `Added: ${data.name} (id=${data.emp_id})`;
-        toast("Employee added");
-
-        refreshRecent(); refreshChart();
-        setTimeout(()=> dlgAdd.close(), 650);
-
-      } catch(err){
-        console.error(err);
-        addMsg.textContent = "Network error.";
-      }
+const row = {
+  bin_id: b.bin_id,
+  name: b.bin_name,
+  location: b.location,
+  mac: b.esp32_mac || "—",
+  temp: live?.temp_c ?? null,
+  humidity: live?.humidity_pct ?? null,
+  fill: live?.fill_pct ?? null,
+  battery: live?.battery_pct ?? null,
+  door: live?.door_open
+};
+      window._binData.set(b.bin_id, row);
+      return row;
     });
 
-    /* ============================================================
-       ====================== VIEW EMPLOYEES ======================
-       ============================================================ */
-    const dlgView = $("#viewEmployeesModal");
-    const openViewBtn = $("#openViewEmployees");
-    const closeViewBtn = $("#closeViewEmployees");
-    const empListStatus = $("#empListStatus");
-    const empTableBody  = $("#empTable tbody");
+    renderBinTable(rows);
 
-    async function loadEmployees(){
-      empListStatus.textContent = "Loading…";
-      empTableBody.innerHTML = "";
-
-      try{
-const res = await fetch("/employees");
-        const text = await res.text();
-
-        let data;
-        try { data = JSON.parse(text); }
-        catch { data = {error:text}; }
-
-        if (!res.ok){
-          empListStatus.textContent = data.error || text || "Failed to fetch employees.";
-          return;
-        }
-
-        const list = (data.employees || []);
-        if (!list.length){
-          empListStatus.textContent = "No employees found.";
-          return;
-        }
-
-        empListStatus.textContent = `Total: ${list.length}`;
-
-for (const e of list){
-  const tr = document.createElement("tr");
-
-  const checked = e.is_active === 1 ? "checked" : "";
-  const isHidden = e.is_hidden === 1;
-
-
-tr.innerHTML = `
-  <td>${e.name}</td>
-  <td>${e.dept}</td>
-  <td>${e.emp_id}</td>
-  <td>${e.dept_id}</td>
-
-  <td>
-<span id="emp-pin-${e.emp_id}" data-pin="${e.pin}">•••••</span>
-<button class="button btn-secondary"
-  style="padding:.3rem .6rem; margin-left:6px;"
-  onclick="window.toggleEmployeePin(${e.emp_id})">
-  👁
-</button>
-  </td>
-
-  <td>
-    <label class="switch">
-      <input type="checkbox" ${checked}
-        onchange="toggleEmployeeStatus(${e.emp_id}, this.checked)">
-      <span class="slider"></span>
-    </label>
-  </td>
-
-<td>
-  <button class="button btn-secondary"
-    onclick="openEmployeeUUIDs(${e.emp_id})">
-    View
-  </button>
-</td>
-
-<td>
-  <button class="button btn-secondary"
-    onclick="openEmployeeChangePin(${e.emp_id})">
-    🔑
-  </button>
-
-  ${
-    isHidden
-      ? `<button class="button btn-secondary"
-           onclick="unhideEmployee(${e.emp_id})">
-           ♻
-         </button>`
-      : `<button class="button btn-secondary"
-           onclick="hideEmployee(${e.emp_id})">
-           🚫
-         </button>`
+  } catch (err) {
+    console.error("BIN LOAD ERROR:", err);
+tbody.innerHTML = "<tr><td colspan='8'>Error loading bins</td></tr>";
   }
-</td>
-`;
-
-
-  empTableBody.appendChild(tr);
 }
 
+async function loadStreams(){
 
-      } catch(err){
-        console.error(err);
-        empListStatus.textContent = "Network error.";
-      }
-    }
-window.loadHiddenEmployees = async function(){
-  empListStatus.textContent = "Loading hidden...";
-  empTableBody.innerHTML = "";
+  const select = document.getElementById("streamSelect");
+  if (!select) return;
 
   try{
-    const res = await fetch("/employees/hidden");
+    const res = await fetch("/streams");   // 🔥 FIXED ENDPOINT
     const data = await res.json();
 
-    const list = data.employees || [];
-    empListStatus.textContent = `Hidden: ${list.length}`;
+    console.log("STREAMS:", data); // debug
 
-    for (const e of list){
-      const tr = document.createElement("tr");
-      const checked = e.is_active === 1 ? "checked" : "";
-      const isHidden = true;
+    select.innerHTML = `<option value="">Select Stream</option>`;
 
-tr.innerHTML = `
-  <td>${e.name}</td>
-  <td>${e.dept}</td>
-  <td>${e.emp_id}</td>
-  <td>${e.dept_id}</td>
+    data.forEach(s => {   // 🔥 backend returns ARRAY
+      select.innerHTML += `
+        <option value="${s.id}">
+          ${s.code} - ${s.name}
+        </option>
+      `;
+    });
 
-  <td>
-    <span id="emp-pin-${e.emp_id}" data-pin="${e.pin}">•••••</span>
-    <button class="button btn-secondary"
-      style="padding:.3rem .6rem; margin-left:6px;"
-      onclick="window.toggleEmployeePin(${e.emp_id})">
-      👁
-    </button>
-  </td>
-
-  <td>Hidden</td>
-
-  <td>
-    <button class="button btn-secondary"
-      onclick="openEmployeeUUIDs(${e.emp_id})">
-      View
-    </button>
-  </td>
-
-  <td>
-    <button class="button btn-secondary"
-      onclick="unhideEmployee(${e.emp_id})">
-      ♻ Restore
-    </button>
-  </td>
-`;
-      empTableBody.appendChild(tr);
-    }
-
-  } catch{
-    empListStatus.textContent = "Failed to load hidden.";
+  } catch(e){
+    console.error("STREAM LOAD ERROR:", e);
   }
 }
 
+function renderBinTable(rows){
 
-    function openView(){ dlgView.showModal(); loadEmployees(); }
-    openViewBtn?.addEventListener("click", openView);
-    closeViewBtn?.addEventListener("click", ()=> dlgView.close());
+  const tbody = document.querySelector("#binClassesTable tbody");
 
-    /* ============================================================
-       ========== BIN + DEPT CLASSIFICATIONS MODALS ================
-       ============================================================ */
-    const dlgBin  = $("#binClassesModal");
-    const dlgDept = $("#deptClassesModal");
+  tbody.innerHTML = rows.map(r => {
 
-    const openBinBtn  = $("#openBinClasses");
-    const openDeptBtn = $("#openDeptClasses");
+const tempTxt = r.temp != null ? `${r.temp.toFixed(1)} °C` : "—";
+const humTxt  = r.humidity != null ? `${r.humidity.toFixed(1)} %` : "—";
+const fillTxt = r.fill != null ? `${r.fill.toFixed(0)}%` : "—";
+const battTxt = r.battery != null ? `${r.battery.toFixed(0)}%` : "—";
 
-    const closeBinBtn  = $("#closeBinClasses");
-    const closeDeptBtn = $("#closeDeptClasses");
+let doorCell = "—";
+if (r.door === 1) doorCell = `<span class="pill pill-warn">OPEN</span>`;
+if (r.door === 0) doorCell = `<span class="pill pill-ok">CLOSED</span>`;
 
-    const binTableBody  = $("#binClassesTable tbody");
-    const deptTableBody = $("#deptClassesTable tbody");
+    return `
+      <tr data-bin-id="${r.bin_id}">
+<td>
+  <div style="font-weight:600;">
+    ${escapeHTML(r.name)}
+  </div>
+  <div style="font-size:12px; color:#9aa3b2;">
+    📍 ${escapeHTML(r.location || "No location")}
+  </div>
+</td>
 
-    async function fetchJSON(urls){
-      for (const u of urls){
-        try{
-          const r = await fetch(u, {headers:{Accept:"application/json"}});
-          const t = await r.text();
-          let data;
-          try { data = JSON.parse(t); }
-          catch { data = {error:t}; }
-          if (r.ok) return data;
-        } catch{}
-      }
-      return null;
+<td>${escapeHTML(r.mac)}</td>
+
+<td class="temp">${tempTxt}</td>
+<td class="humidity">${humTxt}</td>
+<td class="fill">${fillTxt}</td>
+<td class="battery">${battTxt}</td>
+<td class="lid">${doorCell}</td>
+<td>
+          <button type="button"
+            class="button btn-secondary"
+            onclick="deleteBin('${r.mac}', ${r.bin_id})">
+            🗑️ Delete
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function updateBinRowUI(bin_id, data){
+
+  const row = document.querySelector(`[data-bin-id="${bin_id}"]`);
+  if (!row) return;
+
+  const tempEl = row.querySelector(".temp");
+  if (tempEl){
+   tempEl.textContent = data.temp != null ? `${data.temp.toFixed(1)} °C` : "—";
+  }
+
+  const humEl = row.querySelector(".humidity");
+  if (humEl){
+   humEl.textContent = data.humidity != null ? `${data.humidity.toFixed(1)} %` : "—";
+  }
+
+  const lidEl = row.querySelector(".lid");
+  if (lidEl){
+    if (data.door === 1){
+      lidEl.innerHTML = `<span class="pill pill-warn">OPEN</span>`;
+    } else if (data.door === 0){
+      lidEl.innerHTML = `<span class="pill pill-ok">CLOSED</span>`;
     }
-
-    async function loadBinClasses(){
-      binTableBody.innerHTML = "";
-      const live = await fetchJSON(["/bins/live.json"]);
-      if (!live || !Array.isArray(live.bins)){
-        binTableBody.innerHTML = `<tr><td colspan="5">Failed to load.</td></tr>`;
-        return;
-      }
-
-      const streams = await fetchJSON(["/streams"]);
-      const macByStream = new Map();
-      if (Array.isArray(streams)){
-        for (const s of streams){
-          if (s && s.code && s.esp32_mac) macByStream.set(s.code, s.esp32_mac);
-        }
-      }
-
-      const rows = live.bins.map(b=>{
-        let door = null;
-        if (typeof b.door_open === "number"){
-          door = b.door_open === 1? "open":"closed";
-        } else if (typeof b.door_status === "string"){
-          door = b.door_status.trim().toLowerCase();
-        }
-
-        return {
-          name: b.bin_name || "",
-          mac: macByStream.get(b.stream_code) || "",
-          tempC: b.temp_c ?? null,
-          rhPct: b.humidity_pct ?? null,
-          door
-        };
-      });
-
-      rows.sort((a,b)=> a.name.localeCompare(b.name));
-
-      binTableBody.innerHTML = rows.map(r=>{
-        const tempTxt = r.tempC != null ? r.tempC.toFixed(1) : "—";
-        const rhTxt   = r.rhPct != null ? r.rhPct.toFixed(1) : "—";
-
-        let doorCell = "—";
-        if (r.door === "open")   doorCell = `<span class="pill pill-warn">open</span>`;
-        if (r.door === "closed") doorCell = `<span class="pill pill-ok">closed</span>`;
-
-return `
-  <tr>
-    <td>${r.name}</td>
-    <td>${r.mac || "—"}</td>
-    <td>${tempTxt}</td>
-    <td>${rhTxt}</td>
-    <td>${doorCell}</td>
-    <td>
-<button class="button btn-secondary"
-  data-mac="${r.mac}">
-  🗑️ Delete
-</button>
-    </td>
-  </tr>`;
-      }).join('');
-    }
+  }
+}
 
     /* ============================================================
        ================== DEPARTMENTS: LOAD + ADD + DELETE =========
        ============================================================ */
-    async function loadDeptClasses(){
-      deptTableBody.innerHTML = "";
-      const data = await fetchJSON(["/departments/classes", "/departments"]);
-      if (!data){
-        deptTableBody.innerHTML = `<tr><td colspan="4">Failed to load.</td></tr>`;
-        return;
-      }
+async function loadDeptClasses(){
+  deptTableBody.innerHTML = `<tr><td colspan="4">Loading...</td></tr>`;
 
-      let list = data.departments || data;
-      if (!Array.isArray(list)) list = [];
+  try{
+    const res = await fetch("/departments/classes", { cache: "no-store" });
+    const data = await res.json();
 
-      const norm = list.map(d=>({
-        id: Number(d.id ?? d.dept_id ?? 0),
-        name: d.name ?? d.dept ?? "",
-        code: (d.code ?? d.dept_code ?? "") || ""
-      })).sort((a,b)=> a.id - b.id);
-
-      deptTableBody.innerHTML = norm.map(d=>`
-        <tr>
-          <td>${d.id}</td>
-          <td>${d.name}</td>
-          <td>${d.code || "—"}</td>
-          <td>
-            <button class="button btn-secondary" data-del-dept="${d.id}">🗑️ Delete</button>
-          </td>
-        </tr>
-      `).join('');
-
-      // bind delete buttons
-      document.querySelectorAll("[data-del-dept]").forEach(btn=>{
-        btn.addEventListener("click", async ()=>{
-          const deptID = Number(btn.getAttribute("data-del-dept"));
-          if (!deptID) return;
-
-          if (!confirm(`Delete department #${deptID}?`)) return;
-
-          try{
-            const res = await fetch("/departments/delete", {
-              method: "POST",
-              headers: {"Content-Type":"application/json"},
-              body: JSON.stringify({dept_id: deptID})
-            });
-
-            const text = await res.text();
-            let out;
-            try { out = JSON.parse(text); } catch { out = {error:text}; }
-
-            if (!res.ok){
-              toast(out.error || text || "Delete failed");
-              return;
-            }
-
-            toast("Department deleted");
-            loadDeptClasses();
-          } catch(e){
-            toast("Network error");
-          }
-        });
-      });
+    if (!res.ok){
+      deptTableBody.innerHTML = `<tr><td colspan="4">Failed to load.</td></tr>`;
+      return;
     }
+
+    let list = data.departments || data;
+    if (!Array.isArray(list)) list = [];
+
+    const norm = list.map(d => ({
+      id: Number(d.id ?? d.dept_id ?? 0),
+      name: d.name ?? d.dept_name ?? d.dept ?? "",
+      code: (d.code ?? d.dept_code ?? "") || ""
+    })).sort((a,b) => a.id - b.id);
+
+    if (!norm.length){
+      deptTableBody.innerHTML = `<tr><td colspan="4">No departments found.</td></tr>`;
+      return;
+    }
+
+    deptTableBody.innerHTML = norm.map(d => `
+      <tr>
+        <td>${d.id}</td>
+        <td>${escapeHTML(d.name)}</td>
+        <td>${escapeHTML(d.code || "—")}</td>
+        <td>
+          <button class="button btn-secondary" data-del-dept="${d.id}">🗑️ Delete</button>
+        </td>
+      </tr>
+    `).join("");
+
+    document.querySelectorAll("[data-del-dept]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const deptID = Number(btn.getAttribute("data-del-dept"));
+        if (!deptID) return;
+
+        if (!confirm(`Delete department #${deptID}?`)) return;
+
+        try{
+          const res = await fetch("/departments/delete", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ dept_id: deptID })
+          });
+
+          const text = await res.text();
+          let out;
+          try { out = JSON.parse(text); } catch { out = { error: text }; }
+
+          if (!res.ok){
+            toast(out.error || text || "Delete failed");
+            return;
+          }
+
+          toast("Department deleted");
+          loadDeptClasses();
+        } catch(e){
+          toast("Network error");
+        }
+      });
+    });
+
+  } catch (e){
+    console.error("DEPT LOAD ERROR:", e);
+    deptTableBody.innerHTML = `<tr><td colspan="4">Failed to load.</td></tr>`;
+  }
+}
 
     // Add department handler
     const btnAddDept = $("#btnAddDept");
@@ -1679,7 +1747,12 @@ return `
       }
     });
 
-    openBinBtn?.addEventListener("click", ()=>{ dlgBin.showModal();  loadBinClasses(); });
+openBinBtn?.addEventListener("click", ()=>{
+  dlgBin.showModal();
+
+  loadBinClasses();
+  loadStreams();   // 🔥 ADD THIS LINE
+});
     openDeptBtn?.addEventListener("click", ()=>{
       if (deptAddMsg) deptAddMsg.textContent = "";
       if ($("#newDeptName")) $("#newDeptName").value = "";
@@ -1688,8 +1761,185 @@ return `
       loadDeptClasses();
     });
 
-    closeBinBtn?.addEventListener("click", ()=> dlgBin.close());
+    closeBinBtn?.addEventListener("click", ()=>{
+
+  dlgBin.close();
+
+});
     closeDeptBtn?.addEventListener("click", ()=> dlgDept.close());
+
+
+    /* ============================================================
+   =================== LOAD EMPLOYEES =========================
+   ============================================================ */
+
+async function loadEmployees(){
+
+  const tbody = document.querySelector("#empTable tbody");
+  const status = document.getElementById("empListStatus");
+
+  tbody.innerHTML = "";
+  status.textContent = "Loading...";
+
+  try{
+    const res = await fetch("/employees");
+    const data = await res.json();
+
+    if (!res.ok){
+      status.textContent = "Failed to load employees";
+      return;
+    }
+
+    const list = data.employees || [];
+
+    if (!list.length){
+      status.textContent = "No employees found";
+      return;
+    }
+
+    status.textContent = "";
+
+    tbody.innerHTML = list.map(emp => {
+
+      const active = emp.is_active === 1 ? "checked" : "";
+
+      return `
+        <tr>
+          <td>${emp.name}</td>
+          <td>${emp.department || "-"}</td>
+          <td>${emp.emp_id}</td>
+          <td>${emp.dept_id}</td>
+
+          <td>
+            <span id="emp-pin-${emp.emp_id}" data-pin="${emp.pin}">
+              •••••
+            </span>
+           <button class="btn" onclick="toggleEmployeePin(${emp.emp_id})">👁</button>
+          </td>
+
+          <td>
+            <label class="switch">
+              <input type="checkbox" ${active}
+                onchange="toggleEmployeeStatus(${emp.emp_id}, this.checked)">
+              <span class="slider"></span>
+            </label>
+          </td>
+
+          <td>
+  <button class="btn" onclick="openEmployeeUUIDs(${emp.emp_id})">
+    View
+  </button>
+</td>
+
+<td>
+  <button class="btn" onclick="openEmployeeChangePin(${emp.emp_id})">🔑</button>
+  <button class="btn delete" onclick="hideEmployee(${emp.emp_id})">🗑️</button>
+</td>
+        </tr>
+      `;
+    }).join("");
+
+  } catch(e){
+    console.error(e);
+    status.textContent = "Network error";
+  }
+}
+
+window.loadHiddenEmployees = async function() {
+
+  console.log("🔥 BUTTON CLICKED");
+
+  const btn = document.querySelector('.btn-view-hidden');
+  const tbody = document.querySelector("#empTable tbody");
+  const status = document.getElementById("empListStatus");
+
+  if (!tbody){
+    console.error("❌ TABLE NOT FOUND");
+    return;
+  }
+
+  const isShowingHidden = btn && btn.textContent.includes("Active");
+  const endpoint = isShowingHidden ? "/employees" : "/employees/hidden";
+
+  try {
+    const res = await fetch(endpoint);
+
+    console.log("STATUS:", res.status);
+
+    const data = await res.json();
+    console.log("DATA:", data);
+
+    const list = data.employees || [];
+
+    tbody.innerHTML = "";
+
+    if (!list.length){
+      status.textContent = "No employees found";
+      return;
+    }
+
+    status.textContent = `${list.length} employees`;
+
+tbody.innerHTML = list.map(emp => {
+
+  const active = emp.is_active === 1 ? "checked" : "";
+
+  return `
+    <tr>
+      <td>${emp.name}</td>
+      <td>${emp.department || "-"}</td>
+      <td>${emp.emp_id}</td>
+      <td>${emp.dept_id}</td>
+
+      <td>
+        <span id="emp-pin-${emp.emp_id}" data-pin="${emp.pin}">
+          •••••
+        </span>
+        <button class="btn"
+          onclick="toggleEmployeePin(${emp.emp_id})">
+          👁
+        </button>
+      </td>
+
+      <td>
+        <label class="switch">
+          <input type="checkbox" ${active}
+            onchange="toggleEmployeeStatus(${emp.emp_id}, this.checked)">
+          <span class="slider"></span>
+        </label>
+      </td>
+
+      <td>
+        <button class="btn"
+          onclick="openEmployeeUUIDs(${emp.emp_id})">
+          View
+        </button>
+      </td>
+
+      <td>
+        <button class="btn"
+          onclick="openEmployeeChangePin(${emp.emp_id})">
+          🔑
+        </button>
+
+        <button class="btn"
+          onclick="unhideEmployee(${emp.emp_id})">
+          ♻️
+        </button>
+      </td>
+    </tr>
+  `;
+}).join("");
+    // toggle button text
+    btn.textContent = isShowingHidden
+      ? "View Hidden"
+      : "View Active Employees";
+
+  } catch (e) {
+    console.error("ERROR:", e);
+    status.textContent = "Failed to load employees";
+  }
+}
 
     /* ============================================================
        =================== LIVE BIN TELEMETRY =====================
@@ -1705,127 +1955,210 @@ return `
       return Number.isFinite(n)? n.toFixed(digits) : "—";
     }
 
-    function renderLive(){
-      const rows = Array.from(liveState.values())
-        .sort((a,b)=> String(a.bin_name||"").localeCompare(String(b.bin_name||"")));
+function renderLive(){
 
-      liveBodyEl.innerHTML = rows.map(r => `
-        <tr data-bin="${r.bin_id}">
-          <td>${r.bin_name || ("Bin " + r.bin_id)}</td>
-          <td>${r.location || ""}</td>
-          <td>${r.stream_code || ""}</td>
-<td>${fmtNum(r.temp_c)}</td>
-<td>${fmtNum(r.humidity_pct)}</td>
-<td>
-${
-(function(){
+  if (!liveState.size){
+    liveBodyEl.innerHTML = `<tr><td colspan="8">No data</td></tr>`;
+    return;
+  }
 
-  const v = r.fill_pct;
+  // 🔥 ONLY BUILD ONCE (NO REBUILD)
+  if (liveBodyEl.children.length === 0){
 
-  if (v === null || v === undefined) return "—";
+liveBodyEl.innerHTML = Array.from(liveState.values()).map(r => `
+  <tr data-bin-id="${r.bin_id}">
+    <td>
+      <div style="font-weight:600;">${r.bin_name}</div>
+      ${r.location ? `<div style="font-size:12px; color:#9aa3b2;">📍 ${r.location}</div>` : ""}
+    </td>
+    <td>${r.stream_name || r.stream_code || "-"}</td>
+    <td class="temp">-</td>
+    <td class="humidity">-</td>
+    <td class="fill">-</td>
+    <td class="battery">-</td>
+    <td class="lid">-</td>
+    <td class="last_seen">-</td>
+  </tr>
+`).join("");
+  }
 
-  let cls = "fill-normal";
-  if (v >= 85) cls = "fill-danger";
-  else if (v >= 65) cls = "fill-warn";
+  // 🔥 UPDATE ONLY VALUES (NO DOM REBUILD)
+  liveState.forEach((r, id)=>{
 
-  return `
-    <div class="fill-wrap">
-      <div class="fill-gauge">
-        <div class="fill-bar ${cls}" style="width:${v}%"></div>
-      </div>
-      <span style="font-size:12px;">${v.toFixed(0)}%</span>
-    </div>
-  `;
+    const row = liveBodyEl.querySelector(`[data-bin-id="${id}"]`);
+    if (!row) return;
 
-})()
-}
-</td>
-          <!-- 🔥 Door Status Pills -->
-          <td>
-            ${
-              (function(){
-                const d = (r.door_status || "").toString().toLowerCase();
+const tempEl = row.querySelector(".temp");
+const humEl  = row.querySelector(".humidity");
+const fillEl = row.querySelector(".fill");
+const battEl = row.querySelector(".battery");
+const lidEl  = row.querySelector(".lid");
+const timeEl = row.querySelector(".last_seen");
 
-                if (d === "open" || d === "opened" || d === "1") {
-                  return `<span class="pill pill-warn">Open</span>`;
-                }
-                if (d === "closed" || d === "close" || d === "0") {
-                  return `<span class="pill pill-ok">Closed</span>`;
-                }
-                return "—";
-              })()
-            }
-          </td>
+if (tempEl) tempEl.textContent =
+  r.temp_c != null ? `${r.temp_c.toFixed(1)} °C` : "-";
 
-          <!-- 🔥 Updated: Local Time Format -->
-          <td>${r.last_seen ? formatLocal(r.last_seen) : ""}</td>
-        </tr>
-      `).join('');
+if (humEl) humEl.textContent =
+  r.humidity_pct != null ? `${r.humidity_pct.toFixed(1)} %` : "-";
+
+if (fillEl) fillEl.textContent =
+  r.fill_pct != null ? `${r.fill_pct.toFixed(0)}%` : "-";
+
+  if (battEl) battEl.textContent =
+  r.battery_pct != null ? `${r.battery_pct.toFixed(0)}%` : "-";
+
+    if (lidEl){
+      if (r.door_open === 1){
+        lidEl.innerHTML = `<span class="pill pill-warn">OPEN</span>`;
+      } else if (r.door_open === 0){
+        lidEl.innerHTML = `<span class="pill pill-ok">CLOSED</span>`;
+      }
     }
+
+    if (timeEl) timeEl.innerHTML = formatLocal(r.last_seen);
+
+  });
+}
     
 
-    async function seedLive(){
-      try{
-        const resp = await fetch("/bins/live.json", {cache:"no-store"});
-        const j    = await resp.json();
+async function seedLive(){
+  try{
+    const resp = await fetch(`/bins/live.json`, {cache:"no-store"});
+    const j = await resp.json();
 
-        const tsFmt = j.ts ? formatLocal(j.ts) : "";
-        liveTsEl.textContent = "seeded at " + tsFmt;
+    liveTsEl.textContent = "seeded";
 
-        (j.bins||[]).forEach(b=>{
-liveState.set(b.bin_id, {
-  bin_id: b.bin_id,
-  bin_name: b.bin_name,
-  location: b.location,
-  stream_code: b.stream_code,
-  temp_c: b.temp_c ?? null,
-  humidity_pct: b.humidity_pct ?? null,
-  fill_pct: b.fill_pct ?? null,
-  door_status: b.door_status || "",
-  last_seen: b.last_seen || ""
-});
-        });
+    liveState.clear();
 
-        renderLive();
-      }
-      catch{
-        liveTsEl.textContent = "seed failed";
+    (j.bins || []).forEach(b => {
+      liveState.set(b.bin_id, {
+        bin_id: b.bin_id,
+        bin_name: b.bin_name,
+        location: b.location,
+        stream_code: b.stream_code,
+        stream_name: b.stream_name || b.stream_code,
+        temp_c: b.temp_c ?? null,
+        humidity_pct: b.humidity_pct ?? null,
+        fill_pct: b.fill_pct ?? null,
+        battery_pct: b.battery_pct ?? null,
+        door_open: b.door_open ?? null,
+        last_seen: b.last_seen || ""
+      });
+    });
+
+    renderLive();
+
+  } catch(e){
+    console.error("SEED ERROR:", e);
+    liveTsEl.textContent = "seed failed";
+  }
+}
+
+try { seedLive(); } catch(e){ console.error(e); }
+try { refreshRecent(); } catch(e){ console.error(e); }
+try { refreshChart(); } catch(e){ console.error(e); }  
+    setInterval(refreshRecent, 5000);
+    setInterval(refreshChart, 5000)
+
+function applyTelemetry(msg){
+
+  // 🔥 UPDATE MAIN LIVE TABLE
+  const mainRow = document.querySelector(
+    `#live-bins-body [data-bin-id="${msg.bin_id}"]`
+  );
+
+  if (mainRow){
+
+const tempEl = mainRow.querySelector(".temp");
+const humEl  = mainRow.querySelector(".humidity");
+const fillEl = mainRow.querySelector(".fill");
+const battEl = mainRow.querySelector(".battery");
+const lidEl  = mainRow.querySelector(".lid");
+const timeEl = mainRow.querySelector(".last_seen");
+
+if (tempEl && msg.temp_c != null){
+  tempEl.textContent = `${msg.temp_c.toFixed(1)} °C`;
+}
+
+if (humEl && msg.humidity_pct != null){
+  humEl.textContent = `${msg.humidity_pct.toFixed(1)} %`;
+}
+
+if (fillEl && msg.fill_pct != null){
+  fillEl.textContent = `${msg.fill_pct.toFixed(0)}%`;
+}
+if (battEl && msg.battery_pct != null){
+  battEl.textContent = `${msg.battery_pct.toFixed(0)}%`;
+}
+
+    if (lidEl){
+      if (msg.door_open === 1){
+        lidEl.innerHTML = `<span class="pill pill-warn">OPEN</span>`;
+      } else if (msg.door_open === 0){
+        lidEl.innerHTML = `<span class="pill pill-ok">CLOSED</span>`;
       }
     }
 
-    seedLive();
+if (timeEl && msg.last_seen){
+  timeEl.innerHTML = formatLocal(msg.last_seen);
+}
+  }
 
-    function applyTelemetry(msg){
-      const r = liveState.get(msg.bin_id) || {bin_id: msg.bin_id, bin_name: "Bin "+msg.bin_id};
-      if (msg.temp_c      !== undefined) r.temp_c = msg.temp_c;
-      if (msg.humidity_pct!== undefined) r.humidity_pct = msg.humidity_pct;
-      if (msg.fill_pct !== undefined) r.fill_pct = msg.fill_pct;
-      if (msg.door_status)              r.door_status = msg.door_status;
-      if (msg.last_seen)                r.last_seen   = msg.last_seen;
+  // 🔥 UPDATE BIN MODAL (your working part)
+  const modalRow = document.querySelector(
+    `#binClassesTable [data-bin-id="${msg.bin_id}"]`
+  );
 
-      liveState.set(msg.bin_id, r);
-      renderLive();
+  if (modalRow){
+
+const tempEl = modalRow.querySelector(".temp");
+const humEl  = modalRow.querySelector(".humidity");
+const fillEl = modalRow.querySelector(".fill");
+const battEl = modalRow.querySelector(".battery");
+const lidEl  = modalRow.querySelector(".lid");
+
+if (tempEl && msg.temp_c != null){
+  tempEl.textContent = `${msg.temp_c.toFixed(1)} °C`;
+}
+
+if (humEl && msg.humidity_pct != null){
+  humEl.textContent = `${msg.humidity_pct.toFixed(1)} %`;
+}
+    if (fillEl && msg.fill_pct != null){
+  fillEl.textContent = `${msg.fill_pct.toFixed(0)}%`;
+}
+if (battEl && msg.battery_pct != null){
+  battEl.textContent = `${msg.battery_pct.toFixed(0)}%`;
+}
+
+    if (lidEl){
+      if (msg.door_open === 1){
+        lidEl.innerHTML = `<span class="pill pill-warn">OPEN</span>`;
+      } else if (msg.door_open === 0){
+        lidEl.innerHTML = `<span class="pill pill-ok">CLOSED</span>`;
+      }
     }
-
+  }
+}
     /* SSE + Fallback Polling */
     let livePollTimer = null;
     function startLivePolling(){
       if (livePollTimer) return;
       liveTsEl.textContent = "live: polling every 3s (SSE unavailable)";
-      livePollTimer = setInterval(seedLive, 3000);
     }
 
     try {
 const es = new EventSource("/bins/live.sse");
-liveTsEl.textContent = "live: connected (SSE)";
+      liveTsEl.textContent = "live: connected (SSE)";
 
 // ✅ LISTEN TO *NAMED* TELEMETRY EVENTS
 es.addEventListener("telemetry", (e) => {
   try {
     const payload = JSON.parse(e.data);
-    if (payload?.data) {
-      applyTelemetry(payload.data);
-    }
+    if (!payload?.data) return;
+
+    applyTelemetry(payload.data); // ✅ ONLY THIS
+
   } catch (err) {
     console.error("telemetry parse error", err);
   }
@@ -1928,11 +2261,14 @@ const res = await fetch("/admin/bag-tags", {
       })
     });
 
-    if (!res.ok){
-      const txt = await res.text();
-      toast(txt || "Failed to add tag");
-      return;
-    }
+if (!res.ok){
+  const txt = await res.text();
+
+  console.error("ADD BIN ERROR:", txt);  
+  tagMsg.textContent = "ERROR: " + txt;
+
+  return;
+}
 
     toast("Tag added");
     document.getElementById("tagUID").value="";
@@ -2047,6 +2383,7 @@ return `
 document.getElementById("btnAddManager")?.addEventListener("click", async ()=>{
   const name = document.getElementById("managerName").value.trim();
   const pin  = document.getElementById("managerPin").value.trim();
+
 
 if (!/^\d{5}$/.test(pin)){
   toast("PIN must be exactly 5 digits");
@@ -2400,48 +2737,83 @@ document.getElementById("btnAddBin")?.addEventListener("click", async ()=>{
   const name = document.getElementById("newBinName").value.trim();
   const mac  = document.getElementById("newBinMAC").value.trim();
   const msg  = document.getElementById("binAddMsg");
+  const streamID = document.getElementById("streamSelect").value;
+  const location = document.getElementById("newBinLocation").value.trim();
 
-  if (!name || !mac){
-    msg.textContent = "Name and MAC required.";
+  if (!name || !mac || !streamID || !location){
+    msg.textContent = "Name, Location, MAC, and Stream required.";
     return;
   }
 
   try{
-    const res = await fetch("/bins", {
+    const res = await fetch("/admin/bins", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ name, mac })
+body: JSON.stringify({
+  bin_name: name,
+  location: location, 
+  esp32_mac: mac,
+  waste_stream_id: parseInt(streamID)
+})
     });
 
-    if (!res.ok) throw new Error();
+if (!res.ok){
+  const txt = await res.text();
 
-    toast("Bin added");
-    document.getElementById("newBinName").value="";
-    document.getElementById("newBinMAC").value="";
-    loadBinClasses();
+  console.error("ADD BIN ERROR:", txt); 
+  msg.textContent = "ERROR: " + txt;
+
+  return;
+}
+
+toast("Bin added");
+
+document.getElementById("newBinName").value="";
+document.getElementById("newBinMAC").value="";
+document.getElementById("streamSelect").value="";
+document.getElementById("newBinLocation").value="";   
+
+loadBinClasses();
 
   } catch{
     msg.textContent = "Failed to add bin.";
   }
 });
 
-window.deleteBin = async function(mac){
+window.deleteBin = async function(mac, id){
 
   if (!confirm("Delete this bin?")) return;
 
   try{
-    const res = await fetch("/bins/delete", {
+    const res = await fetch("/admin/bins/delete", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ mac })
+body: JSON.stringify({
+  bin_id: id
+})
     });
 
-    if (!res.ok) throw new Error();
+    const txt = await res.text();
 
-    toast("Bin deleted");
-    loadBinClasses();
+if (!res.ok){
+  console.error("DELETE ERROR:", txt);
 
-  } catch{
+  alert("DELETE FAILED:\n\n" + txt);   // 🔥 SHOW REAL BACKEND ERROR
+
+  return;
+}
+
+toast("Bin deleted");
+
+// 🔥 REMOVE ROW INSTANTLY
+const row = document.querySelector(`[data-bin-id="${id}"]`);
+if (row) row.remove();
+
+// reload to sync backend
+setTimeout(loadBinClasses, 500);
+
+  } catch(e){
+    console.error(e);
     toast("Failed to delete bin");
   }
 };

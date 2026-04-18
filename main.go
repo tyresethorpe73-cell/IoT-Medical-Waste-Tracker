@@ -41,13 +41,14 @@ func jamTodayMidnight() time.Time {
 
 // ========== LIVE (in-memory only; NOT persisted) ==========
 type liveReading struct {
-	BinID     int       `json:"bin_id"`
-	Temp      *float64  `json:"temp_c"`
-	Humidity  *float64  `json:"humidity_pct"`
-	FillLevel *float64  `json:"fill_pct"`
-	DoorOpen  *int      `json:"door_open"`
-	LastSeen  time.Time `json:"-"`
-	LastSeenS string    `json:"last_seen"`
+	BinID      int       `json:"bin_id"`
+	Temp       *float64  `json:"temp_c"`
+	Humidity   *float64  `json:"humidity_pct"`
+	FillLevel  *float64  `json:"fill_pct"`
+	BatteryPct *float64  `json:"battery_pct"`
+	DoorOpen   *int      `json:"door_open"`
+	LastSeen   time.Time `json:"-"`
+	LastSeenS  string    `json:"last_seen"`
 }
 
 var (
@@ -188,7 +189,8 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 			BinID      int      `json:"bin_id"`
 			Temp       *float64 `json:"temp_c"`
 			Humidity   *float64 `json:"humidity_pct"`
-			FillLevel  *float64 `json:"fill_pct"` // <<< ADD
+			FillLevel  *float64 `json:"fill_pct"`
+			BatteryPct *float64 `json:"battery_pct"`
 			DoorOpen   *int     `json:"door_open"`
 			DoorStatus string   `json:"door_status"`
 			LastSeen   string   `json:"last_seen"`
@@ -199,7 +201,8 @@ func handleBinsLiveSSE(w http.ResponseWriter, r *http.Request) {
 				BinID:      lr.BinID,
 				Temp:       lr.Temp,
 				Humidity:   lr.Humidity,
-				FillLevel:  lr.FillLevel, // <<< ADD
+				FillLevel:  lr.FillLevel,
+				BatteryPct: lr.BatteryPct,
 				DoorOpen:   lr.DoorOpen,
 				DoorStatus: doorText(lr.DoorOpen),
 				LastSeen:   lr.LastSeenS,
@@ -634,6 +637,7 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 		ESP32MAC        string   `json:"esp32_mac"`
 		TempC           *float64 `json:"temp_c"`
 		Humidity        *float64 `json:"humidity_pct"`
+		BatteryPct      *float64 `json:"battery_pct"`
 		DoorOpen        *int     `json:"door_open"`
 		DoorStatus      string   `json:"door_status"`
 		DoorStatusCamel string   `json:"doorStatus"`
@@ -678,27 +682,27 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 		if binID.Valid {
 			if lr, ok2 := liveByBin[int(binID.Int64)]; ok2 {
 				if sr.LastSeen == "" {
-					sr.TempC = lr.Temp
-					sr.Humidity = lr.Humidity
-					sr.DoorOpen = lr.DoorOpen
-					sr.DoorStatus = doorText(lr.DoorOpen)
-					sr.DoorStatusCamel = sr.DoorStatus
-					sr.LastSeen = lr.LastSeenS
+sr.TempC = lr.Temp
+sr.Humidity = lr.Humidity
+sr.BatteryPct = lr.BatteryPct
+sr.DoorOpen = lr.DoorOpen
+sr.DoorStatus = doorText(lr.DoorOpen)
+sr.DoorStatusCamel = sr.DoorStatus
+sr.LastSeen = lr.LastSeenS
 					if mac != "" {
 						sr.ESP32MAC = mac
 					}
 				} else {
-					prev, _ := time.Parse(time.RFC3339, sr.LastSeen)
-					if lr.LastSeen.After(prev) {
-						sr.TempC = lr.Temp
-						sr.Humidity = lr.Humidity
-						sr.DoorOpen = lr.DoorOpen
-						sr.DoorStatus = doorText(lr.DoorOpen)
-						sr.DoorStatusCamel = sr.DoorStatus
-						sr.LastSeen = lr.LastSeenS
-						if mac != "" {
-							sr.ESP32MAC = mac
-						}
+					// Always overwrite with latest live reading
+sr.TempC = lr.Temp
+sr.Humidity = lr.Humidity
+sr.BatteryPct = lr.BatteryPct
+sr.DoorOpen = lr.DoorOpen
+sr.DoorStatus = doorText(lr.DoorOpen)
+sr.DoorStatusCamel = sr.DoorStatus
+sr.LastSeen = lr.LastSeenS
+					if mac != "" {
+						sr.ESP32MAC = mac
 					}
 				}
 			}
@@ -889,7 +893,7 @@ type empListRow struct {
 	EmpID    int    `json:"emp_id"`
 	Name     string `json:"name"`
 	DeptID   int    `json:"dept_id"`
-	Dept     string `json:"dept"`
+	Dept     string `json:"department"`
 	IsActive int    `json:"is_active"`
 	PIN      string `json:"pin"`
 	IsHidden int    `json:"is_hidden"`
@@ -1214,9 +1218,9 @@ type createReq struct {
 }
 
 type createResp struct {
-	UUID      string    `json:"uuid"`
-	BinID     int       `json:"bin_id"`
-	ExpiresAt time.Time `json:"expires_at"`
+	UUID      string `json:"uuid"`
+	BinID     int    `json:"bin_id"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
 func handleUUIDCreate(w http.ResponseWriter, r *http.Request) {
@@ -1362,7 +1366,7 @@ VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
 	}
 
 	broadcastActiveUUIDCount()
-	writeJSON(w, createResp{UUID: code, BinID: binID, ExpiresAt: exp})
+	writeJSON(w, createResp{UUID: code, BinID: binID, ExpiresAt: exp.Unix()})
 }
 
 /* ---------- UUID CREATE (via PIN) ---------- */
@@ -1505,8 +1509,9 @@ VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, 0, 'clock_in', 'SESSION')
 /* ---------- CONSUME (BIN CONFIRMATION) ---------- */
 
 type consumeReq struct {
-	BinID int    `json:"bin_id"`
-	UUID  string `json:"uuid"`
+	BinID  int    `json:"bin_id"`
+	UUID   string `json:"uuid"`
+	TagUID string `json:"tag_uid"`
 }
 
 type okResp struct {
@@ -1516,26 +1521,82 @@ type okResp struct {
 func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
-		bad(w, 405, "POST only")
+		writeJSON(w, map[string]any{"ok": false, "error": "METHOD_NOT_ALLOWED"})
 		return
 	}
 
-	var req consumeReq
+	if r.Header.Get("X-API-KEY") != "bin-secret" {
+		writeJSON(w, map[string]any{"ok": false, "error": "UNAUTHORIZED"})
+		return
+	}
+
+	var req struct {
+		BinID  int    `json:"bin_id"`
+		UUID   string `json:"uuid"`
+		TagUID string `json:"tag_uid"`
+	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		bad(w, 400, "bad json")
+		writeJSON(w, map[string]any{"ok": false, "error": "BAD_JSON"})
 		return
 	}
 
-	if req.BinID == 0 || req.UUID == "" {
-		bad(w, 400, "need bin_id and uuid")
+	req.UUID = strings.ToUpper(strings.TrimSpace(req.UUID))
+	req.TagUID = strings.ToUpper(strings.TrimSpace(req.TagUID))
+
+	if req.BinID <= 0 || req.UUID == "" || req.TagUID == "" {
+		writeJSON(w, map[string]any{"ok": false, "error": "MISSING_FIELDS"})
 		return
 	}
 
-	// 🔵 1️⃣ Try employee session first
+	// 🔍 UUID FORMAT CHECK
+	if _, err := uuid.Parse(req.UUID); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": "INVALID_UUID_FORMAT"})
+		return
+	}
+
+	// =========================
+	// 🔷 STEP 1: CHECK BAG STREAM
+	// =========================
+
+	var streamID int
+	err := db.QueryRow(`
+        SELECT waste_stream_id
+        FROM bins
+        WHERE bin_id = ?
+    `, req.BinID).Scan(&streamID)
+
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": "BIN_LOOKUP_FAILED"})
+		return
+	}
+
+	var exists int
+	err = db.QueryRow(`
+        SELECT 1
+        FROM bag_tags
+        WHERE tag_uid = ?
+          AND waste_stream_id = ?
+    `, req.TagUID, streamID).Scan(&exists)
+
+	if err == sql.ErrNoRows {
+		writeJSON(w, map[string]any{"ok": false, "error": "WRONG_STREAM"})
+		return
+	}
+
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": "TAG_VALIDATION_FAILED"})
+		return
+	}
+
+	// =========================
+	// 🔷 STEP 2: EMPLOYEE SESSION
+	// =========================
+
 	var empID int
 	var expiresAt sql.NullTime
 
-	err := db.QueryRow(`
+	err = db.QueryRow(`
         SELECT emp_id, expires_at
         FROM uuid_logs
         WHERE uuid_value = ?
@@ -1547,11 +1608,31 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 
 		if expiresAt.Valid && utcNow().After(expiresAt.Time) {
-			bad(w, 409, "uuid expired")
+			writeJSON(w, map[string]any{"ok": false, "error": "SESSION_EXPIRED"})
 			return
 		}
 
-		_, err = db.Exec(`
+		// 🔒 PREVENT DOUBLE USE
+		var alreadyUsed int
+		_ = db.QueryRow(`
+            SELECT 1 FROM uuid_logs
+            WHERE uuid_value = ?
+              AND action = 'consume'
+            LIMIT 1
+        `, req.UUID).Scan(&alreadyUsed)
+
+		if alreadyUsed == 1 {
+			writeJSON(w, map[string]any{"ok": false, "error": "ALREADY_USED"})
+			return
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": "TX_ERROR"})
+			return
+		}
+
+		_, err = tx.Exec(`
             INSERT INTO uuid_logs (
                 uuid_value,
                 emp_id,
@@ -1565,15 +1646,43 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
         `, req.UUID, empID, req.BinID)
 
 		if err != nil {
-			bad(w, 500, "insert consume failed")
+			tx.Rollback()
+			writeJSON(w, map[string]any{"ok": false, "error": "CONSUME_LOG_FAILED"})
 			return
 		}
 
-		writeJSON(w, okResp{OK: true})
+		_, err = tx.Exec(`
+            UPDATE uuid_logs
+            SET closed_at = UTC_TIMESTAMP()
+            WHERE uuid_value = ?
+              AND action = 'clock_in'
+              AND closed_at IS NULL
+        `, req.UUID)
+
+		if err != nil {
+			tx.Rollback()
+			writeJSON(w, map[string]any{"ok": false, "error": "CLOSE_SESSION_FAILED"})
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": "COMMIT_FAILED"})
+			return
+		}
+
+		broadcastActiveUUIDCount()
+
+		writeJSON(w, map[string]any{
+			"ok":   true,
+			"type": "employee",
+		})
 		return
 	}
 
-	// 🟣 2️⃣ Try manager UUID
+	// =========================
+	// 🔷 STEP 3: MANAGER
+	// =========================
+
 	var managerID int
 
 	err = db.QueryRow(`
@@ -1583,12 +1692,13 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
         WHERE mu.uuid_value = ?
           AND mu.is_revoked = 0
           AND m.is_active = 1
+          AND (mu.expires_at IS NULL OR UTC_TIMESTAMP() < mu.expires_at)
         LIMIT 1
     `, req.UUID).Scan(&managerID)
 
 	if err == nil {
 
-		_, err = db.Exec(`
+		_, err := db.Exec(`
             INSERT INTO uuid_logs (
                 uuid_value,
                 emp_id,
@@ -1598,30 +1708,37 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
                 action,
                 uuid_type
             )
-VALUES (?, NULL, ?, 1, UTC_TIMESTAMP(), 'override', 'CREDENTIAL')
+            VALUES (?, NULL, ?, 1, UTC_TIMESTAMP(), 'override', 'CREDENTIAL')
         `, req.UUID, req.BinID)
 
 		if err != nil {
-			bad(w, 500, "manager insert failed")
+			writeJSON(w, map[string]any{"ok": false, "error": "MANAGER_LOG_FAILED"})
 			return
 		}
 
-		writeJSON(w, okResp{OK: true})
+		writeJSON(w, map[string]any{
+			"ok":   true,
+			"type": "manager",
+		})
 		return
 	}
 
-	// ❌ If neither employee nor manager
-	bad(w, 409, "invalid uuid")
+	// =========================
+	// ❌ FINAL
+	// =========================
+
+	writeJSON(w, map[string]any{"ok": false, "error": "INVALID_UUID"})
 }
 
 /* ---------- TELEMETRY ---------- */
 
 type TelemetryReq struct {
-	BinID     int      `json:"bin_id"`
-	Temp      *float64 `json:"temp"`
-	Humidity  *float64 `json:"humidity"`
-	FillLevel *float64 `json:"fill_pct"`
-	DoorOpen  *int     `json:"door_open"`
+	BinID      int      `json:"bin_id"`
+	Temp       *float64 `json:"temp"`
+	Humidity   *float64 `json:"humidity"`
+	FillLevel  *float64 `json:"fill_pct"`
+	BatteryPct *float64 `json:"battery_pct"`
+	DoorOpen   *int     `json:"door_open"`
 }
 
 func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
@@ -1631,6 +1748,10 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
 		bad(w, 405, "POST only")
+		return
+	}
+	if r.Header.Get("X-API-KEY") != "bin-secret" {
+		bad(w, 401, "unauthorized")
 		return
 	}
 
@@ -1645,19 +1766,20 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[TELEM] bin=%d temp=%v hum=%v door=%v",
-		req.BinID, req.Temp, req.Humidity, req.DoorOpen)
+	log.Printf("[TELEM] bin=%d temp=%v hum=%v fill=%v batt=%v door=%v",
+		req.BinID, req.Temp, req.Humidity, req.FillLevel, req.BatteryPct, req.DoorOpen)
 
 	nowUTC := utcNow()
 
 	lr := liveReading{
-		BinID:     req.BinID,
-		Temp:      req.Temp,
-		Humidity:  req.Humidity,
-		FillLevel: req.FillLevel,
-		DoorOpen:  req.DoorOpen,
-		LastSeen:  nowUTC,
-		LastSeenS: formatLocal(nowUTC),
+		BinID:      req.BinID,
+		Temp:       req.Temp,
+		Humidity:   req.Humidity,
+		FillLevel:  req.FillLevel,
+		BatteryPct: req.BatteryPct,
+		DoorOpen:   req.DoorOpen,
+		LastSeen:   nowUTC,
+		LastSeenS:  formatLocal(nowUTC),
 	}
 
 	liveMu.Lock()
@@ -1671,6 +1793,7 @@ func handleBinTelemetry(w http.ResponseWriter, r *http.Request) {
 			"temp_c":       lr.Temp,
 			"humidity_pct": lr.Humidity,
 			"fill_pct":     lr.FillLevel,
+			"battery_pct":  lr.BatteryPct,
 			"door_open":    lr.DoorOpen,
 			"door_status":  doorText(lr.DoorOpen),
 			"last_seen":    lr.LastSeenS,
@@ -1708,7 +1831,12 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT b.bin_id, b.bin_name, b.location, ws.code
+		SELECT 
+    b.bin_id, 
+    b.bin_name, 
+    b.location, 
+    ws.code,
+    ws.name
 		FROM bins b
 		JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
 		ORDER BY b.bin_name
@@ -1727,6 +1855,7 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 		Temp            *float64 `json:"temp_c"`
 		Humidity        *float64 `json:"humidity_pct"`
 		FillLevel       *float64 `json:"fill_pct"`
+		BatteryPct      *float64 `json:"battery_pct"`
 		DoorOpen        *int     `json:"door_open"`
 		DoorStatus      string   `json:"door_status"`
 		DoorStatusCamel string   `json:"doorStatus"`
@@ -1738,8 +1867,8 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 	var out []outRow
 	for rows.Next() {
 		var id int
-		var name, loc, code string
-		if err := rows.Scan(&id, &name, &loc, &code); err != nil {
+		var name, loc, code, streamName string
+		if err := rows.Scan(&id, &name, &loc, &code, &streamName); err != nil {
 			continue
 		}
 
@@ -1752,7 +1881,8 @@ func handleBinsLiveJSON(w http.ResponseWriter, r *http.Request) {
 		if lr, ok := liveByBin[id]; ok {
 			row.Temp = lr.Temp
 			row.Humidity = lr.Humidity
-			row.FillLevel = lr.FillLevel // <<< ADD THIS
+			row.FillLevel = lr.FillLevel
+			row.BatteryPct = lr.BatteryPct
 			row.DoorOpen = lr.DoorOpen
 			row.DoorStatus = doorText(lr.DoorOpen)
 			row.DoorStatusCamel = row.DoorStatus
@@ -1779,21 +1909,23 @@ func handleBinsLivePeek(w http.ResponseWriter, r *http.Request) {
 	defer liveMu.RUnlock()
 
 	type row struct {
-		BinID int      `json:"bin_id"`
-		Temp  *float64 `json:"temp_c"`
-		Hum   *float64 `json:"humidity_pct"`
-		Door  *int     `json:"door_open"`
-		Seen  string   `json:"last_seen"`
+		BinID      int      `json:"bin_id"`
+		Temp       *float64 `json:"temp_c"`
+		Hum        *float64 `json:"humidity_pct"`
+		BatteryPct *float64 `json:"battery_pct"`
+		Door       *int     `json:"door_open"`
+		Seen       string   `json:"last_seen"`
 	}
 
 	var out []row
 	for _, lr := range liveByBin {
 		out = append(out, row{
-			BinID: lr.BinID,
-			Temp:  lr.Temp,
-			Hum:   lr.Humidity,
-			Door:  lr.DoorOpen,
-			Seen:  lr.LastSeenS,
+			BinID:      lr.BinID,
+			Temp:       lr.Temp,
+			Hum:        lr.Humidity,
+			BatteryPct: lr.BatteryPct,
+			Door:       lr.DoorOpen,
+			Seen:       lr.LastSeenS,
 		})
 	}
 
@@ -1949,16 +2081,8 @@ SELECT
 
     IFNULL(b.bin_name, ''),
 
-IFNULL(
-ul.generated_at,
-  ''
-),
-
-IFNULL(
-ul.generated_at,
-    ''
-)
-
+IFNULL(ul.generated_at, ''),
+IFNULL(ul.expires_at, '')
 FROM uuid_logs ul
 LEFT JOIN employees e   ON e.emp_id  = ul.emp_id
 LEFT JOIN departments d ON d.dept_id = e.dept_id
@@ -2190,16 +2314,8 @@ IFNULL(
 IFNULL(b.bin_name,''),
 
 ul.generated_at,
-
-    IFNULL(
-ul.generated_at,
-        ''
-    ),
-
-    IFNULL(
-ul.generated_at,
-        ''
-    )
+ul.used_at,
+ul.expires_at
 
 FROM uuid_logs ul
 
@@ -2242,7 +2358,7 @@ LIMIT 5000
 	for rows.Next() {
 
 		var uuidVal, action, uuidType, name, dept, binName string
-		var eventTime, usedAt, expiresAt string
+		var eventTime, usedAt, expiresAt sql.NullTime
 
 		if err := rows.Scan(
 			&uuidVal,
@@ -2255,8 +2371,22 @@ LIMIT 5000
 			&usedAt,
 			&expiresAt,
 		); err != nil {
-			bad(w, 500, "scan")
+			log.Println("EXPORT SCAN ERROR:", err)
 			return
+		}
+
+		eventTimeStr := ""
+		usedAtStr := ""
+		expiresAtStr := ""
+
+		if eventTime.Valid {
+			eventTimeStr = formatLocal(eventTime.Time)
+		}
+		if usedAt.Valid {
+			usedAtStr = formatLocal(usedAt.Time)
+		}
+		if expiresAt.Valid {
+			expiresAtStr = formatLocal(expiresAt.Time)
 		}
 
 		role := "🔵 EMP"
@@ -2273,9 +2403,9 @@ LIMIT 5000
 			name,
 			dept,
 			binName,
-			eventTime,
-			usedAt,
-			expiresAt,
+			eventTimeStr,
+			usedAtStr,
+			expiresAtStr,
 		})
 	}
 }
@@ -2372,6 +2502,7 @@ type binAdminRow struct {
 	Location   string `json:"location"`
 	StreamCode string `json:"stream_code"`
 	StreamName string `json:"stream_name"`
+	ESP32MAC   string `json:"esp32_mac"`
 }
 
 func handleBinsAdminJSON(w http.ResponseWriter, r *http.Request) {
@@ -2384,12 +2515,13 @@ func handleBinsAdminJSON(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT
-			b.bin_id,
-			b.bin_name,
-			COALESCE(b.location,'') AS location,
-			ws.code,
-			ws.name
+    SELECT
+        b.bin_id,
+        b.bin_name,
+        COALESCE(b.location,'') AS location,
+        ws.code,
+        ws.name,
+        COALESCE(b.esp32_mac,'')   
 		FROM bins b
 		JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
 		ORDER BY b.bin_id DESC
@@ -2403,7 +2535,7 @@ func handleBinsAdminJSON(w http.ResponseWriter, r *http.Request) {
 	out := []binAdminRow{}
 	for rows.Next() {
 		var rr binAdminRow
-		if err := rows.Scan(&rr.BinID, &rr.BinName, &rr.Location, &rr.StreamCode, &rr.StreamName); err != nil {
+		if err := rows.Scan(&rr.BinID, &rr.BinName, &rr.Location, &rr.StreamCode, &rr.StreamName, &rr.ESP32MAC); err != nil {
 			bad(w, 500, "scan")
 			return
 		}
@@ -3265,6 +3397,12 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
+
+	if r.Header.Get("X-API-KEY") != "bin-secret" {
+		bad(w, 401, "unauthorized")
+		return
+	}
+
 	if allowCORS(w, r) {
 		return
 	}
@@ -3317,30 +3455,58 @@ func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3️⃣ Active sessions
-	sRows, _ := db.Query(`
-		SELECT uuid_value
-		FROM uuid_logs
-		WHERE action = 'clock_in'
-		  AND closed_at IS NULL
-		  AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
-	`)
+	type sessionObj struct {
+		UUID      string `json:"uuid"`
+		ExpiresAt int64  `json:"expires_at"`
+	}
+
+	var sessions []sessionObj
+
+	sRows, err := db.Query(`
+    SELECT uuid_value, expires_at
+    FROM uuid_logs
+    WHERE action = 'clock_in'
+      AND closed_at IS NULL
+      AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
+      AND (bin_id = ? OR bin_id IS NULL)
+`, binID)
+	if err != nil {
+		bad(w, 500, "db error")
+		return
+	}
 	defer sRows.Close()
 
-	var sessions []string
 	for sRows.Next() {
 		var u string
-		if err := sRows.Scan(&u); err == nil {
-			sessions = append(sessions, strings.ToUpper(u))
+		var exp sql.NullTime
+
+		if err := sRows.Scan(&u, &exp); err == nil {
+
+			obj := sessionObj{
+				UUID: strings.ToUpper(u),
+			}
+
+			if exp.Valid {
+				obj.ExpiresAt = exp.Time.Unix()
+			} else {
+				obj.ExpiresAt = 0
+			}
+
+			sessions = append(sessions, obj)
 		}
 	}
 
-	// 4️⃣ Manager UUIDs
-	mRows, _ := db.Query(`
-		SELECT uuid_value
-		FROM manager_uuids
-		WHERE is_revoked = 0
-		  AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
-	`)
+	//4️⃣ Manager UUIDs
+	mRows, err := db.Query(`
+    SELECT uuid_value
+    FROM manager_uuids
+    WHERE is_revoked = 0
+      AND (expires_at IS NULL OR UTC_TIMESTAMP() < expires_at)
+`)
+	if err != nil {
+		bad(w, 500, "db error")
+		return
+	}
 	defer mRows.Close()
 
 	var managers []string
@@ -3352,7 +3518,7 @@ func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sessions == nil {
-		sessions = []string{}
+		sessions = []sessionObj{}
 	}
 
 	if tags == nil {
@@ -3363,10 +3529,85 @@ func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
 		managers = []string{}
 	}
 
+	allowedTagMap := map[string]bool{}
+	for _, t := range tags {
+		allowedTagMap[t] = true
+	}
+
+	sessionMap := map[string]int64{}
+	for _, s := range sessions {
+		sessionMap[s.UUID] = s.ExpiresAt
+	}
+
+	managerMap := map[string]bool{}
+	for _, m := range managers {
+		managerMap[m] = true
+	}
+
 	writeJSON(w, map[string]any{
 		"allowed_tags":    tags,
+		"allowed_tag_map": allowedTagMap,
 		"active_sessions": sessions,
+		"session_map":     sessionMap,
 		"manager_uuids":   managers,
+		"manager_map":     managerMap,
+		"stream_id":       streamID,
+	})
+}
+func handleCreateBin(w http.ResponseWriter, r *http.Request) {
+	if allowCORS(w, r) {
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req struct {
+		BinName       string `json:"bin_name"`
+		Location      string `json:"location"`
+		Esp32MAC      string `json:"esp32_mac"`
+		WasteStreamID int    `json:"waste_stream_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+	log.Printf("CREATE BIN raw: name=%q location=%q mac=%q stream=%d", req.BinName, req.Location, req.Esp32MAC, req.WasteStreamID)
+
+	req.BinName = strings.TrimSpace(req.BinName)
+	req.Location = strings.TrimSpace(req.Location)
+	req.Esp32MAC = strings.TrimSpace(req.Esp32MAC)
+
+	if req.BinName == "" || req.Location == "" || req.Esp32MAC == "" || req.WasteStreamID == 0 {
+		bad(w, 400, "missing fields")
+		return
+	}
+
+	// 🔥 TEMP DEFAULT STREAM (so insert doesn't fail)
+	var streamID int
+	err := db.QueryRow(`
+		SELECT waste_stream_id FROM waste_streams LIMIT 1
+	`).Scan(&streamID)
+
+	if err != nil {
+		bad(w, 500, "no waste streams configured")
+		return
+	}
+
+	_, err = db.Exec(`
+INSERT INTO bins (bin_name, location, esp32_mac, waste_stream_id)
+VALUES (?, ?, ?, ?)
+`, req.BinName, req.Location, req.Esp32MAC, req.WasteStreamID)
+
+	if err != nil {
+		bad(w, 500, err.Error())
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"ok": true,
 	})
 }
 
@@ -3399,6 +3640,7 @@ func main() {
 	http.HandleFunc("/admin/chart.json", handleAdminChartJSON)
 	http.HandleFunc("/admin/export.csv", handleAdminExport)
 	http.HandleFunc("/admin/bins.json", handleBinsAdminJSON)
+	http.HandleFunc("/admin/bins", handleCreateBin)
 	http.HandleFunc("/admin/bag-tags.json", handleBagTags)
 	http.HandleFunc("/admin/bag-tags/delete", handleBagTagDelete)
 	http.HandleFunc("/admin/bag-tags", handleBagTags)
@@ -3458,6 +3700,8 @@ func main() {
 	http.HandleFunc("/static/live.js", handleLiveJS)
 	http.HandleFunc("/generate_uuid", handleGenerateUUID)
 
-	fmt.Println("🚀 Server running at http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	fmt.Println("🚀 Server running at http://0.0.0.0:8080")
+	fmt.Println("✅ Router DNS host: http://waste:8080")
+
+	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 }
