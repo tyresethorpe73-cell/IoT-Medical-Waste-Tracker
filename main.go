@@ -682,25 +682,25 @@ func handleBinsSummary(w http.ResponseWriter, r *http.Request) {
 		if binID.Valid {
 			if lr, ok2 := liveByBin[int(binID.Int64)]; ok2 {
 				if sr.LastSeen == "" {
-sr.TempC = lr.Temp
-sr.Humidity = lr.Humidity
-sr.BatteryPct = lr.BatteryPct
-sr.DoorOpen = lr.DoorOpen
-sr.DoorStatus = doorText(lr.DoorOpen)
-sr.DoorStatusCamel = sr.DoorStatus
-sr.LastSeen = lr.LastSeenS
+					sr.TempC = lr.Temp
+					sr.Humidity = lr.Humidity
+					sr.BatteryPct = lr.BatteryPct
+					sr.DoorOpen = lr.DoorOpen
+					sr.DoorStatus = doorText(lr.DoorOpen)
+					sr.DoorStatusCamel = sr.DoorStatus
+					sr.LastSeen = lr.LastSeenS
 					if mac != "" {
 						sr.ESP32MAC = mac
 					}
 				} else {
 					// Always overwrite with latest live reading
-sr.TempC = lr.Temp
-sr.Humidity = lr.Humidity
-sr.BatteryPct = lr.BatteryPct
-sr.DoorOpen = lr.DoorOpen
-sr.DoorStatus = doorText(lr.DoorOpen)
-sr.DoorStatusCamel = sr.DoorStatus
-sr.LastSeen = lr.LastSeenS
+					sr.TempC = lr.Temp
+					sr.Humidity = lr.Humidity
+					sr.BatteryPct = lr.BatteryPct
+					sr.DoorOpen = lr.DoorOpen
+					sr.DoorStatus = doorText(lr.DoorOpen)
+					sr.DoorStatusCamel = sr.DoorStatus
+					sr.LastSeen = lr.LastSeenS
 					if mac != "" {
 						sr.ESP32MAC = mac
 					}
@@ -3218,13 +3218,30 @@ func handleManagerUUIDList(w http.ResponseWriter, r *http.Request) {
 
 		rows.Scan(&uuid, &created, &expires, &revoked, &isRevoked)
 
-		uuids = append(uuids, map[string]interface{}{
+		row := map[string]interface{}{
 			"uuid_value": uuid,
-			"created_at": created.Time,
-			"expires_at": expires.Time,
-			"revoked_at": revoked.Time,
 			"is_revoked": isRevoked,
-		})
+		}
+
+		if created.Valid {
+			row["created_at"] = created.Time
+		} else {
+			row["created_at"] = nil
+		}
+
+		if expires.Valid {
+			row["expires_at"] = expires.Time
+		} else {
+			row["expires_at"] = nil
+		}
+
+		if revoked.Valid {
+			row["revoked_at"] = revoked.Time
+		} else {
+			row["revoked_at"] = nil
+		}
+
+		uuids = append(uuids, row)
 	}
 
 	// ✅ FINAL RESPONSE
