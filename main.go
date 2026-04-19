@@ -1543,6 +1543,9 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 
 	req.UUID = strings.ToUpper(strings.TrimSpace(req.UUID))
 	req.TagUID = strings.ToUpper(strings.TrimSpace(req.TagUID))
+	log.Printf("BIN_CONSUME DEBUG -> bin=%d uuid=%s tag_uid=%q", req.BinID, req.UUID, req.TagUID)
+
+	var err error
 
 	if req.BinID <= 0 || req.UUID == "" || req.TagUID == "" {
 		writeJSON(w, map[string]any{"ok": false, "error": "MISSING_FIELDS"})
@@ -1558,35 +1561,38 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 	// =========================
 	// 🔷 STEP 1: CHECK BAG STREAM
 	// =========================
+	// Skip bag-tag validation for manager override requests
+	if req.TagUID != "MANAGER_OVERRIDE" {
 
-	var streamID int
-	err := db.QueryRow(`
+		var streamID int
+		err = db.QueryRow(`
         SELECT waste_stream_id
         FROM bins
         WHERE bin_id = ?
     `, req.BinID).Scan(&streamID)
 
-	if err != nil {
-		writeJSON(w, map[string]any{"ok": false, "error": "BIN_LOOKUP_FAILED"})
-		return
-	}
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": "BIN_LOOKUP_FAILED"})
+			return
+		}
 
-	var exists int
-	err = db.QueryRow(`
-        SELECT 1
-        FROM bag_tags
-        WHERE tag_uid = ?
-          AND waste_stream_id = ?
-    `, req.TagUID, streamID).Scan(&exists)
+		var exists int
+		err = db.QueryRow(`
+	        SELECT 1
+	        FROM bag_tags
+	        WHERE tag_uid = ?
+	          AND waste_stream_id = ?
+	    `, req.TagUID, streamID).Scan(&exists)
 
-	if err == sql.ErrNoRows {
-		writeJSON(w, map[string]any{"ok": false, "error": "WRONG_STREAM"})
-		return
-	}
+		if err == sql.ErrNoRows {
+			writeJSON(w, map[string]any{"ok": false, "error": "WRONG_STREAM"})
+			return
+		}
 
-	if err != nil {
-		writeJSON(w, map[string]any{"ok": false, "error": "TAG_VALIDATION_FAILED"})
-		return
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": "TAG_VALIDATION_FAILED"})
+			return
+		}
 	}
 
 	// =========================
@@ -2025,7 +2031,7 @@ func formatActionLabel(action string) string {
 	case "clock_out":
 		return "Shift Ended"
 	case "override":
-		return "Manager Disposal Authorized"
+		return "Manager Opened Bin"
 	default:
 		return action
 	}
@@ -2200,7 +2206,7 @@ ul.generated_at
     ELSE IFNULL(d.dept_name, '')
   END AS department_name,
 
-  IFNULL(b.bin_name,''),
+  IFNULL(ws.code,''),
 
   IFNULL(
     DATE_FORMAT(
@@ -2217,6 +2223,7 @@ LEFT JOIN manager_uuids mu ON mu.uuid_value = ul.uuid_value
 LEFT JOIN managers m ON m.manager_id = mu.manager_id
 LEFT JOIN departments md ON md.dept_id = m.dept_id
 LEFT JOIN bins b ON b.bin_id = ul.bin_id
+LEFT JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
 
 ` + where + `
 ORDER BY ul.uuid_id DESC
@@ -2311,7 +2318,7 @@ IFNULL(
   ''
 ) AS department_name,
 
-IFNULL(b.bin_name,''),
+IFNULL(ws.code,''),
 
 ul.generated_at,
 ul.used_at,
@@ -2327,10 +2334,11 @@ LEFT JOIN managers m ON m.manager_id = mu.manager_id
 LEFT JOIN departments md ON md.dept_id = m.dept_id
 
 LEFT JOIN bins b ON b.bin_id = ul.bin_id
+LEFT JOIN waste_streams ws ON ws.waste_stream_id = b.waste_stream_id
 
 ` + where + `
 ORDER BY ul.uuid_id DESC
-LIMIT 5000
+LIMIT ?
 `
 
 	rows, err := db.Query(q, args...)
