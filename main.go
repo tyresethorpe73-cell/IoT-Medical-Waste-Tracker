@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"embed"
 	"encoding/csv"
@@ -17,6 +18,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
+	"github.com/xuri/excelize/v2"
 )
 
 // --- embed templates ---
@@ -2674,13 +2676,9 @@ LIMIT ?
 	}
 }
 
-/* ---------- EXPORT EXCEL WITH COLORS ---------- */
+/* ---------- EXPORT REAL EXCEL XLSX WITH COLORS ---------- */
 
 func handleAdminExportXLS(w http.ResponseWriter, r *http.Request) {
-
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "application/vnd.ms-excel; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="UHWI_UUID_logs_colored.xls"`)
 
 	where, args := buildFilters(r)
 
@@ -2740,60 +2738,153 @@ LIMIT ?
 
 	rows, err := db.Query(q, args...)
 	if err != nil {
-		log.Println("EXPORT XLS QUERY ERROR:", err)
+		log.Println("EXPORT XLSX QUERY ERROR:", err)
 		bad(w, 500, err.Error())
 		return
 	}
 	defer rows.Close()
 
-	fmt.Fprint(w, `
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  body {
-    font-family: Arial, sans-serif;
-  }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-  }
-  th {
-    background: #0f172a;
-    color: #ffffff;
-    font-weight: bold;
-    border: 1px solid #94a3b8;
-    padding: 8px;
-    text-align: left;
-  }
-  td {
-    border: 1px solid #cbd5e1;
-    padding: 7px;
-    mso-number-format:"\@";
-  }
-  .uuid {
-    font-family: Consolas, monospace;
-  }
-</style>
-</head>
-<body>
-<h2>UHWI UUID Logs</h2>
-<table>
-<thead>
-<tr>
-  <th>uuid</th>
-  <th>activity</th>
-  <th>role</th>
-  <th>name</th>
-  <th>department</th>
-  <th>bin</th>
-  <th>event_time</th>
-  <th>used_at</th>
-  <th>expires_at</th>
-</tr>
-</thead>
-<tbody>
-`)
+	f := excelize.NewFile()
+	defer f.Close()
+
+	sheet := "UUID Logs"
+	defaultSheet := f.GetSheetName(0)
+	_ = f.SetSheetName(defaultSheet, sheet)
+
+	headers := []string{
+		"uuid",
+		"activity",
+		"role",
+		"name",
+		"department",
+		"bin",
+		"event_time",
+		"used_at",
+		"expires_at",
+	}
+
+	headerStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{
+			Bold:  true,
+			Color: "FFFFFF",
+		},
+		Fill: excelize.Fill{
+			Type:    "pattern",
+			Color:   []string{"0F172A"},
+			Pattern: 1,
+		},
+		Alignment: &excelize.Alignment{
+			Horizontal: "left",
+			Vertical:   "center",
+		},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	normalStyle, _ := f.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{
+			Horizontal: "left",
+			Vertical:   "center",
+		},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	empStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{
+			Bold:  true,
+			Color: "1D4ED8",
+		},
+		Fill: excelize.Fill{
+			Type:    "pattern",
+			Color:   []string{"DBEAFE"},
+			Pattern: 1,
+		},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	mgrStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{
+			Bold:  true,
+			Color: "7E22CE",
+		},
+		Fill: excelize.Fill{
+			Type:    "pattern",
+			Color:   []string{"F3E8FF"},
+			Pattern: 1,
+		},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	clockInStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true, Color: "92400E"},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"FEF3C7"}, Pattern: 1},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	consumeStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true, Color: "B91C1C"},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"FEE2E2"}, Pattern: 1},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	clockOutStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true, Color: "166534"},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"DCFCE7"}, Pattern: 1},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	overrideStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true, Color: "7E22CE"},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"F3E8FF"}, Pattern: 1},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+
+	for i, h := range headers {
+		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+		_ = f.SetCellValue(sheet, cell, h)
+	}
+	_ = f.SetCellStyle(sheet, "A1", "I1", headerStyle)
+
+	rowNum := 2
 
 	for rows.Next() {
 
@@ -2811,7 +2902,8 @@ LIMIT ?
 			&usedAt,
 			&expiresAt,
 		); err != nil {
-			log.Println("EXPORT XLS SCAN ERROR:", err)
+			log.Println("EXPORT XLSX SCAN ERROR:", err)
+			bad(w, 500, "export scan error")
 			return
 		}
 
@@ -2829,42 +2921,79 @@ LIMIT ?
 			expiresAtStr = formatExcelTime(expiresAt.Time)
 		}
 
-		activityLabel := formatActionLabel(action)
 		roleText := excelRoleText(uuidType)
+		activityLabel := formatActionLabel(action)
 
-		fmt.Fprintf(w, `
-<tr>
-  <td class="uuid">%s</td>
-  <td style="%s">%s</td>
-  <td style="%s">%s</td>
-  <td>%s</td>
-  <td>%s</td>
-  <td>%s</td>
-  <td>%s</td>
-  <td>%s</td>
-  <td>%s</td>
-</tr>
-`,
-			template.HTMLEscapeString(uuidVal),
-			excelActivityStyle(action),
-			template.HTMLEscapeString(activityLabel),
-			excelRoleStyle(uuidType),
-			template.HTMLEscapeString(roleText),
-			template.HTMLEscapeString(name),
-			template.HTMLEscapeString(dept),
-			template.HTMLEscapeString(binName),
-			template.HTMLEscapeString(eventTimeStr),
-			template.HTMLEscapeString(usedAtStr),
-			template.HTMLEscapeString(expiresAtStr),
-		)
+		values := []string{
+			uuidVal,
+			activityLabel,
+			roleText,
+			name,
+			dept,
+			binName,
+			eventTimeStr,
+			usedAtStr,
+			expiresAtStr,
+		}
+
+		for col, val := range values {
+			cell, _ := excelize.CoordinatesToCellName(col+1, rowNum)
+			_ = f.SetCellStr(sheet, cell, val)
+			_ = f.SetCellStyle(sheet, cell, cell, normalStyle)
+		}
+
+		activityCell, _ := excelize.CoordinatesToCellName(2, rowNum)
+		roleCell, _ := excelize.CoordinatesToCellName(3, rowNum)
+
+		switch action {
+		case "clock_in":
+			_ = f.SetCellStyle(sheet, activityCell, activityCell, clockInStyle)
+		case "consume":
+			_ = f.SetCellStyle(sheet, activityCell, activityCell, consumeStyle)
+		case "clock_out":
+			_ = f.SetCellStyle(sheet, activityCell, activityCell, clockOutStyle)
+		case "override":
+			_ = f.SetCellStyle(sheet, activityCell, activityCell, overrideStyle)
+		}
+
+		if uuidType == "CREDENTIAL" {
+			_ = f.SetCellStyle(sheet, roleCell, roleCell, mgrStyle)
+		} else {
+			_ = f.SetCellStyle(sheet, roleCell, roleCell, empStyle)
+		}
+
+		rowNum++
 	}
 
-	fmt.Fprint(w, `
-</tbody>
-</table>
-</body>
-</html>
-`)
+	_ = f.SetColWidth(sheet, "A", "A", 42)
+	_ = f.SetColWidth(sheet, "B", "B", 20)
+	_ = f.SetColWidth(sheet, "C", "C", 12)
+	_ = f.SetColWidth(sheet, "D", "D", 22)
+	_ = f.SetColWidth(sheet, "E", "E", 18)
+	_ = f.SetColWidth(sheet, "F", "F", 12)
+	_ = f.SetColWidth(sheet, "G", "I", 22)
+
+	_ = f.SetPanes(sheet, &excelize.Panes{
+		Freeze:      true,
+		Split:       false,
+		XSplit:      0,
+		YSplit:      1,
+		TopLeftCell: "A2",
+		ActivePane:  "bottomLeft",
+	})
+
+	var buf bytes.Buffer
+	if err := f.Write(&buf); err != nil {
+		log.Println("EXPORT XLSX WRITE ERROR:", err)
+		bad(w, 500, "failed to build excel file")
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", `attachment; filename="UHWI_UUID_logs_colored.xlsx"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
 }
 
 /* ---------- CHART DATA (BAR GRAPH: generated/used/expired) ---------- */
@@ -4157,7 +4286,7 @@ func main() {
 	http.HandleFunc("/admin/recent.json", handleAdminRecentJSON)
 	http.HandleFunc("/admin/chart.json", handleAdminChartJSON)
 	http.HandleFunc("/admin/export.csv", handleAdminExport)
-	http.HandleFunc("/admin/export.xls", handleAdminExportXLS)
+	http.HandleFunc("/admin/export.xlsx", handleAdminExportXLS)
 	http.HandleFunc("/admin/bins.json", handleBinsAdminJSON)
 	http.HandleFunc("/admin/bins", handleCreateBin)
 	http.HandleFunc("/admin/bag-tags.json", handleBagTags)

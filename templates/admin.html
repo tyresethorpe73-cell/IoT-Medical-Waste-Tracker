@@ -563,7 +563,7 @@ dialog{
 
         <div class="actions">
           <button type="submit" class="button btn-primary">Apply</button>
-          <a id="exportBtn" class="button btn-secondary" href="/admin/export.csv">Export CSV</a>
+         <a id="exportBtn" class="button btn-secondary" href="/admin/export.xlsx">Export Excel</a>
         </div>
       </form>
     </section>
@@ -608,7 +608,7 @@ dialog{
         </div>
 
         <div>
-          <a id="exportLink" class="button btn-secondary" href="/admin/export.csv">Export CSV</a>
+        <a id="exportLink" class="button btn-secondary" href="/admin/export.xlsx">Export Excel</a>
         </div>
       </div>
 
@@ -1172,12 +1172,27 @@ loadHiddenEmployees();
 function formatLocal(ts){
   if (!ts || ts === "0000-00-00 00:00:00") return "—";
 
+  // Backend already sends Jamaica/server local time.
+  // Do not let JavaScript shift it by timezone conversion.
+  if (/^\d{4}-\d{2}-\d{2}/.test(ts)) {
+    const [datePartRaw, timePartRaw] = ts.split(" ");
+    if (!datePartRaw || !timePartRaw) return ts;
+
+    const [y, m, d] = datePartRaw.split("-");
+    const [hh, mm, ssRaw] = timePartRaw.split(":");
+
+    let hour = parseInt(hh, 10);
+    const suffix = hour >= 12 ? "PM" : "AM";
+    hour = hour % 12;
+    if (hour === 0) hour = 12;
+
+    const ss = ssRaw || "00";
+
+    return `${m}/${d}/${y}<br>${hour}:${mm}:${ss} ${suffix}`;
+  }
+
   const d = new Date(ts);
-
-  const datePart = d.toLocaleDateString();
-  const timePart = d.toLocaleTimeString();
-
-  return `${datePart}<br>${timePart}`;
+  return `${d.toLocaleDateString()}<br>${d.toLocaleTimeString()}`;
 }
     /* ===== DOM Helpers ===== */
     const $  = (sel, root=document) => root.querySelector(sel);
@@ -1266,7 +1281,7 @@ function toast(msg, timeout = 2400){
 
 function setExportHref(){
   const qs = formQS();
-  const url = "/admin/export.csv" + (qs ? ("?" + qs) : "");
+  const url = "/admin/export.xlsx" + (qs ? ("?" + qs) : "");
   if (exportBtn)  exportBtn.href  = url;
   if (exportLink) exportLink.href = url;
 }
@@ -1291,7 +1306,9 @@ async function refreshChart(){
     if (dept) qs.set("dept", dept);
     if (days) qs.set("days", days);
 
-const resp = await fetch('/admin/chart.json', {cache:"no-store"});
+const chartUrl = "/admin/chart.json" + (qs.toString() ? "?" + qs.toString() : "");
+const resp = await fetch(chartUrl, { cache: "no-store" });
+
     const data = await resp.json();
 
 const canvas = document.getElementById("usageChart");
