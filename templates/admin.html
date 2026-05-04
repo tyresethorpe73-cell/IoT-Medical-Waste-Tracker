@@ -491,6 +491,7 @@ dialog{
   justify-content: center;
   border-bottom: none;
   cursor: move;
+  touch-action: none;
 }
 
 .smart-alert-dock.minimized .smart-alert-title,
@@ -533,6 +534,8 @@ dialog{
   border-bottom: 1px solid rgba(255,255,255,.10);
   cursor: move;
   user-select: none;
+  touch-action: none;
+  -webkit-user-select: none;
 }
 
 .smart-alert-title{
@@ -1404,6 +1407,35 @@ loadHiddenEmployees();
     toast("Failed to restore employee");
   }
 };
+window.deleteEmployeePermanent = async function(id){
+
+  if (!confirm("Permanently delete this employee from the system? This will close any active UUID sessions.")) {
+    return;
+  }
+
+  try{
+    const res = await fetch("/employees/delete", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ emp_id: id })
+    });
+
+    const text = await res.text();
+    let out;
+    try { out = JSON.parse(text); } catch { out = { error: text }; }
+
+    if (!res.ok) {
+      toast(out.error || text || "Failed to delete employee");
+      return;
+    }
+
+    toast("Employee permanently deleted");
+    loadHiddenEmployees();
+
+  } catch {
+    toast("Network error while deleting employee");
+  }
+};
 
 
 
@@ -2034,12 +2066,31 @@ async function loadEmployees(){
 
   const tbody = document.querySelector("#empTable tbody");
   const status = document.getElementById("empListStatus");
+  const empTableHead = document.querySelector("#empTable thead");
+  const btn = document.querySelector('.btn-view-hidden');
+
+  if (btn) btn.textContent = "View Hidden";
+
+  if (empTableHead){
+    empTableHead.innerHTML = `
+      <tr>
+        <th>Name</th>
+        <th>Department</th>
+        <th>Emp ID</th>
+        <th>Dept ID</th>
+        <th>PIN</th>
+        <th>Status</th>
+        <th>UUID</th>
+        <th>Actions</th>
+      </tr>
+    `;
+  }
 
   tbody.innerHTML = "";
   status.textContent = "Loading...";
 
   try{
-    const res = await fetch("/employees");
+    const res = await fetch("/employees", { cache: "no-store" });
     const data = await res.json();
 
     if (!res.ok){
@@ -2054,7 +2105,7 @@ async function loadEmployees(){
       return;
     }
 
-    status.textContent = "";
+    status.textContent = `${list.length} employees`;
 
     tbody.innerHTML = list.map(emp => {
 
@@ -2071,7 +2122,7 @@ async function loadEmployees(){
             <span id="emp-pin-${emp.emp_id}" data-pin="${emp.pin}">
               •••••
             </span>
-           <button class="btn" onclick="toggleEmployeePin(${emp.emp_id})">👁</button>
+            <button class="btn" onclick="toggleEmployeePin(${emp.emp_id})">👁</button>
           </td>
 
           <td>
@@ -2083,14 +2134,21 @@ async function loadEmployees(){
           </td>
 
           <td>
-  <button class="btn" onclick="openEmployeeUUIDs(${emp.emp_id})">
-    View
-  </button>
-</td>
+            <button class="btn" onclick="openEmployeeUUIDs(${emp.emp_id})">
+              View
+            </button>
+          </td>
 
 <td>
-  <button class="btn" onclick="openEmployeeChangePin(${emp.emp_id})">🔑</button>
-  <button class="btn delete" onclick="hideEmployee(${emp.emp_id})">🗑️</button>
+  <button class="btn" title="Change PIN"
+    onclick="openEmployeeChangePin(${emp.emp_id})">
+    🔑
+  </button>
+
+  <button class="btn" title="Move employee to hidden list"
+    onclick="hideEmployee(${emp.emp_id})">
+    🙈
+  </button>
 </td>
         </tr>
       `;
@@ -2104,99 +2162,104 @@ async function loadEmployees(){
 
 window.loadHiddenEmployees = async function() {
 
-  console.log("🔥 BUTTON CLICKED");
-
-  const btn = document.querySelector('.btn-view-hidden');
+  const btn = document.querySelector(".btn-view-hidden");
   const tbody = document.querySelector("#empTable tbody");
   const status = document.getElementById("empListStatus");
+  const empTableHead = document.querySelector("#empTable thead");
 
-  if (!tbody){
-    console.error("❌ TABLE NOT FOUND");
+  if (!tbody || !status) {
+    console.error("Employee table/status not found");
     return;
   }
 
-  const isShowingHidden = btn && btn.textContent.includes("Active");
-  const endpoint = isShowingHidden ? "/employees" : "/employees/hidden";
+  // If we are already viewing hidden employees, this button should return to active employees.
+  if (btn && btn.textContent.trim() === "View Active Employees") {
+    loadEmployees();
+    return;
+  }
+
+  // Otherwise, load hidden employees.
+  if (btn) btn.textContent = "View Active Employees";
+
+  if (empTableHead){
+    empTableHead.innerHTML = `
+      <tr>
+        <th>Name</th>
+        <th>Department</th>
+        <th>Emp ID</th>
+        <th>Dept ID</th>
+        <th>PIN</th>
+        <th>UUID</th>
+        <th>Actions</th>
+      </tr>
+    `;
+  }
+
+  tbody.innerHTML = "";
+  status.textContent = "Loading hidden employees...";
 
   try {
-    const res = await fetch(endpoint);
-
-    console.log("STATUS:", res.status);
-
+    const res = await fetch("/employees/hidden", { cache: "no-store" });
     const data = await res.json();
-    console.log("DATA:", data);
 
-    const list = data.employees || [];
-
-    tbody.innerHTML = "";
-
-    if (!list.length){
-      status.textContent = "No employees found";
+    if (!res.ok){
+      status.textContent = "Failed to load hidden employees";
       return;
     }
 
-    status.textContent = `${list.length} employees`;
+    const list = data.employees || [];
 
-tbody.innerHTML = list.map(emp => {
+    if (!list.length){
+      status.textContent = "No hidden employees found";
+      tbody.innerHTML = "";
+      return;
+    }
 
-  const active = emp.is_active === 1 ? "checked" : "";
+    status.textContent = `${list.length} hidden employees`;
 
-  return `
-    <tr>
-      <td>${emp.name}</td>
-      <td>${emp.department || "-"}</td>
-      <td>${emp.emp_id}</td>
-      <td>${emp.dept_id}</td>
+    tbody.innerHTML = list.map(emp => {
+      return `
+        <tr>
+          <td>${emp.name}</td>
+          <td>${emp.department || "-"}</td>
+          <td>${emp.emp_id}</td>
+          <td>${emp.dept_id}</td>
 
-      <td>
-        <span id="emp-pin-${emp.emp_id}" data-pin="${emp.pin}">
-          •••••
-        </span>
-        <button class="btn"
-          onclick="toggleEmployeePin(${emp.emp_id})">
-          👁
-        </button>
-      </td>
+          <td>
+            <span id="emp-pin-${emp.emp_id}" data-pin="${emp.pin}">
+              •••••
+            </span>
+            <button class="btn" onclick="toggleEmployeePin(${emp.emp_id})">
+              👁
+            </button>
+          </td>
 
-      <td>
-        <label class="switch">
-          <input type="checkbox" ${active}
-            onchange="toggleEmployeeStatus(${emp.emp_id}, this.checked)">
-          <span class="slider"></span>
-        </label>
-      </td>
+          <td>
+            <button class="btn" onclick="openEmployeeUUIDs(${emp.emp_id})">
+              View
+            </button>
+          </td>
 
-      <td>
-        <button class="btn"
-          onclick="openEmployeeUUIDs(${emp.emp_id})">
-          View
-        </button>
-      </td>
+          <td>
+            <button class="btn" title="Restore employee"
+              onclick="unhideEmployee(${emp.emp_id})">
+              ♻️
+            </button>
 
-      <td>
-        <button class="btn"
-          onclick="openEmployeeChangePin(${emp.emp_id})">
-          🔑
-        </button>
-
-        <button class="btn"
-          onclick="unhideEmployee(${emp.emp_id})">
-          ♻️
-        </button>
-      </td>
-    </tr>
-  `;
-}).join("");
-    // toggle button text
-    btn.textContent = isShowingHidden
-      ? "View Hidden"
-      : "View Active Employees";
+            <button class="btn delete" title="Permanently delete employee"
+              onclick="deleteEmployeePermanent(${emp.emp_id})">
+              🗑️
+            </button>
+          </td>
+        </tr>
+      `;
+    }).join("");
 
   } catch (e) {
-    console.error("ERROR:", e);
-    status.textContent = "Failed to load employees";
+    console.error("HIDDEN EMPLOYEE LOAD ERROR:", e);
+    status.textContent = "Failed to load hidden employees";
   }
-}
+};
 
     /* ============================================================
        =================== LIVE BIN TELEMETRY =====================
@@ -2553,33 +2616,52 @@ let smartDrag = null;
 let smartDragMoved = false;
 let smartSuppressClick = false;
 
-smartAlertHeader?.addEventListener("mousedown", (e) => {
-  if (e.target.closest("button")) return;
+function getSmartPointerXY(e){
+  return {
+    x: e.clientX,
+    y: e.clientY
+  };
+}
 
+smartAlertHeader?.addEventListener("pointerdown", (e) => {
+  if (e.target.closest("button")) return;
+  if (!smartAlertDock) return;
+
+  e.preventDefault();
+
+  const p = getSmartPointerXY(e);
   const rect = smartAlertDock.getBoundingClientRect();
 
   smartDrag = {
-    startX: e.clientX,
-    startY: e.clientY,
-    offsetX: e.clientX - rect.left,
-    offsetY: e.clientY - rect.top
+    pointerId: e.pointerId,
+    startX: p.x,
+    startY: p.y,
+    offsetX: p.x - rect.left,
+    offsetY: p.y - rect.top
   };
 
   smartDragMoved = false;
   smartSuppressClick = false;
+
+  smartAlertHeader.setPointerCapture?.(e.pointerId);
   document.body.style.userSelect = "none";
 });
 
-window.addEventListener("mousemove", (e) => {
+window.addEventListener("pointermove", (e) => {
   if (!smartDrag || !smartAlertDock) return;
+  if (e.pointerId !== smartDrag.pointerId) return;
+
+  e.preventDefault();
+
+  const p = getSmartPointerXY(e);
 
   const movedEnough =
-    Math.abs(e.clientX - smartDrag.startX) > 4 ||
-    Math.abs(e.clientY - smartDrag.startY) > 4;
+    Math.abs(p.x - smartDrag.startX) > 4 ||
+    Math.abs(p.y - smartDrag.startY) > 4;
 
   if (!movedEnough) return;
 
-  // When minimized, allow the square to be moved even if it was pinned.
+  // When minimized, allow the square to move even if it was pinned.
   if (smartAlertState.minimized && smartAlertState.pinned){
     smartAlertState.pinned = false;
     localStorage.setItem("smartAlertPinned", "0");
@@ -2591,12 +2673,12 @@ window.addEventListener("mousemove", (e) => {
 
   const left = Math.max(
     8,
-    Math.min(window.innerWidth - smartAlertDock.offsetWidth - 8, e.clientX - smartDrag.offsetX)
+    Math.min(window.innerWidth - smartAlertDock.offsetWidth - 8, p.x - smartDrag.offsetX)
   );
 
   const top = Math.max(
     70,
-    Math.min(window.innerHeight - smartAlertDock.offsetHeight - 8, e.clientY - smartDrag.offsetY)
+    Math.min(window.innerHeight - smartAlertDock.offsetHeight - 8, p.y - smartDrag.offsetY)
   );
 
   smartAlertDock.style.left = `${left}px`;
@@ -2607,8 +2689,9 @@ window.addEventListener("mousemove", (e) => {
   smartSuppressClick = true;
 });
 
-window.addEventListener("mouseup", () => {
+window.addEventListener("pointerup", (e) => {
   if (!smartDrag || !smartAlertDock) return;
+  if (e.pointerId !== smartDrag.pointerId) return;
 
   if (smartDragMoved){
     const rect = smartAlertDock.getBoundingClientRect();
@@ -2618,6 +2701,8 @@ window.addEventListener("mouseup", () => {
     }));
   }
 
+  smartAlertHeader?.releasePointerCapture?.(smartDrag.pointerId);
+
   smartDrag = null;
   document.body.style.userSelect = "";
 
@@ -2626,6 +2711,17 @@ window.addEventListener("mouseup", () => {
     smartSuppressClick = false;
   }, 150);
 });
+
+window.addEventListener("pointercancel", () => {
+  smartDrag = null;
+  smartDragMoved = false;
+  smartSuppressClick = false;
+  document.body.style.userSelect = "";
+});
+
+
+
+
 
 smartAlertHeader?.addEventListener("click", (e) => {
   if (!smartAlertState.minimized) return;

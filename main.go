@@ -98,8 +98,9 @@ func getActiveUUIDCount() int {
 		WHERE ul.action = 'clock_in'
 		  AND ul.closed_at IS NULL
 		  AND (ul.expires_at IS NULL OR ? < ul.expires_at)
-		  AND e.is_active = 1
-		  AND e.is_hidden = 0
+AND e.is_active = 1
+AND e.is_hidden = 0
+AND e.is_deleted = 0
 	`, now).Scan(&n)
 
 	if err != nil {
@@ -785,9 +786,10 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 	err := db.QueryRow(`
     SELECT emp_id, emp_name, dept_id
     FROM employees
-    WHERE pin = ?
-      AND is_active = 1
-      AND is_hidden = 0
+WHERE pin = ?
+  AND is_active = 1
+  AND is_hidden = 0
+  AND is_deleted = 0
     LIMIT 1
 `, req.PIN).Scan(&empID, &empName, &deptID)
 
@@ -949,6 +951,7 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 			FROM employees e
 			JOIN departments d ON d.dept_id = e.dept_id
 			WHERE e.is_hidden = 0
+  AND e.is_deleted = 0
 			ORDER BY d.dept_name, e.emp_name
 		`)
 
@@ -1068,6 +1071,11 @@ func handleEmployeeStatus(w http.ResponseWriter, r *http.Request) {
 type empHideReq struct {
 	EmpID int `json:"emp_id"`
 }
+
+type empDeleteReq struct {
+	EmpID int `json:"emp_id"`
+}
+
 type empChangePinReq struct {
 	EmpID int    `json:"emp_id"`
 	PIN   string `json:"pin"`
@@ -1198,6 +1206,131 @@ func handleEmployeeHide(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+func handleEmployeeDeletePermanent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req empDeleteReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	if req.EmpID <= 0 {
+		bad(w, 400, "emp_id required")
+		return
+	}
+
+	eventTime := utcNow()
+	eventTimeDB := dbTime(eventTime)
+
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`
+		SELECT uuid_id, uuid_value
+		FROM uuid_logs
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+	`, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db(find active sessions)")
+		return
+	}
+
+	type activeSession struct {
+		UUIDID int
+		UUID   string
+	}
+
+	var activeSessions []activeSession
+
+	for rows.Next() {
+		var s activeSession
+		if err := rows.Scan(&s.UUIDID, &s.UUID); err != nil {
+			rows.Close()
+			bad(w, 500, "scan active sessions")
+			return
+		}
+		activeSessions = append(activeSessions, s)
+	}
+	rows.Close()
+
+	// Mark employee as permanently deleted from the system.
+	res, err := tx.Exec(`
+		UPDATE employees
+		SET is_deleted = 1,
+		    is_hidden = 1,
+		    is_active = 0,
+		    current_uuid = NULL,
+		    uuid_expires_at = NULL
+		WHERE emp_id = ?
+	`, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db(delete employee)")
+		return
+	}
+
+	aff, _ := res.RowsAffected()
+	if aff == 0 {
+		bad(w, 404, "employee not found")
+		return
+	}
+
+	// Close active UUID sessions.
+	_, err = tx.Exec(`
+		UPDATE uuid_logs
+		SET closed_at = ?
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+	`, eventTimeDB, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db(close sessions)")
+		return
+	}
+
+	// Insert clock_out rows for audit trail.
+	for _, s := range activeSessions {
+		_, err = tx.Exec(`
+			INSERT INTO uuid_logs (
+				uuid_value,
+				emp_id,
+				bin_id,
+				generated_at,
+				closed_at,
+				action,
+				uuid_type
+			)
+			VALUES (?, ?, NULL, ?, ?, 'clock_out', 'SESSION')
+		`, s.UUID, req.EmpID, eventTimeDB, eventTimeDB)
+
+		if err != nil {
+			bad(w, 500, "db(insert clock_out)")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
+		return
+	}
+
+	broadcastActiveUUIDCount()
+
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 func handleHiddenEmployees(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodGet {
@@ -1216,6 +1349,7 @@ func handleHiddenEmployees(w http.ResponseWriter, r *http.Request) {
     FROM employees e
     JOIN departments d ON d.dept_id = e.dept_id
 WHERE e.is_hidden = 1
+  AND e.is_deleted = 0
     ORDER BY d.dept_name, e.emp_name
 `)
 
@@ -1385,7 +1519,8 @@ WHERE emp_id=?
   AND dept_id=?
   AND is_active=1
   AND is_hidden=0
-	`, req.EmpID, req.DeptID).Scan(&tmp)
+  AND is_deleted=0
+`, req.EmpID, req.DeptID).Scan(&tmp)
 
 	if err == sql.ErrNoRows {
 		bad(w, 400, "employee not in department")
@@ -1551,7 +1686,8 @@ func handleUUIDCreateFromPIN(w http.ResponseWriter, r *http.Request) {
     FROM employees
     WHERE pin = ?
       AND is_active = 1
-      AND is_hidden = 0
+     AND is_hidden = 0
+AND is_deleted = 0
     LIMIT 1
 `, req.PIN).Scan(&empID, &empName, &deptID)
 
@@ -1753,8 +1889,9 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 	WHERE ul.uuid_value = ?
 	  AND ul.action = 'clock_in'
 	  AND ul.closed_at IS NULL
-	  AND e.is_active = 1
-	  AND e.is_hidden = 0
+AND e.is_active = 1
+AND e.is_hidden = 0
+AND e.is_deleted = 0
 	LIMIT 1
 `, req.UUID).Scan(&empID, &expiresAt)
 
@@ -1972,8 +2109,9 @@ func handleBinValidateAccess(w http.ResponseWriter, r *http.Request) {
 	WHERE ul.uuid_value = ?
 	  AND ul.action = 'clock_in'
 	  AND ul.closed_at IS NULL
-	  AND e.is_active = 1
-	  AND e.is_hidden = 0
+AND e.is_active = 1
+AND e.is_hidden = 0
+AND e.is_deleted = 0
 	LIMIT 1
 `, req.UUID).Scan(&empID, &expiresAt)
 
@@ -2404,7 +2542,12 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	var counts adminCounts
 
-	if err := db.QueryRow(`SELECT COUNT(*) FROM employees`).Scan(&counts.Employees); err != nil {
+	if err := db.QueryRow(`
+	SELECT COUNT(*)
+	FROM employees
+	WHERE is_deleted = 0
+	  AND is_hidden = 0
+`).Scan(&counts.Employees); err != nil {
 		bad(w, 500, "db1")
 		return
 	}
@@ -4215,6 +4358,7 @@ func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
 	  AND (ul.bin_id = ? OR ul.bin_id IS NULL)
 	  AND e.is_active = 1
 	  AND e.is_hidden = 0
+	  AND e.is_deleted = 0
 `, dbTime(utcNow()), binID)
 
 	if err != nil {
@@ -4435,6 +4579,7 @@ func main() {
 	http.HandleFunc("/employees/status", handleEmployeeStatus)
 	http.HandleFunc("/employees/hide", handleEmployeeHide)
 	http.HandleFunc("/employees/unhide", handleEmployeeUnhide)
+	http.HandleFunc("/employees/delete", handleEmployeeDeletePermanent)
 	http.HandleFunc("/employees/change-pin", handleEmployeeChangePin)
 	http.HandleFunc("/employees/uuids", handleEmployeeUUIDHistory)
 	http.HandleFunc("/employees/hidden", handleHiddenEmployees)
