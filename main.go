@@ -92,12 +92,15 @@ func getActiveUUIDCount() int {
 	now := dbTime(utcNow())
 
 	err := db.QueryRow(`
-        SELECT COUNT(*)
-        FROM uuid_logs
-        WHERE action = 'clock_in'
-          AND closed_at IS NULL
-          AND (expires_at IS NULL OR ? < expires_at)
-    `, now).Scan(&n)
+		SELECT COUNT(*)
+		FROM uuid_logs ul
+		JOIN employees e ON e.emp_id = ul.emp_id
+		WHERE ul.action = 'clock_in'
+		  AND ul.closed_at IS NULL
+		  AND (ul.expires_at IS NULL OR ? < ul.expires_at)
+		  AND e.is_active = 1
+		  AND e.is_hidden = 0
+	`, now).Scan(&n)
 
 	if err != nil {
 		return 0
@@ -928,23 +931,26 @@ type empListRow struct {
 }
 
 func handleEmployees(w http.ResponseWriter, r *http.Request) {
+	if allowCORS(w, r) {
+		return
+	}
+
 	switch r.Method {
 
 	case http.MethodGet:
-
 		rows, err := db.Query(`
-    SELECT e.emp_id,
-           e.emp_name,
-           e.dept_id,
-           d.dept_name,
-           e.is_active,
-           e.pin,
-           e.is_hidden
-    FROM employees e
-    JOIN departments d ON d.dept_id = e.dept_id
-    WHERE e.is_hidden = 0
-    ORDER BY d.dept_name, e.emp_name
-`)
+			SELECT e.emp_id,
+			       e.emp_name,
+			       e.dept_id,
+			       d.dept_name,
+			       e.is_active,
+			       e.pin,
+			       e.is_hidden
+			FROM employees e
+			JOIN departments d ON d.dept_id = e.dept_id
+			WHERE e.is_hidden = 0
+			ORDER BY d.dept_name, e.emp_name
+		`)
 
 		if err != nil {
 			bad(w, 500, "db(employees)")
@@ -975,12 +981,14 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case http.MethodPost:
-
 		var req empCreateReq
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			bad(w, 400, "bad json")
 			return
 		}
+
+		req.Name = strings.TrimSpace(req.Name)
+		req.PIN = strings.TrimSpace(req.PIN)
 
 		if req.Name == "" || req.DeptID == 0 || len(req.PIN) != 5 {
 			bad(w, 400, "need name, dept_id, and 5-digit pin")
@@ -988,9 +996,9 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 		}
 
 		res, err := db.Exec(`
-    INSERT INTO employees (emp_name, dept_id, pin, is_active, is_hidden)
-    VALUES (?, ?, ?, 1, 0)
-`, req.Name, req.DeptID, req.PIN)
+			INSERT INTO employees (emp_name, dept_id, pin, is_active, is_hidden)
+			VALUES (?, ?, ?, 1, 0)
+		`, req.Name, req.DeptID, req.PIN)
 
 		if err != nil {
 			bad(w, 500, "insert")
@@ -998,12 +1006,14 @@ func handleEmployees(w http.ResponseWriter, r *http.Request) {
 		}
 
 		id64, _ := res.LastInsertId()
+
 		writeJSON(w, empCreateResp{
 			EmpID:  int(id64),
 			Name:   req.Name,
 			DeptID: req.DeptID,
 		})
 		return
+
 	default:
 		bad(w, 405, "GET or POST only")
 		return
@@ -1050,6 +1060,8 @@ func handleEmployeeStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	broadcastActiveUUIDCount()
+
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -1073,22 +1085,119 @@ func handleEmployeeHide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.Exec(`
-        UPDATE employees
-        SET is_hidden = 1,
-            is_active = 0,
-            current_uuid = NULL,
-            uuid_expires_at = NULL
-        WHERE emp_id = ?
-    `, req.EmpID)
-
-	if err != nil {
-		bad(w, 500, "db")
+	if req.EmpID <= 0 {
+		bad(w, 400, "emp_id required")
 		return
 	}
 
+	eventTime := utcNow()
+	eventTimeDB := dbTime(eventTime)
+
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+	defer tx.Rollback()
+
+	// 1) Get all currently active clock_in UUID sessions for this employee
+	rows, err := tx.Query(`
+		SELECT uuid_id, uuid_value
+		FROM uuid_logs
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+	`, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db(find active sessions)")
+		return
+	}
+
+	type activeSession struct {
+		UUIDID int
+		UUID   string
+	}
+
+	var activeSessions []activeSession
+
+	for rows.Next() {
+		var s activeSession
+		if err := rows.Scan(&s.UUIDID, &s.UUID); err != nil {
+			rows.Close()
+			bad(w, 500, "scan active sessions")
+			return
+		}
+		activeSessions = append(activeSessions, s)
+	}
+	rows.Close()
+
+	// 2) Hide/deactivate employee and clear current displayed UUID fields
+	res, err := tx.Exec(`
+		UPDATE employees
+		SET is_hidden = 1,
+		    is_active = 0,
+		    current_uuid = NULL,
+		    uuid_expires_at = NULL
+		WHERE emp_id = ?
+	`, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db(update employee)")
+		return
+	}
+
+	aff, _ := res.RowsAffected()
+	if aff == 0 {
+		bad(w, 404, "employee not found")
+		return
+	}
+
+	// 3) Close all active clock_in UUID sessions
+	_, err = tx.Exec(`
+		UPDATE uuid_logs
+		SET closed_at = ?
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+	`, eventTimeDB, req.EmpID)
+
+	if err != nil {
+		bad(w, 500, "db(close sessions)")
+		return
+	}
+
+	// 4) Insert a clock_out row for each active session that was closed
+	for _, s := range activeSessions {
+		_, err = tx.Exec(`
+			INSERT INTO uuid_logs (
+				uuid_value,
+				emp_id,
+				bin_id,
+				generated_at,
+				closed_at,
+				action,
+				uuid_type
+			)
+			VALUES (?, ?, NULL, ?, ?, 'clock_out', 'SESSION')
+		`, s.UUID, req.EmpID, eventTimeDB, eventTimeDB)
+
+		if err != nil {
+			bad(w, 500, "db(insert clock_out)")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit")
+		return
+	}
+
+	broadcastActiveUUIDCount()
+
 	writeJSON(w, map[string]bool{"ok": true})
 }
+
 func handleHiddenEmployees(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodGet {
@@ -1184,11 +1293,12 @@ func handleEmployeeUUIDHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-        SELECT uuid_value, generated_at, expires_at, closed_at
-        FROM uuid_logs
-        WHERE emp_id = ?
-        ORDER BY generated_at DESC
-    `, empID)
+	SELECT uuid_value, generated_at, expires_at, closed_at
+	FROM uuid_logs
+	WHERE emp_id = ?
+	  AND action = 'clock_in'
+	ORDER BY generated_at DESC
+`, empID)
 
 	if err != nil {
 		bad(w, 500, "db")
@@ -1637,13 +1747,16 @@ func handleBinConsume(w http.ResponseWriter, r *http.Request) {
 	var expiresAt sql.NullTime
 
 	err = db.QueryRow(`
-        SELECT emp_id, expires_at
-        FROM uuid_logs
-        WHERE uuid_value = ?
-          AND action = 'clock_in'
-          AND closed_at IS NULL
-        LIMIT 1
-    `, req.UUID).Scan(&empID, &expiresAt)
+	SELECT ul.emp_id, ul.expires_at
+	FROM uuid_logs ul
+	JOIN employees e ON e.emp_id = ul.emp_id
+	WHERE ul.uuid_value = ?
+	  AND ul.action = 'clock_in'
+	  AND ul.closed_at IS NULL
+	  AND e.is_active = 1
+	  AND e.is_hidden = 0
+	LIMIT 1
+`, req.UUID).Scan(&empID, &expiresAt)
 
 	if err == nil {
 
@@ -1853,13 +1966,16 @@ func handleBinValidateAccess(w http.ResponseWriter, r *http.Request) {
 	var expiresAt sql.NullTime
 
 	err := db.QueryRow(`
-		SELECT emp_id, expires_at
-		FROM uuid_logs
-		WHERE uuid_value = ?
-		  AND action = 'clock_in'
-		  AND closed_at IS NULL
-		LIMIT 1
-	`, req.UUID).Scan(&empID, &expiresAt)
+	SELECT ul.emp_id, ul.expires_at
+	FROM uuid_logs ul
+	JOIN employees e ON e.emp_id = ul.emp_id
+	WHERE ul.uuid_value = ?
+	  AND ul.action = 'clock_in'
+	  AND ul.closed_at IS NULL
+	  AND e.is_active = 1
+	  AND e.is_hidden = 0
+	LIMIT 1
+`, req.UUID).Scan(&empID, &expiresAt)
 
 	if err == nil {
 
@@ -4090,12 +4206,15 @@ func handleBinSnapshot(w http.ResponseWriter, r *http.Request) {
 	var sessions []sessionObj
 
 	sRows, err := db.Query(`
-    SELECT uuid_value, expires_at
-    FROM uuid_logs
-    WHERE action = 'clock_in'
-      AND closed_at IS NULL
-      AND (expires_at IS NULL OR ? < expires_at)
-      AND (bin_id = ? OR bin_id IS NULL)
+	SELECT ul.uuid_value, ul.expires_at
+	FROM uuid_logs ul
+	JOIN employees e ON e.emp_id = ul.emp_id
+	WHERE ul.action = 'clock_in'
+	  AND ul.closed_at IS NULL
+	  AND (ul.expires_at IS NULL OR ? < ul.expires_at)
+	  AND (ul.bin_id = ? OR ul.bin_id IS NULL)
+	  AND e.is_active = 1
+	  AND e.is_hidden = 0
 `, dbTime(utcNow()), binID)
 
 	if err != nil {

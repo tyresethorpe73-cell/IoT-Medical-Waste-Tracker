@@ -448,6 +448,218 @@ dialog{
 .fill-danger{
   background: linear-gradient(90deg,#ff6b3d,#ff3b5c);
 }
+
+/* ============================================================
+   SMART ALERT DOCK - FLOATING OVERLAY ONLY
+   Does not affect dashboard layout
+   ============================================================ */
+
+.smart-alert-dock{
+  position: fixed;
+  top: 96px;
+  right: 18px;
+  width: 360px;
+  max-width: calc(100vw - 28px);
+  max-height: calc(100vh - 120px);
+  z-index: 99990;
+  background: rgba(15, 21, 36, 0.96);
+  border: 1px solid rgba(96,165,250,.45);
+  border-radius: 16px;
+  box-shadow: 0 22px 50px rgba(0,0,0,.55);
+  backdrop-filter: blur(12px);
+  overflow: hidden;
+}
+
+.smart-alert-dock.pinned{
+  right: 18px !important;
+  left: auto !important;
+}
+
+.smart-alert-dock.minimized{
+  width: 58px;
+  height: 58px;
+  min-width: 58px;
+  max-width: 58px;
+  max-height: 58px;
+  border-radius: 14px;
+  overflow: visible;
+}
+
+.smart-alert-dock.minimized .smart-alert-header{
+  height: 58px;
+  padding: 0;
+  justify-content: center;
+  border-bottom: none;
+  cursor: move;
+}
+
+.smart-alert-dock.minimized .smart-alert-title,
+.smart-alert-dock.minimized .smart-alert-controls,
+.smart-alert-dock.minimized .smart-alert-drag,
+.smart-alert-dock.minimized .smart-alert-body,
+.smart-alert-dock.minimized .smart-alert-footer{
+  display: none;
+}
+
+.smart-alert-dock.minimized .smart-alert-mini-icon{
+  display: grid;
+}
+
+.smart-alert-dock.minimized .smart-alert-badge{
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  padding: 1px 5px;
+  font-size: 9px;
+  box-shadow: 0 8px 18px rgba(0,0,0,.35);
+}
+
+.smart-alert-mini-icon{
+  width: 100%;
+  height: 100%;
+  display: none;
+  place-items: center;
+  font-size: 18px;
+  border-radius: 0;
+  background: transparent;
+  border: none;
+}
+
+.smart-alert-header{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-bottom: 1px solid rgba(255,255,255,.10);
+  cursor: move;
+  user-select: none;
+}
+
+.smart-alert-title{
+  flex: 1;
+  font-weight: 800;
+  letter-spacing: .2px;
+}
+
+.smart-alert-badge{
+  background: rgba(248,113,113,.20);
+  color: #fecaca;
+  border: 1px solid rgba(248,113,113,.45);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.smart-alert-controls{
+  display: flex;
+  gap: 6px;
+}
+
+.smart-alert-controls button{
+  width: 32px;
+  height: 30px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: rgba(255,255,255,.04);
+}
+
+.smart-alert-body{
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+  max-height: calc(100vh - 210px);
+  overflow: auto;
+}
+
+.smart-alert-empty{
+  color: var(--muted);
+  text-align: center;
+  padding: 24px 10px;
+  border: 1px dashed rgba(255,255,255,.12);
+  border-radius: 12px;
+}
+
+.smart-alert-card{
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 10px;
+  padding: 11px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(255,255,255,.045);
+}
+
+.smart-alert-card.critical{
+  border-color: rgba(248,113,113,.55);
+  background: linear-gradient(135deg, rgba(248,113,113,.16), rgba(255,255,255,.035));
+}
+
+.smart-alert-card.warning{
+  border-color: rgba(251,191,36,.55);
+  background: linear-gradient(135deg, rgba(251,191,36,.14), rgba(255,255,255,.035));
+}
+
+.smart-alert-icon{
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  background: rgba(0,0,0,.22);
+  border: 1px solid rgba(255,255,255,.10);
+}
+
+.smart-alert-card h4{
+  margin: 0;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.smart-alert-card p{
+  margin: 3px 0 7px;
+  color: #d1d5db;
+  font-size: 13px;
+}
+
+.smart-alert-meta{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.smart-alert-actions{
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 4px;
+}
+
+.smart-alert-actions button{
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.smart-alert-footer{
+  padding: 9px 12px;
+  border-top: 1px solid rgba(255,255,255,.10);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (max-width: 720px){
+  .smart-alert-dock{
+    width: calc(100vw - 24px);
+    right: 12px;
+    top: 82px;
+  }
+}
   </style>
 </head>
 
@@ -967,6 +1179,34 @@ dialog{
 
     <!-- TOAST -->
   </div>
+
+  <!-- SMART ALERT DOCK - FLOATING OVERLAY ONLY -->
+<aside id="smartAlertDock" class="smart-alert-dock pinned">
+
+  <div id="smartAlertHeader" class="smart-alert-header">
+    <div class="smart-alert-drag" style="font-size:18px; opacity:.85;">⠿</div>
+
+    <div class="smart-alert-mini-icon" title="Smart Alert Dock">
+      🔔
+    </div>
+
+    <div class="smart-alert-title">Smart Alert Dock</div>
+    <span id="smartAlertBadge" class="smart-alert-badge">0 Active</span>
+
+    <div class="smart-alert-controls">
+      <button type="button" id="smartAlertPin" title="Pin / unpin">📌</button>
+      <button type="button" id="smartAlertMin" title="Minimize">—</button>
+    </div>
+  </div>
+
+  <div id="smartAlertBody" class="smart-alert-body">
+    <div class="smart-alert-empty">No active faults detected.</div>
+  </div>
+
+  <div class="smart-alert-footer">
+    Local alerts via <strong>waste:8080</strong> / <strong>waste.local:8080</strong> — no internet required
+  </div>
+</aside>
 
 
   <!-- SCRIPT SECTION -->
@@ -1965,6 +2205,439 @@ tbody.innerHTML = list.map(emp => {
     const liveTsEl   = $("#live-bins-ts");
     const liveState  = new Map(); // bin_id → rowData
 
+    /* ============================================================
+       SMART ALERT DOCK ENGINE
+       Frontend-only first version. Uses local LAN telemetry.
+       Real-life basis:
+       - 75% warning: healthcare waste bags/sharps containers should be replaced around 3/4 full.
+       - 24h maximum storage target for warm climate is used as background safety logic,
+         but dashboard warns much earlier for operations.
+       ============================================================ */
+
+    const SMART_THRESHOLDS = {
+      fillWarn: 75,
+      fillCritical: 90,
+      highFillDelayMs: 30 * 60 * 1000,
+      severeFillDelayMs: 15 * 60 * 1000,
+
+tempWarn: 32,
+tempCritical: 35,
+
+      batteryWarn: 25,
+      batteryCritical: 15,
+
+      offlineWarnMs: 5 * 60 * 1000,
+      offlineCriticalMs: 10 * 60 * 1000,
+
+      lidOpenDelayMs: 2 * 60 * 1000
+    };
+
+    const smartAlertState = {
+      acknowledged: new Set(),
+      highFillSince: new Map(),
+      severeFillSince: new Map(),
+      lidOpenSince: new Map(),
+      pinned: localStorage.getItem("smartAlertPinned") !== "0",
+      minimized: localStorage.getItem("smartAlertMinimized") === "1"
+    };
+
+const smartAlertDock = document.getElementById("smartAlertDock");
+const smartAlertHeader = document.getElementById("smartAlertHeader");
+const smartAlertBody = document.getElementById("smartAlertBody");
+const smartAlertBadge = document.getElementById("smartAlertBadge");
+const smartAlertPin = document.getElementById("smartAlertPin");
+const smartAlertMin = document.getElementById("smartAlertMin");
+
+
+    function smartNowText(){
+      return new Date().toLocaleString();
+    }
+
+    function smartBinLabel(r){
+      const code = r.stream_code || r.stream_name || "BIN";
+      return `${code}-${String(r.bin_id).padStart(2, "0")}`;
+    }
+
+    function addSmartAlert(list, alert){
+      if (!smartAlertState.acknowledged.has(alert.id)){
+        list.push(alert);
+      }
+    }
+
+    function updateSmartConditionMemory(r){
+      const now = Date.now();
+      const id = r.bin_id;
+
+      const fill = Number(r.fill_pct);
+      if (Number.isFinite(fill) && fill >= SMART_THRESHOLDS.fillWarn){
+        if (!smartAlertState.highFillSince.has(id)){
+          smartAlertState.highFillSince.set(id, now);
+        }
+      } else {
+        smartAlertState.highFillSince.delete(id);
+        smartAlertState.acknowledged.delete(`delayed-${id}`);
+        smartAlertState.acknowledged.delete(`fillwarn-${id}`);
+      }
+
+      if (Number.isFinite(fill) && fill >= SMART_THRESHOLDS.fillCritical){
+        if (!smartAlertState.severeFillSince.has(id)){
+          smartAlertState.severeFillSince.set(id, now);
+        }
+      } else {
+        smartAlertState.severeFillSince.delete(id);
+        smartAlertState.acknowledged.delete(`overflow-${id}`);
+        smartAlertState.acknowledged.delete(`severedelay-${id}`);
+      }
+
+      if (r.door_open === 1){
+        if (!smartAlertState.lidOpenSince.has(id)){
+          smartAlertState.lidOpenSince.set(id, now);
+        }
+      } else {
+        smartAlertState.lidOpenSince.delete(id);
+        smartAlertState.acknowledged.delete(`lid-${id}`);
+      }
+    }
+
+    function evaluateSmartAlerts(){
+      if (!smartAlertBody || !smartAlertBadge) return;
+
+      const now = Date.now();
+      const alerts = [];
+
+      liveState.forEach((r) => {
+        updateSmartConditionMemory(r);
+
+        const id = r.bin_id;
+        const binLabel = smartBinLabel(r);
+        const fill = Number(r.fill_pct);
+        const temp = Number(r.temp_c);
+        const batt = Number(r.battery_pct);
+
+        if (Number.isFinite(fill)){
+          if (fill >= SMART_THRESHOLDS.fillCritical){
+            addSmartAlert(alerts, {
+              id: `overflow-${id}`,
+              severity: "critical",
+              icon: "⚠️",
+              title: "Overflow Risk",
+              message: `${binLabel} is ${fill.toFixed(0)}% full.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          } else if (fill >= SMART_THRESHOLDS.fillWarn){
+            addSmartAlert(alerts, {
+              id: `fillwarn-${id}`,
+              severity: "warning",
+              icon: "🟡",
+              title: "Approaching Full",
+              message: `${binLabel} is ${fill.toFixed(0)}% full. Replace/empty soon.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          }
+
+          const highSince = smartAlertState.highFillSince.get(id);
+          if (highSince && now - highSince >= SMART_THRESHOLDS.highFillDelayMs){
+            const mins = Math.floor((now - highSince) / 60000);
+            addSmartAlert(alerts, {
+              id: `delayed-${id}`,
+              severity: "warning",
+              icon: "⏱️",
+              title: "Delayed Disposal",
+              message: `${binLabel} has stayed above 75% for ${mins} min.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          }
+
+          const severeSince = smartAlertState.severeFillSince.get(id);
+          if (severeSince && now - severeSince >= SMART_THRESHOLDS.severeFillDelayMs){
+            const mins = Math.floor((now - severeSince) / 60000);
+            addSmartAlert(alerts, {
+              id: `severedelay-${id}`,
+              severity: "critical",
+              icon: "🚨",
+              title: "Severe Disposal Delay",
+              message: `${binLabel} has stayed at/above 90% for ${mins} min.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          }
+        }
+
+        if (Number.isFinite(temp)){
+          if (temp >= SMART_THRESHOLDS.tempCritical){
+            addSmartAlert(alerts, {
+              id: `tempcrit-${id}`,
+              severity: "critical",
+              icon: "🌡️",
+              title: "High Temperature",
+              message: `${binLabel} is ${temp.toFixed(1)}°C.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          } else if (temp >= SMART_THRESHOLDS.tempWarn){
+            addSmartAlert(alerts, {
+              id: `tempwarn-${id}`,
+              severity: "warning",
+              icon: "🌡️",
+              title: "Temperature Warning",
+              message: `${binLabel} is ${temp.toFixed(1)}°C.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          } else {
+            smartAlertState.acknowledged.delete(`tempcrit-${id}`);
+            smartAlertState.acknowledged.delete(`tempwarn-${id}`);
+          }
+        }
+
+        if (Number.isFinite(batt)){
+          if (batt <= SMART_THRESHOLDS.batteryCritical){
+            addSmartAlert(alerts, {
+              id: `battcrit-${id}`,
+              severity: "critical",
+              icon: "🪫",
+              title: "Battery Critical",
+              message: `${binLabel} battery is ${batt.toFixed(0)}%.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          } else if (batt <= SMART_THRESHOLDS.batteryWarn){
+            addSmartAlert(alerts, {
+              id: `battwarn-${id}`,
+              severity: "warning",
+              icon: "🔋",
+              title: "Low Battery",
+              message: `${binLabel} battery is ${batt.toFixed(0)}%.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          } else {
+            smartAlertState.acknowledged.delete(`battcrit-${id}`);
+            smartAlertState.acknowledged.delete(`battwarn-${id}`);
+          }
+        }
+
+        const lidSince = smartAlertState.lidOpenSince.get(id);
+        if (lidSince && now - lidSince >= SMART_THRESHOLDS.lidOpenDelayMs){
+          const mins = Math.floor((now - lidSince) / 60000);
+          addSmartAlert(alerts, {
+            id: `lid-${id}`,
+            severity: "warning",
+            icon: "🚪",
+            title: "Lid Open Too Long",
+            message: `${binLabel} lid has been open for ${mins} min.`,
+            bin: binLabel,
+            time: smartNowText()
+          });
+        }
+
+        if (r._lastUpdateMs){
+          const age = now - r._lastUpdateMs;
+
+          if (age >= SMART_THRESHOLDS.offlineCriticalMs){
+            const mins = Math.floor(age / 60000);
+            addSmartAlert(alerts, {
+              id: `offlinecrit-${id}`,
+              severity: "critical",
+              icon: "📡",
+              title: "Bin Offline",
+              message: `No telemetry from ${binLabel} for ${mins} min.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          } else if (age >= SMART_THRESHOLDS.offlineWarnMs){
+            const mins = Math.floor(age / 60000);
+            addSmartAlert(alerts, {
+              id: `offlinewarn-${id}`,
+              severity: "warning",
+              icon: "📶",
+              title: "Telemetry Delay",
+              message: `No telemetry from ${binLabel} for ${mins} min.`,
+              bin: binLabel,
+              time: smartNowText()
+            });
+          } else {
+            smartAlertState.acknowledged.delete(`offlinecrit-${id}`);
+            smartAlertState.acknowledged.delete(`offlinewarn-${id}`);
+          }
+        }
+      });
+
+      alerts.sort((a,b) => {
+        const rank = {critical: 0, warning: 1};
+        return rank[a.severity] - rank[b.severity];
+      });
+
+      smartAlertBadge.textContent = `${alerts.length} Active`;
+
+      if (!alerts.length){
+        smartAlertBody.innerHTML = `<div class="smart-alert-empty">No active faults detected.</div>`;
+        return;
+      }
+
+      smartAlertBody.innerHTML = alerts.map(a => `
+        <div class="smart-alert-card ${a.severity}">
+          <div class="smart-alert-icon">${a.icon}</div>
+          <div>
+            <h4>${escapeHTML(a.title)}</h4>
+            <p>${escapeHTML(a.message)}</p>
+            <div class="smart-alert-meta">
+              <span>🕒 ${escapeHTML(a.time)}</span>
+              <span>🗑️ ${escapeHTML(a.bin)}</span>
+            </div>
+          </div>
+          <div class="smart-alert-actions">
+            <button type="button" data-alert-ack="${escapeHTML(a.id)}">Acknowledge</button>
+          </div>
+        </div>
+      `).join("");
+
+      document.querySelectorAll("[data-alert-ack]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          smartAlertState.acknowledged.add(btn.getAttribute("data-alert-ack"));
+          evaluateSmartAlerts();
+        });
+      });
+    }
+
+    function applySmartDockSavedState(){
+      if (!smartAlertDock) return;
+
+      smartAlertDock.classList.toggle("pinned", smartAlertState.pinned);
+      smartAlertDock.classList.toggle("minimized", smartAlertState.minimized);
+
+smartAlertPin.textContent = smartAlertState.pinned ? "📌" : "📍";
+smartAlertMin.textContent = smartAlertState.minimized ? "+" : "—";
+
+
+
+      if (!smartAlertState.pinned){
+        const pos = JSON.parse(localStorage.getItem("smartAlertPos") || "null");
+        if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)){
+          smartAlertDock.style.left = `${pos.left}px`;
+          smartAlertDock.style.top = `${pos.top}px`;
+          smartAlertDock.style.right = "auto";
+        }
+} else {
+  smartAlertDock.style.left = "auto";
+  smartAlertDock.style.right = "18px";
+  smartAlertDock.style.top = smartAlertState.minimized ? "110px" : "96px";
+}
+    }
+
+function toggleSmartAlertMinimized(){
+  smartAlertState.minimized = !smartAlertState.minimized;
+  localStorage.setItem("smartAlertMinimized", smartAlertState.minimized ? "1" : "0");
+  applySmartDockSavedState();
+}
+
+smartAlertPin?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+
+  smartAlertState.pinned = !smartAlertState.pinned;
+  localStorage.setItem("smartAlertPinned", smartAlertState.pinned ? "1" : "0");
+  applySmartDockSavedState();
+});
+
+smartAlertMin?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  toggleSmartAlertMinimized();
+});
+
+let smartDrag = null;
+let smartDragMoved = false;
+let smartSuppressClick = false;
+
+smartAlertHeader?.addEventListener("mousedown", (e) => {
+  if (e.target.closest("button")) return;
+
+  const rect = smartAlertDock.getBoundingClientRect();
+
+  smartDrag = {
+    startX: e.clientX,
+    startY: e.clientY,
+    offsetX: e.clientX - rect.left,
+    offsetY: e.clientY - rect.top
+  };
+
+  smartDragMoved = false;
+  smartSuppressClick = false;
+  document.body.style.userSelect = "none";
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!smartDrag || !smartAlertDock) return;
+
+  const movedEnough =
+    Math.abs(e.clientX - smartDrag.startX) > 4 ||
+    Math.abs(e.clientY - smartDrag.startY) > 4;
+
+  if (!movedEnough) return;
+
+  // When minimized, allow the square to be moved even if it was pinned.
+  if (smartAlertState.minimized && smartAlertState.pinned){
+    smartAlertState.pinned = false;
+    localStorage.setItem("smartAlertPinned", "0");
+    smartAlertDock.classList.remove("pinned");
+  }
+
+  // If full dock is pinned, do not move it.
+  if (!smartAlertState.minimized && smartAlertState.pinned) return;
+
+  const left = Math.max(
+    8,
+    Math.min(window.innerWidth - smartAlertDock.offsetWidth - 8, e.clientX - smartDrag.offsetX)
+  );
+
+  const top = Math.max(
+    70,
+    Math.min(window.innerHeight - smartAlertDock.offsetHeight - 8, e.clientY - smartDrag.offsetY)
+  );
+
+  smartAlertDock.style.left = `${left}px`;
+  smartAlertDock.style.top = `${top}px`;
+  smartAlertDock.style.right = "auto";
+
+  smartDragMoved = true;
+  smartSuppressClick = true;
+});
+
+window.addEventListener("mouseup", () => {
+  if (!smartDrag || !smartAlertDock) return;
+
+  if (smartDragMoved){
+    const rect = smartAlertDock.getBoundingClientRect();
+    localStorage.setItem("smartAlertPos", JSON.stringify({
+      left: rect.left,
+      top: rect.top
+    }));
+  }
+
+  smartDrag = null;
+  document.body.style.userSelect = "";
+
+  setTimeout(() => {
+    smartDragMoved = false;
+    smartSuppressClick = false;
+  }, 150);
+});
+
+smartAlertHeader?.addEventListener("click", (e) => {
+  if (!smartAlertState.minimized) return;
+  if (e.target.closest("button")) return;
+  if (smartSuppressClick) return;
+
+  toggleSmartAlertMinimized();
+});
+
+    applySmartDockSavedState();
+    setInterval(evaluateSmartAlerts, 10000);
+
     function fmtNum(v, digits=1){
       if (v===null || v===undefined) return "—";
       if (typeof v==="number") return v.toFixed(digits);
@@ -2048,6 +2721,7 @@ async function seedLive(){
     liveState.clear();
 
     (j.bins || []).forEach(b => {
+
       liveState.set(b.bin_id, {
         bin_id: b.bin_id,
         bin_name: b.bin_name,
@@ -2059,11 +2733,13 @@ async function seedLive(){
         fill_pct: b.fill_pct ?? null,
         battery_pct: b.battery_pct ?? null,
         door_open: b.door_open ?? null,
-        last_seen: b.last_seen || ""
+        last_seen: b.last_seen || "",
+        _lastUpdateMs: Date.now()
       });
     });
 
     renderLive();
+    evaluateSmartAlerts();
 
   } catch(e){
     console.error("SEED ERROR:", e);
@@ -2078,6 +2754,28 @@ try { refreshChart(); } catch(e){ console.error(e); }
     setInterval(refreshChart, 5000)
 
 function applyTelemetry(msg){
+
+  // Keep liveState updated so Smart Alert Dock can evaluate faults.
+  const existing = liveState.get(msg.bin_id) || {
+    bin_id: msg.bin_id,
+    bin_name: `Bin ${msg.bin_id}`,
+    stream_code: "BIN",
+    stream_name: "BIN",
+    location: ""
+  };
+
+  liveState.set(msg.bin_id, {
+    ...existing,
+    temp_c: msg.temp_c ?? existing.temp_c ?? null,
+    humidity_pct: msg.humidity_pct ?? existing.humidity_pct ?? null,
+    fill_pct: msg.fill_pct ?? existing.fill_pct ?? null,
+    battery_pct: msg.battery_pct ?? existing.battery_pct ?? null,
+    door_open: msg.door_open ?? existing.door_open ?? null,
+    last_seen: msg.last_seen || existing.last_seen || "",
+    _lastUpdateMs: Date.now()
+  });
+
+  evaluateSmartAlerts();
 
   // 🔥 UPDATE MAIN LIVE TABLE
   const mainRow = document.querySelector(
@@ -2159,9 +2857,44 @@ if (battEl && msg.battery_pct != null){
 }
     /* SSE + Fallback Polling */
     let livePollTimer = null;
+
     function startLivePolling(){
       if (livePollTimer) return;
+
       liveTsEl.textContent = "live: polling every 3s (SSE unavailable)";
+
+      livePollTimer = setInterval(async () => {
+        try {
+          const resp = await fetch("/bins/live.json", {cache:"no-store"});
+          const j = await resp.json();
+
+          (j.bins || []).forEach(b => {
+            const existing = liveState.get(b.bin_id) || {};
+
+            liveState.set(b.bin_id, {
+              ...existing,
+              bin_id: b.bin_id,
+              bin_name: b.bin_name,
+              location: b.location,
+              stream_code: b.stream_code,
+              stream_name: b.stream_name || b.stream_code,
+              temp_c: b.temp_c ?? null,
+              humidity_pct: b.humidity_pct ?? null,
+              fill_pct: b.fill_pct ?? null,
+              battery_pct: b.battery_pct ?? null,
+              door_open: b.door_open ?? null,
+              last_seen: b.last_seen || "",
+              _lastUpdateMs: Date.now()
+            });
+          });
+
+          renderLive();
+          evaluateSmartAlerts();
+
+        } catch (e) {
+          console.error("fallback polling failed", e);
+        }
+      }, 3000);
     }
 
     try {
