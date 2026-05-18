@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -755,15 +756,34 @@ type pinReq struct {
 }
 
 type pinResp struct {
-	Valid        bool   `json:"valid"`
-	Role         string `json:"role"`
+	Valid            bool   `json:"valid"`
+	Role             string `json:"role"`
+	EmployeeID       int    `json:"employee_id"`
+	EmployeeName     string `json:"employee_name"`
+	SessionUUID      string `json:"session_uuid"`
+	PendingToken     string `json:"pending_token,omitempty"`
+	PendingExpiresAt int64  `json:"pending_expires_at,omitempty"`
+}
+
+type pinCommitReq struct {
 	EmployeeID   int    `json:"employee_id"`
-	EmployeeName string `json:"employee_name"`
 	SessionUUID  string `json:"session_uuid"`
+	UUID         string `json:"uuid"`
+	PendingToken string `json:"pending_token"`
+}
+
+type pinCommitResp struct {
+	OK        bool   `json:"ok"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+	Message   string `json:"message,omitempty"`
 }
 
 func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
-
+	// IMPORTANT:
+	// This endpoint now PREPARES a clock-in only.
+	// It validates the employee PIN and returns a UUID + pending_token,
+	// but it does NOT create the active 8-hour uuid_logs session.
+	// The ESP must write + verify the RFID card first, then call /auth/pin/commit.
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -779,19 +799,20 @@ func handleAuthPIN(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "need 5-digit pin", http.StatusBadRequest)
 		return
 	}
+
 	var empID, deptID int
 	var empName string
 	role := "employee"
 
 	err := db.QueryRow(`
-    SELECT emp_id, emp_name, dept_id
-    FROM employees
-WHERE pin = ?
-  AND is_active = 1
-  AND is_hidden = 0
-  AND is_deleted = 0
-    LIMIT 1
-`, req.PIN).Scan(&empID, &empName, &deptID)
+		SELECT emp_id, emp_name, dept_id
+		FROM employees
+		WHERE pin = ?
+		  AND is_active = 1
+		  AND is_hidden = 0
+		  AND is_deleted = 0
+		LIMIT 1
+	`, req.PIN).Scan(&empID, &empName, &deptID)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "Access denied", http.StatusUnauthorized)
@@ -805,102 +826,279 @@ WHERE pin = ?
 	now := utcNow()
 	nowDB := dbTime(now)
 
-	// 🔥 FORCE CLOSE ANY EXPIRED SESSIONS FIRST
+	// Close any expired active sessions before checking for an open session.
 	_, _ = db.Exec(`
-	UPDATE uuid_logs
-	SET closed_at = ?,
-	    expired_at = COALESCE(expired_at, ?)
-	WHERE emp_id = ?
-	  AND action = 'clock_in'
-	  AND closed_at IS NULL
-	  AND expires_at IS NOT NULL
-	  AND expires_at < ?
-`, nowDB, nowDB, empID, nowDB)
+		UPDATE uuid_logs
+		SET closed_at = ?,
+		    expired_at = COALESCE(expired_at, ?)
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+		  AND expires_at IS NOT NULL
+		  AND expires_at < ?
+	`, nowDB, nowDB, empID, nowDB)
 
-	// 🔒 Prevent multiple active sessions
+	// Prevent multiple active sessions.
 	var existingUUID string
 	var existingExpiry sql.NullTime
 
 	err = db.QueryRow(`
-    SELECT uuid_value, expires_at
-    FROM uuid_logs
-WHERE emp_id = ?
-AND action = 'clock_in'
-AND closed_at IS NULL
-AND (expires_at IS NULL OR ? < expires_at)
-    ORDER BY generated_at DESC
-    LIMIT 1
-`, empID, nowDB).Scan(&existingUUID, &existingExpiry)
+		SELECT uuid_value, expires_at
+		FROM uuid_logs
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+		  AND (expires_at IS NULL OR ? < expires_at)
+		ORDER BY generated_at DESC
+		LIMIT 1
+	`, empID, nowDB).Scan(&existingUUID, &existingExpiry)
 
 	if err == nil {
-
-		// If session still valid → block login
 		if existingExpiry.Valid && utcNow().Before(existingExpiry.Time) {
 			http.Error(w, "already clocked in", http.StatusConflict)
 			return
 		}
 
-		// If expired → close the session automatically
 		_, _ = db.Exec(`
-        UPDATE uuid_logs
-        SET closed_at = ?,
-            expired_at = COALESCE(expired_at, ?)
-        WHERE uuid_value = ?
-          AND action = 'clock_in'
-          AND closed_at IS NULL
-    `, nowDB, nowDB, existingUUID)
-	}
-
-	sessionUUID := uuid.New().String()
-	issuedAt := now
-	expiresAt := issuedAt.Add(8 * time.Hour)
-
-	_, err = db.Exec(`
-INSERT INTO uuid_logs (
-    uuid_value,
-    emp_id,
-    bin_id,
-    generated_at,
-    expires_at,
-    is_used,
-    action,
-    uuid_type
-)
-VALUES (?, ?, NULL, ?, ?, 0, 'clock_in', 'SESSION')
-`, sessionUUID, empID, dbTime(issuedAt), dbTime(expiresAt))
-
-	if err != nil {
-
-		if strings.Contains(err.Error(), "one_open_session") {
-			http.Error(w, "already clocked in", http.StatusConflict)
-			return
-		}
-
+			UPDATE uuid_logs
+			SET closed_at = ?,
+			    expired_at = COALESCE(expired_at, ?)
+			WHERE uuid_value = ?
+			  AND action = 'clock_in'
+			  AND closed_at IS NULL
+		`, nowDB, nowDB, existingUUID)
+	} else if err != sql.ErrNoRows {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
-	broadcastActiveUUIDCount()
+
+	sessionUUID := uuid.New().String()
+	pendingToken := uuid.New().String()
+	pendingExpiresAt := now.Add(3 * time.Minute)
+
+	// Remove old/expired pending attempts for this employee.
+	_, _ = db.Exec(`
+		DELETE FROM pending_clockins
+		WHERE expires_at < ?
+		   OR (emp_id = ? AND used_at IS NULL)
+	`, nowDB, empID)
 
 	_, err = db.Exec(`
-		UPDATE employees
-		SET current_uuid = ?,
-			uuid_issued_at = ?,
-			uuid_expires_at = ?
-		WHERE emp_id = ?
-	`, sessionUUID, dbTime(issuedAt), dbTime(expiresAt), empID)
+		INSERT INTO pending_clockins (
+			emp_id,
+			uuid_value,
+			pending_token,
+			created_at,
+			expires_at
+		)
+		VALUES (?, ?, ?, ?, ?)
+	`, empID, sessionUUID, pendingToken, nowDB, dbTime(pendingExpiresAt))
 
 	if err != nil {
+		log.Println("pending clock-in insert failed:", err)
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
 
 	writeJSON(w, pinResp{
-		Valid:        true,
-		Role:         role,
-		EmployeeID:   empID,
-		EmployeeName: empName,
-		SessionUUID:  sessionUUID,
+		Valid:            true,
+		Role:             role,
+		EmployeeID:       empID,
+		EmployeeName:     empName,
+		SessionUUID:      sessionUUID,
+		PendingToken:     pendingToken,
+		PendingExpiresAt: pendingExpiresAt.Unix(),
 	})
+}
+
+func handleAuthPINCommit(w http.ResponseWriter, r *http.Request) {
+	// This endpoint creates the active 8-hour session ONLY after
+	// the ESP confirms the RFID card was written and read-back verified.
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req pinCommitReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+
+	req.PendingToken = strings.TrimSpace(req.PendingToken)
+	req.SessionUUID = strings.TrimSpace(req.SessionUUID)
+	req.UUID = strings.TrimSpace(req.UUID)
+
+	if req.SessionUUID == "" && req.UUID != "" {
+		req.SessionUUID = req.UUID
+	}
+
+	if req.EmployeeID <= 0 || req.PendingToken == "" || req.SessionUUID == "" {
+		http.Error(w, "missing fields", http.StatusBadRequest)
+		return
+	}
+
+	if _, err := uuid.Parse(req.SessionUUID); err != nil {
+		http.Error(w, "invalid uuid", http.StatusBadRequest)
+		return
+	}
+
+	now := utcNow()
+	nowDB := dbTime(now)
+	issuedAt := now
+	expiresAt := issuedAt.Add(8 * time.Hour)
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "tx error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	var pendingEmpID int
+	var pendingUUID string
+	var pendingExpiresAt time.Time
+
+	err = tx.QueryRow(`
+		SELECT emp_id, uuid_value, expires_at
+		FROM pending_clockins
+		WHERE pending_token = ?
+		  AND used_at IS NULL
+		LIMIT 1
+		FOR UPDATE
+	`, req.PendingToken).Scan(&pendingEmpID, &pendingUUID, &pendingExpiresAt)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "pending clock-in not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		log.Println("pending lookup failed:", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	if pendingEmpID != req.EmployeeID || pendingUUID != req.SessionUUID {
+		http.Error(w, "pending clock-in mismatch", http.StatusConflict)
+		return
+	}
+
+	if now.After(pendingExpiresAt) {
+		_, _ = tx.Exec(`DELETE FROM pending_clockins WHERE pending_token = ?`, req.PendingToken)
+		http.Error(w, "pending clock-in expired", http.StatusGone)
+		return
+	}
+
+	// Close any expired active sessions first.
+	_, _ = tx.Exec(`
+		UPDATE uuid_logs
+		SET closed_at = ?,
+		    expired_at = COALESCE(expired_at, ?)
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+		  AND expires_at IS NOT NULL
+		  AND expires_at < ?
+	`, nowDB, nowDB, req.EmployeeID, nowDB)
+
+	// Prevent multiple active sessions at commit time too.
+	var activeUUID string
+	var activeExpiry sql.NullTime
+
+	err = tx.QueryRow(`
+		SELECT uuid_value, expires_at
+		FROM uuid_logs
+		WHERE emp_id = ?
+		  AND action = 'clock_in'
+		  AND closed_at IS NULL
+		  AND (expires_at IS NULL OR ? < expires_at)
+		ORDER BY generated_at DESC
+		LIMIT 1
+		FOR UPDATE
+	`, req.EmployeeID, nowDB).Scan(&activeUUID, &activeExpiry)
+
+	if err == nil {
+		if activeExpiry.Valid && now.Before(activeExpiry.Time) {
+			http.Error(w, "already clocked in", http.StatusConflict)
+			return
+		}
+	} else if err != sql.ErrNoRows {
+		log.Println("active session check failed:", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO uuid_logs (
+			uuid_value,
+			emp_id,
+			bin_id,
+			generated_at,
+			expires_at,
+			is_used,
+			action,
+			uuid_type
+		)
+		VALUES (?, ?, NULL, ?, ?, 0, 'clock_in', 'SESSION')
+	`, req.SessionUUID, req.EmployeeID, dbTime(issuedAt), dbTime(expiresAt))
+
+	if err != nil {
+		if strings.Contains(err.Error(), "one_open_session") {
+			http.Error(w, "already clocked in", http.StatusConflict)
+			return
+		}
+
+		log.Println("clock-in insert failed:", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = tx.Exec(`
+		UPDATE employees
+		SET current_uuid = ?,
+		    uuid_issued_at = ?,
+		    uuid_expires_at = ?
+		WHERE emp_id = ?
+		  AND is_active = 1
+		  AND is_hidden = 0
+		  AND is_deleted = 0
+	`, req.SessionUUID, dbTime(issuedAt), dbTime(expiresAt), req.EmployeeID)
+
+	if err != nil {
+		log.Println("employee uuid update failed:", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = tx.Exec(`
+		UPDATE pending_clockins
+		SET used_at = ?
+		WHERE pending_token = ?
+	`, nowDB, req.PendingToken)
+
+	if err != nil {
+		log.Println("pending used update failed:", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Println("clock-in commit failed:", err)
+		http.Error(w, "commit failed", http.StatusInternalServerError)
+		return
+	}
+
+	broadcastActiveUUIDCount()
+
+	writeJSON(w, pinCommitResp{
+		OK:        true,
+		ExpiresAt: expiresAt.Unix(),
+		Message:   "session_created",
+	})
+}
+
+func handleAuthPINPrepare(w http.ResponseWriter, r *http.Request) {
+	handleAuthPIN(w, r)
 }
 
 /* ---------- EMPLOYEES ---------- */
@@ -4521,11 +4719,35 @@ VALUES (?, ?, ?, ?)
 	})
 }
 
+func ensurePendingClockinsTable() {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS pending_clockins (
+			pending_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			emp_id INT NOT NULL,
+			uuid_value CHAR(36) NOT NULL,
+			pending_token VARCHAR(80) NOT NULL,
+			created_at DATETIME NOT NULL,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME NULL,
+			UNIQUE KEY uq_pending_token (pending_token),
+			KEY idx_pending_emp (emp_id),
+			KEY idx_pending_uuid (uuid_value),
+			KEY idx_pending_expires (expires_at)
+		)
+	`)
+	if err != nil {
+		log.Fatal("❌ Failed to ensure pending_clockins table:", err)
+	}
+}
+
 // ========== MAIN ==========
 func main() {
 	var err error
 
-	dsn := "tracker:Rootpass2025@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=America%2FJamaica"
+	dsn := os.Getenv("WASTE_DB_DSN")
+	if dsn == "" {
+		dsn = "tracker:Rootpass2025@tcp(127.0.0.1:3306)/iot_medical_waste_tracker?parseTime=true&loc=America%2FJamaica"
+	}
 
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
@@ -4540,6 +4762,7 @@ func main() {
 	}
 
 	fmt.Println("✅ Connected to MySQL (Jamaica/server time mode)")
+	ensurePendingClockinsTable()
 	startUUIDDailyRollupJob()
 
 	// ===== ROUTES =====
@@ -4585,6 +4808,8 @@ func main() {
 	http.HandleFunc("/employees/hidden", handleHiddenEmployees)
 
 	// --- Auth + UUID ---
+	http.HandleFunc("/auth/pin/prepare", handleAuthPINPrepare)
+	http.HandleFunc("/auth/pin/commit", handleAuthPINCommit)
 	http.HandleFunc("/auth/pin", handleAuthPIN)
 	http.HandleFunc("/uuid/create/from-pin", handleUUIDCreateFromPIN)
 	http.HandleFunc("/uuid/create/legacy", handleUUIDCreate)

@@ -803,7 +803,6 @@ dialog{
   <th>Temp (°C)</th>
   <th>Humidity (%)</th>
   <th>Fill (%)</th>
-  <th>Battery (%)</th>
   <th>Lid</th>
   <th>Last Seen (Local)</th>
 </tr>
@@ -975,7 +974,6 @@ dialog{
 <th>Temp (°C)</th>
 <th>Humidity (%)</th>
 <th>Fill (%)</th>
-<th>Battery (%)</th>
 <th>Lid</th>
 <th>Action</th>
 </tr>
@@ -1769,7 +1767,7 @@ async function loadBinClasses(){
   window._binData = new Map();
 
   const tbody = document.querySelector("#binClassesTable tbody");
-tbody.innerHTML = "<tr><td colspan='8'>Loading...</td></tr>";
+tbody.innerHTML = "<tr><td colspan='7'>Loading...</td></tr>";
 
   try {
     const resp = await fetch("/admin/bins.json", {cache:"no-store"});
@@ -1778,7 +1776,7 @@ tbody.innerHTML = "<tr><td colspan='8'>Loading...</td></tr>";
     console.log("BINS DATA:", data);
 
     if (!data || !Array.isArray(data.bins)){
-tbody.innerHTML = `<tr><td colspan="8">No bins found</td></tr>`;
+tbody.innerHTML = `<tr><td colspan="7">No bins found</td></tr>`;
       return;
     }
 
@@ -1803,7 +1801,6 @@ const row = {
   temp: live?.temp_c ?? null,
   humidity: live?.humidity_pct ?? null,
   fill: live?.fill_pct ?? null,
-  battery: live?.battery_pct ?? null,
   door: live?.door_open
 };
       window._binData.set(b.bin_id, row);
@@ -1814,7 +1811,7 @@ const row = {
 
   } catch (err) {
     console.error("BIN LOAD ERROR:", err);
-tbody.innerHTML = "<tr><td colspan='8'>Error loading bins</td></tr>";
+tbody.innerHTML = "<tr><td colspan='7'>Error loading bins</td></tr>";
   }
 }
 
@@ -1853,7 +1850,6 @@ function renderBinTable(rows){
 const tempTxt = r.temp != null ? `${r.temp.toFixed(1)} °C` : "—";
 const humTxt  = r.humidity != null ? `${r.humidity.toFixed(1)} %` : "—";
 const fillTxt = r.fill != null ? `${r.fill.toFixed(0)}%` : "—";
-const battTxt = r.battery != null ? `${r.battery.toFixed(0)}%` : "—";
 
 let doorCell = "—";
 if (r.door === 1) doorCell = `<span class="pill pill-warn">OPEN</span>`;
@@ -1875,7 +1871,6 @@ if (r.door === 0) doorCell = `<span class="pill pill-ok">CLOSED</span>`;
 <td class="temp">${tempTxt}</td>
 <td class="humidity">${humTxt}</td>
 <td class="fill">${fillTxt}</td>
-<td class="battery">${battTxt}</td>
 <td class="lid">${doorCell}</td>
 <td>
           <button type="button"
@@ -2285,11 +2280,7 @@ window.loadHiddenEmployees = async function() {
 
 tempWarn: 32,
 tempCritical: 35,
-
-      batteryWarn: 25,
-      batteryCritical: 15,
-
-      offlineWarnMs: 5 * 60 * 1000,
+offlineWarnMs: 5 * 60 * 1000,
       offlineCriticalMs: 10 * 60 * 1000,
 
       lidOpenDelayMs: 2 * 60 * 1000
@@ -2375,7 +2366,6 @@ const smartAlertMin = document.getElementById("smartAlertMin");
         const binLabel = smartBinLabel(r);
         const fill = Number(r.fill_pct);
         const temp = Number(r.temp_c);
-        const batt = Number(r.battery_pct);
 
         if (Number.isFinite(fill)){
           if (fill >= SMART_THRESHOLDS.fillCritical){
@@ -2453,33 +2443,6 @@ const smartAlertMin = document.getElementById("smartAlertMin");
           } else {
             smartAlertState.acknowledged.delete(`tempcrit-${id}`);
             smartAlertState.acknowledged.delete(`tempwarn-${id}`);
-          }
-        }
-
-        if (Number.isFinite(batt)){
-          if (batt <= SMART_THRESHOLDS.batteryCritical){
-            addSmartAlert(alerts, {
-              id: `battcrit-${id}`,
-              severity: "critical",
-              icon: "🪫",
-              title: "Battery Critical",
-              message: `${binLabel} battery is ${batt.toFixed(0)}%.`,
-              bin: binLabel,
-              time: smartNowText()
-            });
-          } else if (batt <= SMART_THRESHOLDS.batteryWarn){
-            addSmartAlert(alerts, {
-              id: `battwarn-${id}`,
-              severity: "warning",
-              icon: "🔋",
-              title: "Low Battery",
-              message: `${binLabel} battery is ${batt.toFixed(0)}%.`,
-              bin: binLabel,
-              time: smartNowText()
-            });
-          } else {
-            smartAlertState.acknowledged.delete(`battcrit-${id}`);
-            smartAlertState.acknowledged.delete(`battwarn-${id}`);
           }
         }
 
@@ -2744,7 +2707,7 @@ smartAlertHeader?.addEventListener("click", (e) => {
 function renderLive(){
 
   if (!liveState.size){
-    liveBodyEl.innerHTML = `<tr><td colspan="8">No data</td></tr>`;
+    liveBodyEl.innerHTML = `<tr><td colspan="7">No data</td></tr>`;
     return;
   }
 
@@ -2761,7 +2724,6 @@ liveBodyEl.innerHTML = Array.from(liveState.values()).map(r => `
     <td class="temp">-</td>
     <td class="humidity">-</td>
     <td class="fill">-</td>
-    <td class="battery">-</td>
     <td class="lid">-</td>
     <td class="last_seen">-</td>
   </tr>
@@ -2777,7 +2739,6 @@ liveBodyEl.innerHTML = Array.from(liveState.values()).map(r => `
 const tempEl = row.querySelector(".temp");
 const humEl  = row.querySelector(".humidity");
 const fillEl = row.querySelector(".fill");
-const battEl = row.querySelector(".battery");
 const lidEl  = row.querySelector(".lid");
 const timeEl = row.querySelector(".last_seen");
 
@@ -2789,9 +2750,6 @@ if (humEl) humEl.textContent =
 
 if (fillEl) fillEl.textContent =
   r.fill_pct != null ? `${r.fill_pct.toFixed(0)}%` : "-";
-
-  if (battEl) battEl.textContent =
-  r.battery_pct != null ? `${r.battery_pct.toFixed(0)}%` : "-";
 
     if (lidEl){
       if (r.door_open === 1){
@@ -2827,7 +2785,6 @@ async function seedLive(){
         temp_c: b.temp_c ?? null,
         humidity_pct: b.humidity_pct ?? null,
         fill_pct: b.fill_pct ?? null,
-        battery_pct: b.battery_pct ?? null,
         door_open: b.door_open ?? null,
         last_seen: b.last_seen || "",
         _lastUpdateMs: Date.now()
@@ -2865,7 +2822,6 @@ function applyTelemetry(msg){
     temp_c: msg.temp_c ?? existing.temp_c ?? null,
     humidity_pct: msg.humidity_pct ?? existing.humidity_pct ?? null,
     fill_pct: msg.fill_pct ?? existing.fill_pct ?? null,
-    battery_pct: msg.battery_pct ?? existing.battery_pct ?? null,
     door_open: msg.door_open ?? existing.door_open ?? null,
     last_seen: msg.last_seen || existing.last_seen || "",
     _lastUpdateMs: Date.now()
@@ -2883,7 +2839,6 @@ function applyTelemetry(msg){
 const tempEl = mainRow.querySelector(".temp");
 const humEl  = mainRow.querySelector(".humidity");
 const fillEl = mainRow.querySelector(".fill");
-const battEl = mainRow.querySelector(".battery");
 const lidEl  = mainRow.querySelector(".lid");
 const timeEl = mainRow.querySelector(".last_seen");
 
@@ -2897,9 +2852,6 @@ if (humEl && msg.humidity_pct != null){
 
 if (fillEl && msg.fill_pct != null){
   fillEl.textContent = `${msg.fill_pct.toFixed(0)}%`;
-}
-if (battEl && msg.battery_pct != null){
-  battEl.textContent = `${msg.battery_pct.toFixed(0)}%`;
 }
 
     if (lidEl){
@@ -2925,7 +2877,6 @@ if (timeEl && msg.last_seen){
 const tempEl = modalRow.querySelector(".temp");
 const humEl  = modalRow.querySelector(".humidity");
 const fillEl = modalRow.querySelector(".fill");
-const battEl = modalRow.querySelector(".battery");
 const lidEl  = modalRow.querySelector(".lid");
 
 if (tempEl && msg.temp_c != null){
@@ -2937,9 +2888,6 @@ if (humEl && msg.humidity_pct != null){
 }
     if (fillEl && msg.fill_pct != null){
   fillEl.textContent = `${msg.fill_pct.toFixed(0)}%`;
-}
-if (battEl && msg.battery_pct != null){
-  battEl.textContent = `${msg.battery_pct.toFixed(0)}%`;
 }
 
     if (lidEl){
@@ -2977,7 +2925,6 @@ if (battEl && msg.battery_pct != null){
               temp_c: b.temp_c ?? null,
               humidity_pct: b.humidity_pct ?? null,
               fill_pct: b.fill_pct ?? null,
-              battery_pct: b.battery_pct ?? null,
               door_open: b.door_open ?? null,
               last_seen: b.last_seen || "",
               _lastUpdateMs: Date.now()
