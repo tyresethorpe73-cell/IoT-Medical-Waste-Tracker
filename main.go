@@ -3828,6 +3828,20 @@ type managerUUIDCreateReq struct {
 	PIN string `json:"pin"`
 }
 
+type managerUUIDCreateResp struct {
+	UUID             string    `json:"uuid"`
+	ManagerID        int       `json:"manager_id"`
+	PendingToken     string    `json:"pending_token"`
+	PendingExpiresAt int64     `json:"pending_expires_at"`
+	ExpiresAt        time.Time `json:"expires_at"`
+}
+
+type managerUUIDCommitReq struct {
+	ManagerID    int    `json:"manager_id"`
+	UUID         string `json:"uuid"`
+	PendingToken string `json:"pending_token"`
+}
+
 type managerValidateReq struct {
 	UUID string `json:"uuid"`
 }
@@ -4041,12 +4055,13 @@ func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.PIN = strings.TrimSpace(req.PIN)
+
 	if len(req.PIN) != 5 {
 		bad(w, 400, "5-digit pin required")
 		return
 	}
 
-	// 1️⃣ Find manager by PIN
 	var managerID int
 
 	err := db.QueryRow(`
@@ -4066,7 +4081,6 @@ func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2️⃣ Check if active UUID already exists
 	now := utcNow()
 	nowDB := dbTime(now)
 
@@ -4084,26 +4098,181 @@ func handleManagerUUIDCreate(w http.ResponseWriter, r *http.Request) {
 		bad(w, 409, "manager already has active credential")
 		return
 	}
+	if err != sql.ErrNoRows {
+		bad(w, 500, "db")
+		return
+	}
 
-	// 3️⃣ Generate new UUID
+	_, _ = db.Exec(`
+		DELETE FROM pending_manager_uuids
+		WHERE manager_id = ?
+		  AND used_at IS NULL
+	`, managerID)
+
 	newUUID := uuid.New().String()
-	createdAt := now
-	expires := createdAt.AddDate(0, 6, 0)
+	pendingToken := uuid.New().String()
+	pendingExpiresAt := now.Add(3 * time.Minute)
+	credentialExpiresAt := now.AddDate(0, 6, 0)
 
 	_, err = db.Exec(`
+        INSERT INTO pending_manager_uuids (
+			manager_id,
+			uuid_value,
+			pending_token,
+			created_at,
+			expires_at,
+			credential_expires_at
+		)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `, managerID, newUUID, pendingToken, nowDB, dbTime(pendingExpiresAt), dbTime(credentialExpiresAt))
+
+	if err != nil {
+		bad(w, 500, "insert pending failed")
+		return
+	}
+
+	writeJSON(w, managerUUIDCreateResp{
+		UUID:             newUUID,
+		ManagerID:        managerID,
+		PendingToken:     pendingToken,
+		PendingExpiresAt: pendingExpiresAt.Unix(),
+		ExpiresAt:        credentialExpiresAt,
+	})
+}
+
+func handleManagerUUIDCommit(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		bad(w, 405, "POST only")
+		return
+	}
+
+	var req managerUUIDCommitReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		bad(w, 400, "bad json")
+		return
+	}
+
+	req.UUID = strings.TrimSpace(req.UUID)
+	req.PendingToken = strings.TrimSpace(req.PendingToken)
+
+	if req.ManagerID <= 0 || req.UUID == "" || req.PendingToken == "" {
+		bad(w, 400, "missing fields")
+		return
+	}
+
+	if _, err := uuid.Parse(req.UUID); err != nil {
+		bad(w, 400, "invalid uuid")
+		return
+	}
+
+	now := utcNow()
+	nowDB := dbTime(now)
+
+	tx, err := db.Begin()
+	if err != nil {
+		bad(w, 500, "tx")
+		return
+	}
+	defer tx.Rollback()
+
+	var pendingID int
+	var pendingExpiresAt time.Time
+	var credentialExpiresAt time.Time
+
+	err = tx.QueryRow(`
+		SELECT id, expires_at, credential_expires_at
+		FROM pending_manager_uuids
+		WHERE manager_id = ?
+		  AND uuid_value = ?
+		  AND pending_token = ?
+		  AND used_at IS NULL
+		LIMIT 1
+	`, req.ManagerID, req.UUID, req.PendingToken).Scan(&pendingID, &pendingExpiresAt, &credentialExpiresAt)
+
+	if err == sql.ErrNoRows {
+		bad(w, 409, "pending manager uuid not found")
+		return
+	}
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	if now.After(pendingExpiresAt) {
+		bad(w, 409, "pending manager uuid expired")
+		return
+	}
+
+	var activeManager int
+	err = tx.QueryRow(`
+		SELECT 1
+		FROM managers
+		WHERE manager_id = ?
+		  AND is_active = 1
+		LIMIT 1
+	`, req.ManagerID).Scan(&activeManager)
+
+	if err == sql.ErrNoRows {
+		bad(w, 401, "manager inactive")
+		return
+	}
+	if err != nil {
+		bad(w, 500, "db")
+		return
+	}
+
+	var exists int
+	err = tx.QueryRow(`
+		SELECT 1
+		FROM manager_uuids
+		WHERE manager_id = ?
+		  AND is_revoked = 0
+		  AND (expires_at IS NULL OR ? < expires_at)
+		LIMIT 1
+	`, req.ManagerID, nowDB).Scan(&exists)
+
+	if err == nil {
+		bad(w, 409, "manager already has active credential")
+		return
+	}
+	if err != sql.ErrNoRows {
+		bad(w, 500, "db")
+		return
+	}
+
+	_, err = tx.Exec(`
         INSERT INTO manager_uuids
         (uuid_value, manager_id, is_revoked, created_at, expires_at)
         VALUES (?, ?, 0, ?, ?)
-    `, newUUID, managerID, dbTime(createdAt), dbTime(expires))
+    `, req.UUID, req.ManagerID, nowDB, dbTime(credentialExpiresAt))
 
 	if err != nil {
 		bad(w, 500, "insert failed")
 		return
 	}
 
+	_, err = tx.Exec(`
+		UPDATE pending_manager_uuids
+		SET used_at = ?
+		WHERE id = ?
+	`, nowDB, pendingID)
+
+	if err != nil {
+		bad(w, 500, "update pending failed")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		bad(w, 500, "commit failed")
+		return
+	}
+
 	writeJSON(w, map[string]any{
-		"uuid":       newUUID,
-		"expires_at": expires,
+		"ok":         true,
+		"message":    "manager_uuid_created",
+		"uuid":       req.UUID,
+		"expires_at": credentialExpiresAt,
 	})
 }
 
@@ -4679,6 +4848,27 @@ func ensurePendingClockinsTable() {
 	}
 }
 
+func ensurePendingManagerUUIDsTable() {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS pending_manager_uuids (
+			id INT AUTO_INCREMENT PRIMARY KEY,
+			manager_id INT NOT NULL,
+			uuid_value CHAR(36) NOT NULL,
+			pending_token VARCHAR(80) NOT NULL,
+			created_at DATETIME NOT NULL,
+			expires_at DATETIME NOT NULL,
+			credential_expires_at DATETIME NOT NULL,
+			used_at DATETIME NULL,
+			INDEX idx_pending_mgr_token (pending_token),
+			INDEX idx_pending_mgr_id (manager_id),
+			INDEX idx_pending_mgr_uuid (uuid_value)
+		)
+	`)
+	if err != nil {
+		log.Println("pending_manager_uuids table setup failed:", err)
+	}
+}
+
 func main() {
 	var err error
 
@@ -4698,6 +4888,7 @@ func main() {
 
 	fmt.Println("✅ Connected to MySQL (Jamaica/server time mode)")
 	ensurePendingClockinsTable()
+	ensurePendingManagerUUIDsTable()
 	startUUIDDailyRollupJob()
 
 	// ===== ROUTES =====
@@ -4756,6 +4947,8 @@ func main() {
 	http.HandleFunc("/managers/delete", handleManagerDelete)
 	http.HandleFunc("/managers/change-pin", handleManagerChangePin)
 	http.HandleFunc("/managers/uuid", handleManagerUUIDCreate)
+	http.HandleFunc("/managers/uuid/prepare", handleManagerUUIDCreate)
+	http.HandleFunc("/managers/uuid/commit", handleManagerUUIDCommit)
 	http.HandleFunc("/managers/uuid/revoke", handleManagerUUIDRevoke)
 	http.HandleFunc("/managers/uuid/validate", handleManagerValidate)
 	http.HandleFunc("/managers/", handleManagerUUIDList)
