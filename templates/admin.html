@@ -1445,18 +1445,29 @@ function formatLocal(ts){
   // Backend already sends Jamaica/server local time.
   // Do not let JavaScript shift it by timezone conversion.
   if (/^\d{4}-\d{2}-\d{2}/.test(ts)) {
-    const [datePartRaw, timePartRaw] = ts.split(" ");
+    const parts = String(ts).trim().split(/\s+/);
+    const datePartRaw = parts[0];
+    const timePartRaw = parts[1];
+    const meridiemRaw = parts[2] || "";
+
     if (!datePartRaw || !timePartRaw) return ts;
 
     const [y, m, d] = datePartRaw.split("-");
-    const [hh, mm, ssRaw] = timePartRaw.split(":");
+    const timeParts = timePartRaw.split(":");
 
-    let hour = parseInt(hh, 10);
-    const suffix = hour >= 12 ? "PM" : "AM";
-    hour = hour % 12;
-    if (hour === 0) hour = 12;
+    let hour = parseInt(timeParts[0], 10);
+    const mm = timeParts[1] || "00";
+    const ss = timeParts[2] || "00";
+    let suffix = meridiemRaw.toUpperCase();
 
-    const ss = ssRaw || "00";
+    if (suffix === "AM" || suffix === "PM") {
+      if (hour === 0) hour = 12;
+      if (hour > 12) hour = hour - 12;
+    } else {
+      suffix = hour >= 12 ? "PM" : "AM";
+      hour = hour % 12;
+      if (hour === 0) hour = 12;
+    }
 
     return `${m}/${d}/${y}<br>${hour}:${mm}:${ss} ${suffix}`;
   }
