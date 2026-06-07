@@ -1,0 +1,2420 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <PCF8574.h>
+#include <U8g2lib.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <MFRC522.h>
+#include <RTClib.h>
+#include <time.h>
+
+const char* WIFI_SSID = "LIB-6642744";
+const char* WIFI_PASS = "9saumKpYkcyx";
+
+const char* SERVER_BASE_URL = "http://192.168.50.10:8080";
+
+
+/* ========== I2C / KEYPAD ========== */
+#define I2C_SDA 21
+#define I2C_SCL 22
+PCF8574 pcf(0x20);
+
+/* ========== OLED (SPI) ========== */
+#define OLED_CS   14
+#define OLED_DC   27
+#define OLED_RST  33
+
+U8G2_SSD1309_128X64_NONAME0_F_4W_HW_SPI oled(
+  U8G2_R0, OLED_CS, OLED_DC, OLED_RST
+);
+
+#define PIN_DIGITS 5        // what the user must type
+#define PIN_BUFFER_SIZE 6  // PIN_DIGITS + null terminator
+
+#define RFID_SS   5
+#define RFID_RST  13
+MFRC522 rfid(RFID_SS, RFID_RST);
+
+#define GREEN_LED 25
+#define RED_LED   26
+
+RTC_DS3231 rtc;
+bool rtcInitialized = false;
+
+enum State {
+  BOOT,
+  HOME,        
+  IDLE,
+  PIN_ENTRY_EMP,
+  PIN_ENTRY_MGR,
+  VERIFY_EMP,
+  VERIFY_MGR,
+  CARD_SCAN_IN,
+  CARD_SCAN_OUT,
+  PROGRAM_CARD,
+  CHECK_CARD,
+  PROGRAM_OVERRIDE,
+  NETWORK_STATUS,
+
+  REGISTER_UID_SCAN,   
+  REGISTER_UID_BIN,    
+  REGISTER_UID_SEND,   
+
+  SUCCESS,
+  ERROR_STATE
+};
+State currentState = BOOT;
+State lastState = BOOT;
+
+bool verificationDone = false;
+bool pinActive = false;
+bool pinReadyToVerify = false;
+State pinSourceState;
+
+String employeeID;
+String employeeName;
+String managerID = "";
+String sessionUUID;
+String pendingToken = "";
+bool managerEnrollMode = false;
+String scannedUID = "";
+String selectedBin = "";
+
+//  Success screen details
+String successTitle = "Success";
+String successLine1 = "";
+String successLine2 = "";
+String successLine3 = "";
+
+unsigned long lastActivityTime = 0;
+const unsigned long INACTIVITY_TIMEOUT = 60000;  // 1 minute
+
+unsigned long lastHealthCheck = 0;
+int lastHealthCode = 0;
+unsigned long lastRtcSyncAttempt = 0;
+bool rtcSyncedFromNTP = false;
+const unsigned long RTC_SYNC_RETRY_INTERVAL = 30000; // retry every 30 seconds
+
+enum ConnectionStatus {
+  CONN_UNKNOWN,
+  CONN_OK,
+  CONN_WIFI_DNS_DOWN,
+  CONN_SERVER_OFFLINE
+};
+
+ConnectionStatus lastConnectionStatus = CONN_UNKNOWN;
+
+// 🔴 WiFi disconnect blink control
+unsigned long lastWifiBlink = 0;
+bool redState = false;
+unsigned long lastPulse = 0;
+
+unsigned long lastReconnectAttempt = 0;
+unsigned long wifiConnectStartedAt = 0;
+const unsigned long RECONNECT_INTERVAL = 5000;
+enum ServerResult {
+  SERVER_OK,
+  SERVER_INVALID_PIN,
+  SERVER_ALREADY_CLOCKED_IN,
+  SERVER_ERROR,
+  SERVER_UNREACHABLE
+};
+
+enum ClockOutResult {
+  CLOCKOUT_OK,
+  CLOCKOUT_WIFI_DNS_DOWN,
+  CLOCKOUT_SERVER_OFFLINE,
+  CLOCKOUT_EMPLOYEE_INACTIVE,
+  CLOCKOUT_UUID_NOT_FOUND,
+  CLOCKOUT_ALREADY_CLOSED,
+  CLOCKOUT_BAD_REQUEST,
+  CLOCKOUT_SERVER_ERROR
+};
+
+ClockOutResult lastClockOutResult = CLOCKOUT_OK;
+String lastClockOutMessage = "";
+
+ServerResult lastServerResult = SERVER_OK;
+
+
+bool allowBackgroundNetworkTasks() {
+  return currentState == HOME ||
+         currentState == IDLE ||
+         currentState == NETWORK_STATUS;
+}
+
+void showConnectionIssue() {
+  oled.clearBuffer();
+
+  if (lastConnectionStatus == CONN_WIFI_DNS_DOWN ||
+      WiFi.status() != WL_CONNECTED) {
+
+    oled.drawStr(0, 20, "WiFi/DNS Down");
+    oled.drawStr(0, 35, "Check Router");
+  }
+  else if (lastConnectionStatus == CONN_SERVER_OFFLINE) {
+
+    oled.drawStr(0, 20, "Server Offline");
+    oled.drawStr(0, 35, "Start Go Server");
+  }
+  else {
+    oled.drawStr(0, 25, "Network OK");
+  }
+
+  oled.sendBuffer();
+}
+
+void showClockOutIssue() {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x8_tf);
+
+  if (lastClockOutResult == CLOCKOUT_WIFI_DNS_DOWN ||
+      lastClockOutResult == CLOCKOUT_SERVER_OFFLINE) {
+    showConnectionIssue();
+    return;
+  }
+
+  oled.drawStr(0, 10, "Clock-Out Failed");
+  oled.drawHLine(0, 14, 128);
+
+  if (lastClockOutResult == CLOCKOUT_EMPLOYEE_INACTIVE) {
+    oled.drawStr(0, 30, "Employee Inactive");
+    oled.drawStr(0, 45, "Access Disabled");
+  }
+  else if (lastClockOutResult == CLOCKOUT_UUID_NOT_FOUND) {
+    oled.drawStr(0, 30, "UUID Not Found");
+    oled.drawStr(0, 45, "Check Card");
+  }
+  else if (lastClockOutResult == CLOCKOUT_ALREADY_CLOSED) {
+    oled.drawStr(0, 30, "Already Clocked");
+    oled.drawStr(0, 45, "Out");
+  }
+  else if (lastClockOutResult == CLOCKOUT_BAD_REQUEST) {
+    oled.drawStr(0, 30, "Bad UUID");
+    oled.drawStr(0, 45, "Reprogram Card");
+  }
+  else {
+    oled.drawStr(0, 30, "Server Error");
+    oled.drawStr(0, 45, "Check Backend Log");
+  }
+
+  oled.sendBuffer();
+}
+
+//  Red LED should flash if WiFi is disconnected OR server is unreachable/down
+bool shouldFlashRedLED() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return true;
+  }
+
+  if (lastConnectionStatus == CONN_WIFI_DNS_DOWN ||
+      lastConnectionStatus == CONN_SERVER_OFFLINE) {
+    return true;
+  }
+
+  return false;
+}
+
+
+char pinBuffer[PIN_BUFFER_SIZE];
+
+uint8_t pinIndex = 0;
+
+char keyMap[4][4] = {
+  {'D','C','B','A'},
+  {'#','9','6','3'},
+  {'0','8','5','2'},
+  {'*','7','4','1'}
+};
+
+MFRC522::MIFARE_Key key;
+
+// Function prototypes
+void setSuccessMessage(String title, String line1 = "", String line2 = "", String line3 = "");
+void resetPin();
+void startTimedTransition(unsigned long durationMs, State nextState);
+void serviceTimedTransition();
+void serviceGreenPulse();
+void initRFIDKey();
+bool isRFIDScanState();
+void prepareRFIDForScan();
+void cleanupRFID();
+void serviceRFIDRecovery();
+String buildURL(const char* path);
+bool resolveServerHost(IPAddress &resolvedIP);
+bool writeBlock(byte block, byte *data);
+const char* wifiStatusText(wl_status_t s);
+bool syncRTCFromNTP();
+char readKeypad();
+void drawIdleScreen();
+void drawHomeScreen();
+void drawPinEntry(const char* title);
+void handleIdleInput(char key);
+void handlePinInput(char key);
+String readUUIDFromCard();
+bool verifyPinWithServer(const char* pin, bool &isManager);
+bool commitClockInWithServer();
+bool commitManagerUUIDWithServer();
+
+bool commitManagerUUIDWithServer() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    lastHealthCode = 0;
+    lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+    return false;
+  }
+
+  IPAddress resolvedIP;
+  if (!resolveServerHost(resolvedIP)) {
+    lastHealthCode = -1;
+    lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+    return false;
+  }
+
+  if (managerID.length() == 0 || sessionUUID.length() != 36 || pendingToken.length() == 0) {
+    Serial.println("MANAGER COMMIT ERROR -> missing manager_id / uuid / pending token");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = buildURL("/managers/uuid/commit");
+
+  http.begin(url);
+  http.setConnectTimeout(1200);
+  http.setTimeout(1200);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<256> doc;
+  doc["manager_id"] = managerID.toInt();
+  doc["uuid"] = sessionUUID;
+  doc["pending_token"] = pendingToken;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.print("MANAGER COMMIT PAYLOAD -> ");
+  Serial.println(payload);
+
+  int httpCode = http.POST(payload);
+  lastHealthCode = httpCode;
+
+  String body = "";
+  if (httpCode > 0) {
+    body = http.getString();
+  }
+
+  http.end();
+
+  Serial.print("MANAGER COMMIT HTTP -> ");
+  Serial.println(httpCode);
+  Serial.print("MANAGER COMMIT RESP -> ");
+  Serial.println(body);
+
+  if (httpCode == 200) {
+    lastConnectionStatus = CONN_OK;
+    return true;
+  }
+
+  if (httpCode <= 0) {
+    lastConnectionStatus = CONN_SERVER_OFFLINE;
+  } else {
+    lastConnectionStatus = CONN_OK;
+  }
+
+  return false;
+}
+
+bool logClockOutWithServer(const String& uuid);
+bool registerUIDWithServer(const String& uid, const String& bin);
+void pulseGreenLED();
+void drawWifiBars(int x, int y);
+void drawServerStatusDot(int x, int y);
+bool allowBackgroundNetworkTasks();
+void showConnectionIssue();
+void showClockOutIssue();
+bool shouldFlashRedLED();
+
+//  Non-blocking timer control
+bool timedTransitionActive = false;
+unsigned long timedTransitionStart = 0;
+unsigned long timedTransitionDuration = 0;
+State timedTransitionNextState = IDLE;
+
+bool greenPulseActive = false;
+unsigned long greenPulseStart = 0;
+const unsigned long GREEN_PULSE_DURATION = 50;
+
+// RFID reliability recovery.
+// The OLED and MFRC522 share SPI, so if the reader misses scans after screen changes
+// or after failed authentication, we periodically re-arm the reader while on RFID screens.
+unsigned long lastRFIDRecover = 0;
+const unsigned long RFID_RECOVER_INTERVAL_MS = 2000;
+
+void initRFIDKey() {
+  for (byte i = 0; i < 6; i++) {
+    key.keyByte[i] = 0xFF;
+  }
+}
+
+bool isRFIDScanState() {
+  return currentState == CARD_SCAN_IN ||
+         currentState == CARD_SCAN_OUT ||
+         currentState == CHECK_CARD ||
+         currentState == REGISTER_UID_SCAN;
+}
+
+void prepareRFIDForScan() {
+  // Make sure OLED is not holding the shared SPI bus before MFRC522 access.
+  digitalWrite(OLED_CS, HIGH);
+  digitalWrite(RFID_SS, HIGH);
+
+  // Re-arm the reader when entering an RFID screen.
+  rfid.PCD_Init();
+  rfid.PCD_AntennaOn();
+  cleanupRFID();
+
+  lastRFIDRecover = millis();
+
+  Serial.println("RFID ready for scan");
+}
+
+void cleanupRFID() {
+  // Always release the card/crypto session cleanly after success OR failure.
+  // IMPORTANT: do NOT call cleanupRFID() from inside itself.
+  // That recursive call caused the ESP32 to reset/boot-loop when entering RFID screens.
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  digitalWrite(RFID_SS, HIGH);
+}
+
+void serviceRFIDRecovery() {
+  if (!isRFIDScanState()) return;
+
+  // If the reader is sitting waiting for a card and becomes quiet/stuck,
+  // re-arm it without blocking the main loop.
+  if (millis() - lastRFIDRecover >= RFID_RECOVER_INTERVAL_MS) {
+    lastRFIDRecover = millis();
+
+    digitalWrite(OLED_CS, HIGH);
+    digitalWrite(RFID_SS, HIGH);
+
+    rfid.PCD_StopCrypto1();
+    rfid.PCD_AntennaOn();
+
+    Serial.println("RFID re-armed while waiting");
+  }
+}
+
+void startTimedTransition(unsigned long durationMs, State nextState) {
+  timedTransitionStart = millis();
+  timedTransitionDuration = durationMs;
+  timedTransitionNextState = nextState;
+  timedTransitionActive = true;
+}
+
+void serviceTimedTransition() {
+  if (!timedTransitionActive) return;
+
+  if (millis() - timedTransitionStart >= timedTransitionDuration) {
+    timedTransitionActive = false;
+    currentState = timedTransitionNextState;
+  }
+}
+
+void serviceGreenPulse() {
+  if (greenPulseActive && millis() - greenPulseStart >= GREEN_PULSE_DURATION) {
+    digitalWrite(GREEN_LED, LOW);
+    greenPulseActive = false;
+  }
+}
+
+
+String buildURL(const char* path) {
+  return String(SERVER_BASE_URL) + String(path);
+}
+
+bool resolveServerHost(IPAddress &resolvedIP) {
+
+  //  Direct IP (NO DNS needed)
+  resolvedIP.fromString("192.168.50.10");
+
+  Serial.print("Using direct IP: ");
+  Serial.println(resolvedIP);
+
+  return true;
+}
+
+bool writeBlock(byte block, byte *data) {
+  MFRC522::StatusCode status;
+
+  status = rfid.PCD_Authenticate(
+    MFRC522::PICC_CMD_MF_AUTH_KEY_A,
+    block,
+    &key,
+    &(rfid.uid)
+  );
+
+  if (status != MFRC522::STATUS_OK) {
+    Serial.println("Auth failed");
+    return false;
+  }
+
+  status = rfid.MIFARE_Write(block, data, 16);
+  if (status != MFRC522::STATUS_OK) {
+    Serial.println("Write failed");
+    return false;
+  }
+
+  return true;
+}
+
+const char* wifiStatusText(wl_status_t s) {
+  switch (s) {
+    case WL_NO_SHIELD:      return "WL_NO_SHIELD";
+    case WL_IDLE_STATUS:    return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL:  return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED:      return "WL_CONNECTED";
+    case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST:return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED:   return "WL_DISCONNECTED";
+    default:                return "UNKNOWN";
+  }
+}
+
+bool syncRTCFromNTP() {
+  if (!rtcInitialized) {
+    Serial.println("❌ RTC sync skipped: RTC not initialized");
+    return false;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ RTC sync skipped: WiFi not connected");
+    return false;
+  }
+
+Serial.println("🌐 Starting NTP sync...");
+
+//  Test if router/repeater DNS can resolve internet NTP server
+IPAddress ntpIP;
+
+if (!WiFi.hostByName("pool.ntp.org", ntpIP)) {
+  Serial.println("❌ Cannot resolve pool.ntp.org");
+  Serial.println("Router DNS/repeater internet is not passing through");
+  return false;
+}
+
+Serial.print(" pool.ntp.org resolved to: ");
+Serial.println(ntpIP);
+
+// Jamaica = UTC -5, no daylight saving time
+configTime(-5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+struct tm timeinfo;
+
+  // Keep NTP from freezing the terminal for too long.
+  if (!getLocalTime(&timeinfo, 1500)) {
+    Serial.println("❌ NTP sync failed");
+    Serial.println("Check repeater internet/DNS access");
+    return false;
+  }
+
+  rtc.adjust(DateTime(
+    timeinfo.tm_year + 1900,
+    timeinfo.tm_mon + 1,
+    timeinfo.tm_mday,
+    timeinfo.tm_hour,
+    timeinfo.tm_min,
+    timeinfo.tm_sec
+  ));
+
+  DateTime now = rtc.now();
+
+  Serial.println(" RTC updated from NTP");
+  Serial.print("RTC Time: ");
+  Serial.print(now.year());
+  Serial.print("-");
+  Serial.print(now.month());
+  Serial.print("-");
+  Serial.print(now.day());
+  Serial.print(" ");
+  Serial.print(now.hour());
+  Serial.print(":");
+  Serial.print(now.minute());
+  Serial.print(":");
+  Serial.println(now.second());
+
+  return true;
+}
+
+void setup() {
+Serial.begin(115200);
+
+pinMode(GREEN_LED, OUTPUT);
+pinMode(RED_LED, OUTPUT);
+
+digitalWrite(GREEN_LED, LOW);
+digitalWrite(RED_LED, LOW);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+if (!rtc.begin()) {
+  Serial.println("RTC not found");
+  rtcInitialized = false;
+} else {
+  rtcInitialized = true;   
+  Serial.println("RTC ready");
+
+  DateTime now = rtc.now();
+  if (now.year() < 2023) {
+    Serial.println("RTC lost power - needs sync");
+  }
+}
+  // ---------- SPI BUS SETUP ----------
+  // OLED and RFID share SPI, so both CS pins must be idle HIGH first.
+  pinMode(OLED_CS, OUTPUT);
+  pinMode(RFID_SS, OUTPUT);
+
+  digitalWrite(OLED_CS, HIGH);
+  digitalWrite(RFID_SS, HIGH);
+
+  SPI.begin();
+
+  oled.begin();
+  oled.setContrast(255);
+
+  digitalWrite(OLED_CS, HIGH);
+  digitalWrite(RFID_SS, HIGH);
+
+  rfid.PCD_Init();
+  rfid.PCD_AntennaOn();
+  initRFIDKey();
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x8_tf);
+  oled.drawStr(0, 20, "Starting...");
+  oled.sendBuffer();
+
+  pcf.begin();
+  for (int i = 0; i < 8; i++) pcf.write(i, HIGH);
+
+
+
+
+WiFi.mode(WIFI_STA);
+WiFi.setSleep(false);
+WiFi.setAutoReconnect(true);
+WiFi.persistent(true);
+
+Serial.print("Joining SSID: ");
+Serial.println(WIFI_SSID);
+
+WiFi.begin(WIFI_SSID, WIFI_PASS);
+wifiConnectStartedAt = millis();
+
+unsigned long wifiStart = millis();
+unsigned long lastBootWifiPrint = 0;
+
+while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 5000) {
+  if (millis() - lastBootWifiPrint >= 250) {
+    lastBootWifiPrint = millis();
+
+    wl_status_t st = WiFi.status();
+    Serial.print(".");
+    Serial.print(" ");
+    Serial.println(wifiStatusText(st));
+  }
+
+  yield();
+}
+
+Serial.println();
+
+if (WiFi.status() == WL_CONNECTED) {
+  Serial.println(" WiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Gateway: ");
+  Serial.println(WiFi.gatewayIP());
+  Serial.print("DNS: ");
+  Serial.println(WiFi.dnsIP());
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  Serial.println(" Boot WiFi stage passed");
+
+//  Try to update DS3231 RTC from internet time
+rtcSyncedFromNTP = syncRTCFromNTP();
+lastRtcSyncAttempt = millis();
+
+} else {
+  Serial.println("⚠ WiFi not ready at boot");
+  Serial.println("System will continue offline");
+}
+
+
+lastActivityTime = millis();   // initialize timer properly
+
+//  Force first health check quickly instead of waiting 30 seconds
+lastHealthCheck = millis() - 5000;
+
+currentState = HOME;
+}
+
+void loop() {
+
+  //  READ KEYPAD FIRST
+  // This allows keypad response even when server/DNS/HTTP is down.
+  char pressedKey = readKeypad();
+
+  if (pressedKey != 0) {
+    lastActivityTime = millis();
+  }
+
+  //  Global back/cancel key
+  if (pressedKey == '*') {
+    timedTransitionActive = false;
+    resetPin();
+    sessionUUID = "";
+    pendingToken = "";
+    employeeID = "";
+    employeeName = "";
+    scannedUID = "";
+    selectedBin = "";
+    currentState = IDLE;
+  }
+
+  serviceGreenPulse();
+  serviceTimedTransition();
+
+  // While a timed message is on screen, keep the display as-is and skip state actions.
+  if (timedTransitionActive) {
+    return;
+  }
+
+  // Only run background network checks on safe screens
+  bool canRunNetwork = allowBackgroundNetworkTasks();
+
+  // 🔄 WiFi Reconnect Logic
+if (canRunNetwork && WiFi.status() != WL_CONNECTED) {
+  if (millis() - lastReconnectAttempt > RECONNECT_INTERVAL) {
+    lastReconnectAttempt = millis();
+
+    wl_status_t st = WiFi.status();
+
+    Serial.println("🔄 Attempting WiFi reconnect...");
+    Serial.print("WiFi status: ");
+    Serial.println(wifiStatusText(st));
+
+    // IMPORTANT:
+    // WL_IDLE_STATUS means the ESP is already trying to connect.
+    // Do NOT call WiFi.begin() again in that state.
+if (st == WL_IDLE_STATUS) {
+  Serial.println("⏳ WiFi still connecting... waiting");
+}
+else if (st == WL_DISCONNECTED) {
+  if (millis() - wifiConnectStartedAt < 20000) {
+    Serial.println("⏳ Recent connect attempt still settling...");
+  } else {
+    Serial.println("🔁 Restarting WiFi connection...");
+    WiFi.disconnect(false, false);
+    wifiConnectStartedAt = millis();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+}
+else if (st == WL_CONNECT_FAILED ||
+         st == WL_NO_SSID_AVAIL ||
+         st == WL_CONNECTION_LOST) {
+  Serial.println("🔁 Restarting WiFi connection...");
+  WiFi.disconnect(false, false);
+  wifiConnectStartedAt = millis();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+  }
+}
+
+static bool wasConnected = (WiFi.status() == WL_CONNECTED);
+
+bool nowConnected = (WiFi.status() == WL_CONNECTED);
+
+if (canRunNetwork && nowConnected && !wasConnected) {
+
+  Serial.println("✅ WiFi RECONNECTED");
+
+// ✅ Update DS3231 after WiFi returns
+rtcSyncedFromNTP = syncRTCFromNTP();
+lastRtcSyncAttempt = millis();
+
+}
+
+wasConnected = nowConnected;
+
+// 🕒 Retry RTC sync if WiFi is connected but NTP failed earlier
+if (canRunNetwork &&
+    rtcInitialized &&
+    WiFi.status() == WL_CONNECTED &&
+    !rtcSyncedFromNTP &&
+    millis() - lastRtcSyncAttempt > RTC_SYNC_RETRY_INTERVAL) {
+
+  Serial.println("🔄 Retrying RTC NTP sync...");
+
+  rtcSyncedFromNTP = syncRTCFromNTP();
+  lastRtcSyncAttempt = millis();
+}
+
+  // 🔴 Red LED Flash
+  // Flashes when WiFi is disconnected OR server is unreachable/down.
+if (shouldFlashRedLED()) {
+
+  if (millis() - lastWifiBlink > 500) {
+    lastWifiBlink = millis();
+    redState = !redState;
+    digitalWrite(RED_LED, redState);
+  }
+
+} else {
+  redState = false;
+  digitalWrite(RED_LED, LOW);
+}
+
+// 🔍 Periodic server health check
+// ✅ Only run when keypad/card flow is idle
+if (canRunNetwork && millis() - lastHealthCheck > 5000) {
+
+  lastHealthCheck = millis();
+
+if (WiFi.status() == WL_CONNECTED) {
+
+  IPAddress resolvedIP;
+
+  if (!resolveServerHost(resolvedIP)) {
+    lastHealthCode = -1;
+    lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+  } 
+  else {
+    HTTPClient http;
+    String url = buildURL("/health");
+
+    http.begin(url);
+    http.setConnectTimeout(1000);
+    http.setTimeout(1000);
+
+    lastHealthCode = http.GET();
+    http.end();
+
+    if (lastHealthCode == 200) {
+      lastConnectionStatus = CONN_OK;
+    } else {
+      lastConnectionStatus = CONN_SERVER_OFFLINE;
+    }
+  }
+
+} else {
+  lastHealthCode = 0;
+  lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+}
+}
+
+
+// ⏳ Inactivity timeout
+if (currentState != HOME &&
+    millis() - lastActivityTime > INACTIVITY_TIMEOUT)
+{
+  Serial.println("⏳ Returning to HOME");
+
+  resetPin();
+  sessionUUID = "";
+  employeeID = "";
+  employeeName = "";
+  scannedUID = "";
+  selectedBin = "";
+
+  currentState = HOME;
+}
+
+
+// ---------- STATE ENTRY / EXIT HANDLING ----------
+bool stateChanged = (currentState != lastState);
+
+if (stateChanged) {
+
+  lastActivityTime = millis();
+
+  // ENTERING a PIN state
+  if (currentState == PIN_ENTRY_EMP ||
+      currentState == PIN_ENTRY_MGR) {
+
+    resetPin();
+    pinActive = true;
+    verificationDone = false;
+  }
+
+  // LEAVING a PIN state
+  if (lastState == PIN_ENTRY_EMP ||
+      lastState == PIN_ENTRY_MGR) {
+
+    pinActive = false;
+  }
+
+  // ENTERING an RFID scan state
+  // Draw the waiting screen ONCE, then leave SPI mostly free for MFRC522.
+  if (currentState == CARD_SCAN_IN ||
+      currentState == CARD_SCAN_OUT ||
+      currentState == CHECK_CARD ||
+      currentState == REGISTER_UID_SCAN) {
+
+    prepareRFIDForScan();
+
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_5x8_tf);
+
+    if (currentState == CARD_SCAN_IN) {
+      if (managerEnrollMode) {
+        oled.drawStr(0, 20, "Manager Enrolment");
+        oled.drawStr(0, 35, "Scan Manager Card");
+        oled.drawStr(0, 50, "Ready...");
+      } else {
+        oled.drawStr(0, 20, "Employee Clock-In");
+        oled.drawStr(0, 35, "Scan Employee Card");
+        oled.drawStr(0, 50, "Ready...");
+      }
+    }
+    else if (currentState == CARD_SCAN_OUT) {
+      oled.drawStr(0, 20, "Scan Card");
+      oled.drawStr(0, 35, "to Clock-Out");
+    }
+    else if (currentState == CHECK_CARD) {
+      oled.drawStr(0, 15, "Check Card");
+      oled.drawStr(0, 30, "Tap card...");
+    }
+    else if (currentState == REGISTER_UID_SCAN) {
+      oled.drawStr(0, 20, "Scan UID Tag");
+      oled.drawStr(0, 35, "Place card...");
+    }
+
+    oled.sendBuffer();
+  }
+
+  lastState = currentState;
+}
+
+if (!isRFIDScanState() && !timedTransitionActive) {
+  oled.clearBuffer();
+}
+
+// Keep MFRC522 healthy while waiting on RFID screens.
+serviceRFIDRecovery();
+
+  switch (currentState) {
+    
+case NETWORK_STATUS: {
+
+  oled.setFont(u8g2_font_6x12_tf);
+
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+  int labelX = 0;
+  int colonX = 36;   // 👈 aligned to "Signal"
+  int valueX = 44;   // 👈 space for long words
+
+int y1 = 10;
+int y2 = 22;
+int y3 = 32;
+int y4 = 42;
+int y5 = 52;
+int y6 = 62;
+
+oled.drawStr(0, y1, "Network Status");
+drawWifiBars(112, 10);
+  drawServerStatusDot(124, 7);
+oled.drawHLine(0, 14, 128);
+
+// WiFi
+oled.drawStr(labelX, y2, "WiFi");
+oled.drawStr(colonX, y2, ":");
+oled.drawStr(valueX, y2, wifiConnected ? "Connected" : "Disconnected");
+
+// IP
+oled.drawStr(labelX, y3, "IP");
+oled.drawStr(colonX, y3, ":");
+if (wifiConnected)
+  oled.drawStr(valueX, y3, WiFi.localIP().toString().c_str());
+else
+  oled.drawStr(valueX, y3, "N/A");
+
+// RSSI
+oled.drawStr(labelX, y4, "Signal");
+oled.drawStr(colonX, y4, ":");
+if (wifiConnected) {
+  String sig = String(WiFi.RSSI());
+  oled.drawStr(valueX, y4, sig.c_str());
+} else {
+  oled.drawStr(valueX, y4, "N/A");
+}
+
+// Host
+oled.drawStr(labelX, y5, "Host");
+oled.drawStr(colonX, y5, ":");
+oled.drawStr(valueX, y5, "waste");
+
+// Server
+oled.drawStr(labelX, y6, "Server");
+oled.drawStr(colonX, y6, ":");
+if (!wifiConnected)
+  oled.drawStr(valueX, y6, "WiFi/DNS");
+else if (lastConnectionStatus == CONN_OK)
+  oled.drawStr(valueX, y6, "Online");
+else if (lastConnectionStatus == CONN_WIFI_DNS_DOWN)
+  oled.drawStr(valueX, y6, "WiFi/DNS");
+else if (lastConnectionStatus == CONN_SERVER_OFFLINE)
+  oled.drawStr(valueX, y6, "Server Off");
+else
+  oled.drawStr(valueX, y6, "Unknown");
+
+  break;
+}
+
+case CHECK_CARD: {
+
+  if (!rfid.PICC_IsNewCardPresent()) {
+    break;
+  }
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    Serial.println("CHECK_CARD: serial read failed");
+    break;
+  }
+
+  Serial.println("CHECK_CARD: card detected");
+
+    byte buffer4[18] = {0};
+    byte size = sizeof(buffer4);
+    String emp = "";
+
+    // ---- READ EMPLOYEE ID FROM BLOCK 4 ----
+    if (rfid.PCD_Authenticate(
+          MFRC522::PICC_CMD_MF_AUTH_KEY_A,
+          4,
+          &key,
+          &(rfid.uid)
+        ) == MFRC522::STATUS_OK) {
+
+      size = sizeof(buffer4);
+
+      if (rfid.MIFARE_Read(4, buffer4, &size) == MFRC522::STATUS_OK) {
+        for (int i = 0; i < 16; i++) {
+          if (buffer4[i] != 0x00) emp += (char)buffer4[i];
+        }
+      }
+    }
+
+    // ---- READ FULL UUID FROM BLOCKS 5, 6, AND 8 ----
+    String uuid = readUUIDFromCard();
+
+    cleanupRFID();
+
+    Serial.println("===== CHECK CARD =====");
+    Serial.print("Employee ID: ");
+    Serial.println(emp);
+    Serial.print("Full UUID: ");
+    Serial.println(uuid);
+    Serial.print("UUID Length: ");
+    Serial.println(uuid.length());
+    Serial.println("======================");
+
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_5x8_tf);
+
+    oled.drawStr(0, 8, "Card Details");
+    oled.drawHLine(0, 11, 128);
+
+    String empLine = "Emp: " + emp;
+    oled.drawStr(0, 22, empLine.c_str());
+
+    if (uuid.length() == 36) {
+      oled.drawStr(0, 34, uuid.substring(0, 12).c_str());
+      oled.drawStr(0, 46, uuid.substring(12, 24).c_str());
+      oled.drawStr(0, 58, uuid.substring(24, 36).c_str());
+    } else if (uuid.length() > 0) {
+      oled.drawStr(0, 34, "Bad UUID Length");
+      String lenLine = "Len: " + String(uuid.length());
+      oled.drawStr(0, 46, lenLine.c_str());
+    } else {
+      oled.drawStr(0, 34, "No UUID Found");
+    }
+
+    oled.sendBuffer();
+
+    startTimedTransition(6000, IDLE);
+
+  break;
+}
+
+case HOME:
+  drawHomeScreen();
+
+  if (pressedKey != 0) {
+    currentState = IDLE;
+  }
+  break;
+
+case IDLE:
+  drawIdleScreen();
+  handleIdleInput(pressedKey);
+  break;
+case PROGRAM_CARD: {
+
+  if (managerEnrollMode) {
+    oled.drawStr(0, 15, "Writing Manager");
+    oled.drawStr(0, 30, "Card...");
+  } else {
+    oled.drawStr(0, 15, "Writing Employee");
+    oled.drawStr(0, 30, "Card...");
+  }
+  oled.sendBuffer();
+
+  if (sessionUUID.length() != 36 || pendingToken.length() == 0) {
+    oled.clearBuffer();
+    if (managerEnrollMode) {
+      oled.drawStr(0, 20, "Manager Prep");
+      oled.drawStr(0, 35, "Missing Token");
+    } else {
+      oled.drawStr(0, 20, "Clock-In Prep");
+      oled.drawStr(0, 35, "Missing Token");
+    }
+    oled.drawStr(0, 50, "Try Again");
+    oled.sendBuffer();
+
+    sessionUUID = "";
+    pendingToken = "";
+    employeeID = "";
+    employeeName = "";
+    managerID = "";
+    managerEnrollMode = false;
+
+    cleanupRFID();
+    startTimedTransition(2500, IDLE);
+    break;
+  }
+
+  byte block4[16] = {0};   // employee ID
+  byte block5[16] = {0};   // UUID [0–15]
+  byte block6[16] = {0};   // UUID [16–31]
+  byte block8[16] = {0};   // UUID [32–35]
+
+  if (managerEnrollMode) {
+    String mgrBlock = "MGR:" + managerID;
+    mgrBlock.toCharArray((char*)block4, 16);
+  } else if (employeeID.length() > 0) {
+    employeeID.toCharArray((char*)block4, 16);
+  }
+
+  // Write UUID sequentially, EXACTLY as received
+  for (int i = 0; i < 16; i++) {
+    block5[i] = sessionUUID[i];
+  }
+  for (int i = 0; i < 16; i++) {
+    block6[i] = sessionUUID[i + 16];
+  }
+  for (int i = 0; i < 4; i++) {
+    block8[i] = sessionUUID[i + 32];
+  }
+
+  bool ok =
+    writeBlock(4, block4) &&
+    writeBlock(5, block5) &&
+    writeBlock(6, block6) &&
+    writeBlock(8, block8);
+
+  if (ok) {
+    String verifyUUID = readUUIDFromCard();
+
+    Serial.print("CARD VERIFY UUID: ");
+    Serial.println(verifyUUID);
+
+    if (verifyUUID != sessionUUID) {
+      ok = false;
+      Serial.println("Card verification failed");
+    }
+  }
+
+  cleanupRFID();
+
+  if (!ok) {
+    oled.clearBuffer();
+    if (managerEnrollMode) {
+      oled.drawStr(0, 20, "MANAGER CARD");
+    } else {
+      oled.drawStr(0, 20, "EMPLOYEE CARD");
+    }
+    oled.drawStr(0, 35, "WRITE FAILED");
+    oled.drawStr(0, 50, "TRY AGAIN");
+    oled.sendBuffer();
+
+    sessionUUID = "";
+    pendingToken = "";
+    employeeID = "";
+    employeeName = "";
+    managerID = "";
+    managerEnrollMode = false;
+
+    startTimedTransition(3000, IDLE);
+    break;
+  }
+
+  oled.clearBuffer();
+  if (managerEnrollMode) {
+    oled.drawStr(0, 20, "Manager Card OK");
+    oled.drawStr(0, 35, "Saving Credential");
+  } else {
+    oled.drawStr(0, 20, "Employee Card OK");
+    oled.drawStr(0, 35, "Saving Session");
+  }
+  oled.sendBuffer();
+
+  bool commitOK = managerEnrollMode ? commitManagerUUIDWithServer() : commitClockInWithServer();
+
+  if (!commitOK) {
+    oled.clearBuffer();
+    if (managerEnrollMode) {
+      oled.drawStr(0, 20, "MANAGER SAVE");
+    } else {
+      oled.drawStr(0, 20, "SESSION SAVE");
+    }
+    oled.drawStr(0, 35, "FAILED");
+    oled.drawStr(0, 50, "TRY AGAIN");
+    oled.sendBuffer();
+
+    sessionUUID = "";
+    pendingToken = "";
+    employeeID = "";
+    employeeName = "";
+    managerID = "";
+    managerEnrollMode = false;
+
+    startTimedTransition(3000, IDLE);
+    break;
+  }
+
+  if (managerEnrollMode) {
+    setSuccessMessage(
+      "Manager Enrolled",
+      "Card programmed",
+      "Credential active",
+      "You may remove card"
+    );
+  } else {
+    setSuccessMessage(
+      "Clock-In Complete",
+      "Card programmed",
+      employeeName.length() > 0 ? employeeName : "Employee verified",
+      "Session active"
+    );
+  }
+
+  pendingToken = "";
+  managerID = "";
+  managerEnrollMode = false;
+  currentState = SUCCESS;
+
+  break;
+}
+
+
+case PIN_ENTRY_EMP:
+  handlePinInput(pressedKey);
+  drawPinEntry("Employee PIN");
+  break;
+
+case PIN_ENTRY_MGR:
+  handlePinInput(pressedKey);
+  drawPinEntry("Manager PIN");
+  break;
+
+case VERIFY_EMP:
+
+  oled.drawStr(0, 15, "Contacting");
+  oled.drawStr(0, 25, "Server...");
+  oled.sendBuffer();
+
+  if (!verificationDone) {
+
+    bool isManager = false;
+    managerEnrollMode = false;
+    managerID = "";
+    bool ok = verifyPinWithServer(pinBuffer, isManager);
+    verificationDone = true;
+
+    oled.clearBuffer();
+
+    if (lastServerResult == SERVER_OK && ok) {
+
+      oled.drawStr(0, 20, "Employee PIN OK");
+      oled.drawStr(0, 35, "Scan Emp Card");
+      oled.sendBuffer();
+
+      // Session is only prepared here. It is committed after card write + verify succeeds.
+      startTimedTransition(800, CARD_SCAN_IN);
+    }
+else if (lastServerResult == SERVER_INVALID_PIN) {
+  oled.drawStr(0, 30, "Invalid PIN");
+  oled.sendBuffer();
+  startTimedTransition(2000, IDLE);
+}
+else if (lastServerResult == SERVER_ALREADY_CLOCKED_IN) {
+  oled.drawStr(0, 20, "Already");
+  oled.drawStr(0, 30, "Clocked In");
+  oled.sendBuffer();
+  startTimedTransition(2000, IDLE);
+}
+else if (lastServerResult == SERVER_UNREACHABLE) {
+  showConnectionIssue();
+  startTimedTransition(2000, IDLE);
+}
+else {
+  oled.drawStr(0, 30, "Server Error");
+  oled.sendBuffer();
+  startTimedTransition(2000, IDLE);
+}
+  }
+  break;
+
+
+case VERIFY_MGR: {
+
+  oled.drawStr(0, 15, "Preparing");
+  oled.drawStr(0, 25, "Manager UUID...");
+  oled.sendBuffer();
+
+  if (!verificationDone) {
+
+    verificationDone = true;
+    managerEnrollMode = true;
+    managerID = "";
+    sessionUUID = "";
+    pendingToken = "";
+
+    if (WiFi.status() != WL_CONNECTED) {
+      lastHealthCode = 0;
+      lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+      showConnectionIssue();
+      startTimedTransition(1500, IDLE);
+      break;
+    }
+
+    IPAddress resolvedIP;
+    if (!resolveServerHost(resolvedIP)) {
+      lastHealthCode = -1;
+      lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+      showConnectionIssue();
+      startTimedTransition(1500, IDLE);
+      break;
+    }
+
+    HTTPClient http;
+    String url = buildURL("/managers/uuid");
+
+    http.begin(url);
+    http.setConnectTimeout(1200);
+    http.setTimeout(1200);
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<128> doc;
+    doc["pin"] = pinBuffer;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Serial.print("MANAGER PREPARE PAYLOAD -> ");
+    Serial.println(payload);
+
+    int httpCode = http.POST(payload);
+    lastHealthCode = httpCode;
+
+    String body = "";
+    if (httpCode > 0) {
+      body = http.getString();
+    }
+
+    Serial.print("MANAGER PREPARE HTTP -> ");
+    Serial.println(httpCode);
+    Serial.print("MANAGER PREPARE RESP -> ");
+    Serial.println(body);
+
+    if (httpCode <= 0) {
+      lastHealthCode = -1;
+      lastConnectionStatus = CONN_SERVER_OFFLINE;
+      http.end();
+      showConnectionIssue();
+      startTimedTransition(1500, IDLE);
+      break;
+    }
+
+    if (httpCode == 409) {
+      lastConnectionStatus = CONN_OK;
+      http.end();
+
+      oled.clearBuffer();
+      oled.drawStr(0, 30, "Credential Exists");
+      oled.sendBuffer();
+
+      startTimedTransition(2000, IDLE);
+      break;
+    }
+
+    if (httpCode == 401) {
+      lastConnectionStatus = CONN_OK;
+      http.end();
+
+      oled.clearBuffer();
+      oled.drawStr(0, 30, "Invalid PIN");
+      oled.sendBuffer();
+
+      startTimedTransition(2000, IDLE);
+      break;
+    }
+
+    if (httpCode != 200) {
+      lastConnectionStatus = CONN_SERVER_OFFLINE;
+      http.end();
+
+      showConnectionIssue();
+      startTimedTransition(1500, IDLE);
+      break;
+    }
+
+    lastConnectionStatus = CONN_OK;
+    pulseGreenLED();
+
+    StaticJsonDocument<384> resp;
+    DeserializationError err = deserializeJson(resp, body);
+    http.end();
+
+    if (err) {
+      Serial.print("MANAGER PREPARE JSON ERROR -> ");
+      Serial.println(err.c_str());
+
+      oled.clearBuffer();
+      oled.drawStr(0, 20, "Manager Prep");
+      oled.drawStr(0, 35, "Bad Response");
+      oled.sendBuffer();
+
+      managerEnrollMode = false;
+      startTimedTransition(2500, IDLE);
+      break;
+    }
+
+    sessionUUID  = resp["uuid"].as<String>();
+    managerID    = resp["manager_id"].as<String>();
+    pendingToken = resp["pending_token"].as<String>();
+
+    if (sessionUUID.length() != 36 || managerID.length() == 0 || pendingToken.length() == 0) {
+      Serial.println("Missing manager uuid / manager_id / pending token");
+
+      oled.clearBuffer();
+      oled.drawStr(0, 20, "Manager Prep");
+      oled.drawStr(0, 35, "Missing Token");
+      oled.sendBuffer();
+
+      managerEnrollMode = false;
+      startTimedTransition(2500, IDLE);
+      break;
+    }
+
+    oled.clearBuffer();
+    oled.drawStr(0, 20, "Manager PIN OK");
+    oled.drawStr(0, 35, "Scan Manager Card");
+    oled.sendBuffer();
+
+    startTimedTransition(800, CARD_SCAN_IN);
+  }
+
+  break;
+}
+
+case CARD_SCAN_IN: {
+
+  if (!rfid.PICC_IsNewCardPresent()) {
+    break;
+  }
+
+  Serial.println("CARD_SCAN_IN: card presence detected");
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    Serial.println("CARD_SCAN_IN: serial read failed");
+    break;
+  }
+
+  Serial.println("CARD_SCAN_IN: card detected, writing next");
+
+  oled.clearBuffer();
+  oled.drawStr(0, 25, "Card Detected");
+  oled.drawStr(0, 40, "Writing...");
+  oled.sendBuffer();
+
+  currentState = PROGRAM_CARD;
+  break;
+}
+
+case CARD_SCAN_OUT: {
+
+  if (!rfid.PICC_IsNewCardPresent()) {
+    break;
+  }
+
+  Serial.println("CARD_SCAN_OUT: card presence detected");
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    Serial.println("CARD_SCAN_OUT: serial read failed");
+    break;
+  }
+
+  Serial.println("CARD_SCAN_OUT: card detected");
+
+    byte buffer5[18] = {0};
+    byte buffer6[18] = {0};
+    byte buffer8[18] = {0};
+    byte size;
+
+    // ---- Block 5 ----
+    if (rfid.PCD_Authenticate(
+          MFRC522::PICC_CMD_MF_AUTH_KEY_A,
+          5,
+          &key,
+          &(rfid.uid)
+        ) != MFRC522::STATUS_OK) {
+Serial.println("Auth B5 fail");
+cleanupRFID();
+break;
+
+    }
+
+    size = sizeof(buffer5);
+if (rfid.MIFARE_Read(5, buffer5, &size) != MFRC522::STATUS_OK) {
+  Serial.println("Read B5 fail");
+  cleanupRFID();
+  break;
+}
+
+    // ---- Block 6 ----
+    if (rfid.PCD_Authenticate(
+          MFRC522::PICC_CMD_MF_AUTH_KEY_A,
+          6,
+          &key,
+          &(rfid.uid)
+        ) != MFRC522::STATUS_OK) {
+Serial.println("Auth B6 fail");
+cleanupRFID();
+break;
+    }
+
+    size = sizeof(buffer6);
+if (rfid.MIFARE_Read(6, buffer6, &size) != MFRC522::STATUS_OK) {
+  Serial.println("Read B6 fail");
+  cleanupRFID();
+  break;
+}
+
+
+    // ---- Block 8 ----
+    if (rfid.PCD_Authenticate(
+          MFRC522::PICC_CMD_MF_AUTH_KEY_A,
+          8,
+          &key,
+          &(rfid.uid)
+        ) != MFRC522::STATUS_OK) {
+Serial.println("Auth B8 fail");
+cleanupRFID();
+break;
+
+    }
+
+    size = sizeof(buffer8);
+if (rfid.MIFARE_Read(8, buffer8, &size) != MFRC522::STATUS_OK) {
+  Serial.println("Read B8 fail");
+  cleanupRFID();
+  break;
+}
+
+    // ---- FULL UUID (AS STORED) ----
+String uuid = "";
+
+for (int i = 0; i < 16; i++) {
+  if (buffer5[i] != 0x00) uuid += (char)buffer5[i];
+}
+for (int i = 0; i < 16; i++) {
+  if (buffer6[i] != 0x00) uuid += (char)buffer6[i];
+}
+for (int i = 0; i < 4; i++){
+  if (buffer8[i] != 0x00) uuid += (char)buffer8[i];
+}
+
+if (uuid.length() != 36) {
+  Serial.println("❌ Invalid UUID length");
+  Serial.print("UUID LENGTH: ");
+  Serial.println(uuid.length());
+
+  cleanupRFID();
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x8_tf);
+  oled.drawStr(0, 10, "Clock-Out Failed");
+  oled.drawHLine(0, 14, 128);
+
+  if (uuid.length() == 0) {
+    oled.drawStr(0, 30, "Card Empty");
+    oled.drawStr(0, 45, "Not Programmed");
+  } else {
+    oled.drawStr(0, 30, "Invalid Card Data");
+    oled.drawStr(0, 45, "Reprogram Card");
+  }
+
+  oled.sendBuffer();
+  startTimedTransition(2500, IDLE);
+  break;
+}
+
+// 🔍 DEBUG — KEEP THIS
+Serial.print("UUID LENGTH: ");
+Serial.println(uuid.length());
+Serial.print("UUID VALUE: ");
+Serial.println(uuid);
+
+
+    cleanupRFID();
+
+    Serial.print("UUID SENT TO SERVER: ");
+    Serial.println(uuid);
+
+    oled.clearBuffer();
+    oled.drawStr(0, 30, "Logging Clock-Out");
+    oled.sendBuffer();
+
+if (logClockOutWithServer(uuid)) {
+  setSuccessMessage(
+    "Clock-Out Complete",
+    "Session closed",
+    "UUID verified",
+    "You may remove card"
+  );
+
+  currentState = SUCCESS;
+} else {
+  showClockOutIssue();
+  startTimedTransition(2500, IDLE);
+}
+
+  break;
+}
+
+case REGISTER_UID_SCAN: {
+
+  if (!rfid.PICC_IsNewCardPresent()) {
+    break;
+  }
+
+  Serial.println("REGISTER_UID_SCAN: card presence detected");
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    Serial.println("REGISTER_UID_SCAN: serial read failed");
+    break;
+  }
+
+  scannedUID = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) scannedUID += "0";
+    scannedUID += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  scannedUID.toUpperCase();
+
+  Serial.print("Scanned UID: ");
+  Serial.println(scannedUID);
+
+  cleanupRFID();
+
+  currentState = REGISTER_UID_BIN;
+  break;
+}
+
+case REGISTER_UID_BIN: {
+
+  oled.drawStr(0, 10, "Select Bin:");
+   oled.drawHLine(0, 14, 128);
+
+  oled.drawStr(0, 25,  "1: Biohazard");
+  oled.drawStr(0, 37,  "2: Recyclables");
+  oled.drawStr(0, 49,  "3: Sharps");
+
+  oled.drawStr(74, 25, "4: Pharma");
+  oled.drawStr(74, 37, "5: General");
+
+  if (pressedKey >= '1' && pressedKey <= '5') {
+    selectedBin = String(pressedKey);
+    currentState = REGISTER_UID_SEND;
+  }
+
+  break;
+}
+
+case REGISTER_UID_SEND: {
+
+  oled.clearBuffer();
+  oled.drawStr(0, 20, "Registering...");
+  oled.sendBuffer();
+
+  bool ok = registerUIDWithServer(scannedUID, selectedBin);
+
+  // Function already handled user messaging
+  // Just reset cleanly
+
+  sessionUUID = "";
+  employeeID = "";
+  employeeName = "";
+  scannedUID = "";
+  selectedBin = "";
+
+  resetPin();
+  if (!timedTransitionActive) currentState = IDLE;
+
+  break;
+}
+
+case SUCCESS:
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x8_tf);
+
+  oled.drawStr(0, 10, successTitle.c_str());
+  oled.drawHLine(0, 14, 128);
+
+  if (successLine1.length() > 0) oled.drawStr(0, 27, successLine1.c_str());
+  if (successLine2.length() > 0) oled.drawStr(0, 40, successLine2.c_str());
+  if (successLine3.length() > 0) oled.drawStr(0, 53, successLine3.c_str());
+
+  oled.sendBuffer();
+
+  sessionUUID = "";
+  employeeID = "";
+  employeeName = "";
+  scannedUID = "";
+  selectedBin = "";
+
+  successTitle = "Success";
+  successLine1 = "";
+  successLine2 = "";
+  successLine3 = "";
+
+  resetPin();
+  startTimedTransition(2200, IDLE);
+  break;
+
+case ERROR_STATE:
+  oled.clearBuffer();
+  oled.drawStr(0, 20, "Access Denied");
+  oled.sendBuffer();
+  resetPin();
+  startTimedTransition(2000, IDLE);
+  break;
+  }
+
+  // Do not refresh OLED every loop while polling RFID.
+  // RFID and OLED share the SPI bus.
+  if (!isRFIDScanState() && !timedTransitionActive) {
+    oled.sendBuffer();
+  }
+
+
+}
+void drawIdleScreen() {
+  oled.setFont(u8g2_font_5x8_tf);   // 🔥 Smaller font (8px tall)
+
+  // ===== HEADER =====
+  oled.drawStr(0, 10, "Smart Waste Terminal");
+  drawWifiBars(112, 10);
+  drawServerStatusDot(124, 7);
+  oled.drawHLine(0, 14, 128);
+
+  // ===== MENU =====
+  int yStart = 22;
+  int step = 10;   // perfect for 5x8 font
+
+  oled.drawStr(4, yStart + step * 0, "A: Employee Clock In");
+  oled.drawStr(4, yStart + step * 1, "B: Employee Clock Out");
+  oled.drawStr(4, yStart + step * 2, "C: Manager Enrolment");
+  oled.drawStr(4, yStart + step * 3, "D: Card Details");
+  oled.drawStr(4, yStart + step * 4, "0: Register Trash UID");
+}
+
+void drawHomeScreen() {
+
+  DateTime now;
+
+  if (rtcInitialized) {
+    now = rtc.now();
+  } else {
+    now = DateTime(2000, 1, 1, 0, 0, 0);
+  }
+
+  char timeStr[10];
+  sprintf(timeStr, "%02d:%02d",
+          now.hour(),
+          now.minute());
+
+  char dateStr[20];
+  sprintf(dateStr, "%02d/%02d/%04d",
+          now.day(),
+          now.month(),
+          now.year());
+
+  // ===== BIG TIME =====
+  oled.setFont(u8g2_font_logisoso26_tf);
+
+  int timeWidth = oled.getStrWidth(timeStr);
+  int timeX = (128 - timeWidth) / 2;
+  oled.drawStr(timeX, 32, timeStr);
+
+  // ===== DATE =====
+  oled.setFont(u8g2_font_6x12_tf);
+
+  int dateWidth = oled.getStrWidth(dateStr);
+  int dateX = (128 - dateWidth) / 2;
+  oled.drawStr(dateX, 50, dateStr);
+
+  // ===== PRESS KEY =====
+  const char* msg = "Press any key";
+  oled.setFont(u8g2_font_5x8_tf);
+
+  int msgWidth = oled.getStrWidth(msg);
+  int msgX = (128 - msgWidth) / 2;
+  oled.drawStr(msgX, 62, msg);
+}
+
+void drawPinEntry(const char* title) {
+  oled.drawStr(0, 10, title);
+  oled.drawStr(0, 25, "PIN:");
+
+  char stars[PIN_DIGITS + 1];
+
+  int shown = (pinIndex > PIN_DIGITS) ? PIN_DIGITS : pinIndex;
+
+  for (int i = 0; i < shown; i++) {
+    stars[i] = '*';
+  }
+  stars[shown] = '\0';
+
+  oled.drawStr(40, 25, stars);
+}
+
+void handleIdleInput(char key) {
+
+  if (key == 'A') currentState = PIN_ENTRY_EMP;
+else if (key == 'B') currentState = CARD_SCAN_OUT;
+  else if (key == 'C') currentState = PIN_ENTRY_MGR;
+  else if (key == 'D') currentState = CHECK_CARD;
+  else if (key == '#') currentState = NETWORK_STATUS;
+  else if (key == '0') currentState = REGISTER_UID_SCAN;
+}
+
+void handlePinInput(char key) {
+
+  if (key == 0) return;
+
+  if (key >= '0' && key <= '9' && pinIndex < PIN_DIGITS) {
+
+    pinBuffer[pinIndex++] = key;
+
+    if (pinIndex == PIN_DIGITS) {
+
+      pinBuffer[PIN_DIGITS] = '\0';
+
+      if (currentState == PIN_ENTRY_EMP)
+        currentState = VERIFY_EMP;
+
+      else if (currentState == PIN_ENTRY_MGR)
+        currentState = VERIFY_MGR;
+    }
+
+    return;
+  }
+
+  if (key == 'C') {
+    resetPin();
+  }
+}
+
+
+char readKeypad() {
+  static char lastKey = 0;
+
+  for (int row = 0; row < 4; row++) {
+
+    // Set all rows HIGH
+    for (int i = 0; i < 4; i++) {
+      pcf.write(i, HIGH);
+    }
+
+    // Drive one row LOW
+    pcf.write(row, LOW);
+
+    for (int col = 0; col < 4; col++) {
+      if (pcf.read(col + 4) == LOW) {
+
+        char key = keyMap[row][col];
+
+        // Register only NEW press
+        if (key != lastKey) {
+          lastKey = key;
+          return key;
+        }
+
+        return 0; // same key still held
+      }
+    }
+  }
+
+  // No key pressed anywhere
+  lastKey = 0;
+  return 0;
+}
+
+
+
+void resetPin() {
+  memset(pinBuffer, 0, sizeof(pinBuffer));
+  pinIndex = 0;
+}
+
+void setSuccessMessage(String title, String line1, String line2, String line3) {
+  successTitle = title;
+  successLine1 = line1;
+  successLine2 = line2;
+  successLine3 = line3;
+}
+
+
+String readUUIDFromCard() {
+
+  byte buffer5[18] = {0};
+  byte buffer6[18] = {0};
+  byte buffer8[18] = {0};
+  byte size;
+
+  // ---- Block 5 ----
+  size = sizeof(buffer5);
+  if (rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 5, &key, &(rfid.uid)) != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return "";
+  }
+
+  if (rfid.MIFARE_Read(5, buffer5, &size) != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return "";
+  }
+
+  // ---- Block 6 ----
+  size = sizeof(buffer6);
+  if (rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 6, &key, &(rfid.uid)) != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return "";
+  }
+
+  if (rfid.MIFARE_Read(6, buffer6, &size) != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return "";
+  }
+
+  // ---- Block 8 ----
+  size = sizeof(buffer8);
+  if (rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 8, &key, &(rfid.uid)) != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return "";
+  }
+
+  if (rfid.MIFARE_Read(8, buffer8, &size) != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return "";
+  }
+
+  String uuid = "";
+
+  for (int i = 0; i < 16; i++)
+    if (buffer5[i] != 0x00) uuid += (char)buffer5[i];
+
+  for (int i = 0; i < 16; i++)
+    if (buffer6[i] != 0x00) uuid += (char)buffer6[i];
+
+for (int i = 0; i < 4; i++)
+    if (buffer8[i] != 0x00) uuid += (char)buffer8[i];
+
+  rfid.PCD_StopCrypto1();   // close session cleanly
+  return uuid;
+}
+
+
+bool verifyPinWithServer(const char* pin, bool &isManager) {
+
+if (WiFi.status() != WL_CONNECTED) {
+  lastServerResult = SERVER_UNREACHABLE;
+  lastHealthCode = 0;
+  lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+  Serial.println("❌ WiFi/DNS down");
+  return false;
+}
+
+  IPAddress resolvedIP;
+
+if (!resolveServerHost(resolvedIP)) {
+  lastServerResult = SERVER_UNREACHABLE;
+  lastHealthCode = -1;
+  lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+  Serial.println("❌ WiFi/DNS down - cannot resolve waste");
+  return false;
+}
+
+  HTTPClient http;
+  String url = buildURL("/auth/pin");
+
+if (url == "") {
+  lastServerResult = SERVER_UNREACHABLE;
+  lastConnectionStatus = CONN_SERVER_OFFLINE;
+  Serial.println("❌ Server URL unavailable");
+  return false;
+}
+
+  Serial.println("➡️ Contacting server...");
+
+  http.begin(url);
+  http.setConnectTimeout(1200);
+  http.setTimeout(1200);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<128> doc;
+  doc["pin"] = pin;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int httpCode = http.POST(payload);
+
+if (httpCode <= 0) {
+  Serial.println("❌ Server offline");
+  lastHealthCode = -1;
+  lastConnectionStatus = CONN_SERVER_OFFLINE;
+  http.end();
+  lastServerResult = SERVER_UNREACHABLE;
+  return false;
+}
+
+  Serial.printf("📡 HTTP code: %d\n", httpCode);
+  lastHealthCode = httpCode;
+  lastConnectionStatus = CONN_OK;
+
+  if (httpCode == 401) {
+    http.end();
+    lastServerResult = SERVER_INVALID_PIN;
+    return false;
+  }
+
+  if (httpCode == 409) {
+    http.end();
+    lastServerResult = SERVER_ALREADY_CLOCKED_IN;
+    return false;
+  }
+
+  if (httpCode >= 500) {
+    http.end();
+    lastServerResult = SERVER_ERROR;
+    return false;
+  }
+
+  if (httpCode != 200) {
+    http.end();
+    lastServerResult = SERVER_ERROR;
+    return false;
+  }
+
+  StaticJsonDocument<384> response;
+  DeserializationError err = deserializeJson(response, http.getString());
+  http.end();
+
+  if (err) {
+    Serial.print("❌ PIN verify JSON parse failed: ");
+    Serial.println(err.c_str());
+    lastServerResult = SERVER_ERROR;
+    return false;
+  }
+
+  bool valid = response["valid"] | false;
+  const char* role = response["role"] | "";
+
+  if (!valid) {
+    Serial.println("❌ Invalid PIN");
+    lastServerResult = SERVER_INVALID_PIN;
+    return false;
+  }
+
+  pulseGreenLED();
+
+  Serial.println("✅ PIN accepted");
+  lastServerResult = SERVER_OK;
+
+  isManager = (strcmp(role, "manager") == 0);
+
+  employeeID    = response["employee_id"].as<String>();
+  employeeName  = response["employee_name"].as<String>();
+  sessionUUID   = response["session_uuid"].as<String>();
+  pendingToken  = response["pending_token"].as<String>();
+
+  if (sessionUUID.length() != 36 || pendingToken.length() == 0) {
+    Serial.println("❌ Missing session UUID or pending token");
+    lastServerResult = SERVER_ERROR;
+    return false;
+  }
+
+  return true;
+}
+
+bool commitClockInWithServer() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    lastHealthCode = 0;
+    lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+    return false;
+  }
+
+  IPAddress resolvedIP;
+  if (!resolveServerHost(resolvedIP)) {
+    lastHealthCode = -1;
+    lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+    return false;
+  }
+
+  HTTPClient http;
+  String url = buildURL("/auth/pin/commit");
+
+  http.begin(url);
+  http.setConnectTimeout(1200);
+  http.setTimeout(1200);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<256> doc;
+  doc["employee_id"] = employeeID.toInt();
+  doc["session_uuid"] = sessionUUID;
+  doc["pending_token"] = pendingToken;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.print("COMMIT PAYLOAD -> ");
+  Serial.println(payload);
+
+  int httpCode = http.POST(payload);
+  lastHealthCode = httpCode;
+
+  String body = "";
+  if (httpCode > 0) {
+    body = http.getString();
+  }
+
+  http.end();
+
+  Serial.print("COMMIT HTTP -> ");
+  Serial.println(httpCode);
+  Serial.print("COMMIT RESP -> ");
+  Serial.println(body);
+
+  if (httpCode == 200) {
+    lastConnectionStatus = CONN_OK;
+    return true;
+  }
+
+  if (httpCode <= 0) {
+    lastConnectionStatus = CONN_SERVER_OFFLINE;
+  } else {
+    lastConnectionStatus = CONN_OK;
+  }
+
+  return false;
+}
+
+bool logClockOutWithServer(const String& uuid) {
+
+  lastClockOutResult = CLOCKOUT_OK;
+  lastClockOutMessage = "";
+
+  if (WiFi.status() != WL_CONNECTED) {
+    lastHealthCode = 0;
+    lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+    lastClockOutResult = CLOCKOUT_WIFI_DNS_DOWN;
+    lastClockOutMessage = "WiFi/DNS Down";
+    Serial.println("❌ Clock-out failed: WiFi/DNS down");
+    return false;
+  }
+
+  IPAddress resolvedIP;
+
+  if (!resolveServerHost(resolvedIP)) {
+    lastHealthCode = -1;
+    lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+    lastClockOutResult = CLOCKOUT_WIFI_DNS_DOWN;
+    lastClockOutMessage = "WiFi/DNS Down";
+    Serial.println("❌ Clock-out failed: DNS cannot resolve waste");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = buildURL("/uuid/clock-out");
+
+  Serial.println("🕒 Logging clock-out...");
+  Serial.print("URL: ");
+  Serial.println(url);
+
+  http.begin(url);
+  http.setConnectTimeout(1200);
+  http.setTimeout(1200);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<128> doc;
+  doc["uuid"] = uuid;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("📤 Clock-out payload:");
+  Serial.println(payload);
+
+  int httpCode = http.POST(payload);
+  lastHealthCode = httpCode;
+
+  String response = http.getString();
+
+  Serial.print("📡 Clock-out HTTP code: ");
+  Serial.println(httpCode);
+  Serial.println("📥 Clock-out response:");
+  Serial.println(response);
+
+  http.end();
+
+  if (httpCode <= 0) {
+    lastHealthCode = -1;
+    lastConnectionStatus = CONN_SERVER_OFFLINE;
+    lastClockOutResult = CLOCKOUT_SERVER_OFFLINE;
+    lastClockOutMessage = "Server Offline";
+    Serial.printf("❌ Clock-out failed: server unreachable HTTP %d\n", httpCode);
+    return false;
+  }
+
+  // From here, the server replied, so the server is ONLINE.
+  lastConnectionStatus = CONN_OK;
+
+  if (httpCode == 200) {
+    lastClockOutResult = CLOCKOUT_OK;
+    pulseGreenLED();
+    Serial.println("✅ Clock-out recorded");
+    return true;
+  }
+
+  if (httpCode == 400) {
+    lastClockOutResult = CLOCKOUT_BAD_REQUEST;
+    lastClockOutMessage = "Bad Card UUID";
+    return false;
+  }
+
+  if (httpCode == 401 || httpCode == 403) {
+    lastClockOutResult = CLOCKOUT_EMPLOYEE_INACTIVE;
+    lastClockOutMessage = "Employee Inactive";
+    return false;
+  }
+
+  if (httpCode == 404) {
+    lastClockOutResult = CLOCKOUT_UUID_NOT_FOUND;
+    lastClockOutMessage = "UUID Not Found";
+    return false;
+  }
+
+  if (httpCode == 409) {
+    lastClockOutResult = CLOCKOUT_ALREADY_CLOSED;
+    lastClockOutMessage = "Already Clocked Out";
+    return false;
+  }
+
+  if (httpCode >= 500) {
+    lastClockOutResult = CLOCKOUT_SERVER_ERROR;
+    lastClockOutMessage = "Server Error";
+    return false;
+  }
+
+  lastClockOutResult = CLOCKOUT_SERVER_ERROR;
+  lastClockOutMessage = "Clock-Out Failed";
+  return false;
+}
+
+bool registerUIDWithServer(const String& uid, const String& bin) {
+
+if (WiFi.status() != WL_CONNECTED) {
+  lastHealthCode = 0;
+  lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+  Serial.println("❌ Tag register failed: WiFi/DNS down");
+  showConnectionIssue();
+  startTimedTransition(2000, IDLE);
+  return false;
+}
+
+  IPAddress resolvedIP;
+
+if (!resolveServerHost(resolvedIP)) {
+  lastHealthCode = -1;
+  lastConnectionStatus = CONN_WIFI_DNS_DOWN;
+  Serial.println("❌ Tag register failed: WiFi/DNS down");
+  showConnectionIssue();
+  startTimedTransition(2000, IDLE);
+  return false;
+}
+
+  HTTPClient http;
+  String url = buildURL("/admin/bag-tags");
+
+if (url == "") {
+  lastConnectionStatus = CONN_SERVER_OFFLINE;
+  showConnectionIssue();
+  startTimedTransition(2000, IDLE);
+  return false;
+}
+
+  http.begin(url);
+  http.setConnectTimeout(1200);
+  http.setTimeout(1200);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<256> doc;
+  doc["tag_uid"] = uid;
+
+  int streamID = 0;
+
+  switch (bin.toInt()) {
+    case 1: streamID = 1; break; // BIO
+    case 2: streamID = 6; break; // REC
+    case 3: streamID = 2; break; // SHR
+    case 4: streamID = 4; break; // PHA
+    case 5: streamID = 3; break; // GEN
+    default: streamID = 0; break;
+  }
+
+  doc["waste_stream_id"] = streamID;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("📤 Sending tag registration:");
+  Serial.println(payload);
+
+  int httpCode = http.POST(payload);
+  lastHealthCode = httpCode;
+
+  Serial.printf("📡 HTTP Code: %d\n", httpCode);
+
+if (httpCode <= 0) {
+  lastHealthCode = -1;
+  lastConnectionStatus = CONN_SERVER_OFFLINE;
+  http.end();
+
+  showConnectionIssue();
+  startTimedTransition(1500, IDLE);
+  return false;
+}
+
+  String response = http.getString();
+  Serial.println("📥 Response:");
+  Serial.println(response);
+
+  http.end();
+
+lastConnectionStatus = CONN_OK;
+if (httpCode == 200) {
+  pulseGreenLED();
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x8_tf);
+
+  oled.drawStr(0, 10, "Tag Registered");
+  oled.drawHLine(0, 14, 128);
+
+  oled.drawStr(0, 27, "UID saved to server");
+
+  String binText = "Bin: " + bin;
+  oled.drawStr(0, 40, binText.c_str());
+
+  oled.drawStr(0, 53, "Ready for use");
+
+  oled.sendBuffer();
+  startTimedTransition(2200, IDLE);
+  return true;
+}
+
+  if (httpCode == 409) {
+    oled.clearBuffer();
+    oled.drawStr(0, 20, "Tag Already");
+    oled.drawStr(0, 35, "Registered");
+    oled.sendBuffer();
+    startTimedTransition(2000, IDLE);
+    return false;
+  }
+
+  if (httpCode == 400) {
+    oled.clearBuffer();
+    oled.drawStr(0, 20, "Bad Request");
+    oled.sendBuffer();
+    startTimedTransition(2000, IDLE);
+    return false;
+  }
+
+lastConnectionStatus = CONN_SERVER_OFFLINE;
+showConnectionIssue();
+startTimedTransition(2000, IDLE);
+return false;
+}
+
+void pulseGreenLED() {
+
+  if (millis() - lastPulse < 500) return;
+
+  lastPulse = millis();
+  greenPulseStart = millis();
+  greenPulseActive = true;
+  digitalWrite(GREEN_LED, HIGH);
+}
+
+void drawWifiBars(int x, int y) {
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+  if (!wifiConnected) {
+    oled.drawFrame(x, y - 6, 10, 6);
+    oled.drawLine(x, y - 6, x + 10, y);
+    return;
+  }
+
+  int rssi = WiFi.RSSI();
+  int bars = 0;
+
+  if (rssi > -60) bars = 3;
+  else if (rssi > -75) bars = 2;
+  else if (rssi > -90) bars = 1;
+  else bars = 0;
+
+  if (bars >= 1) oled.drawBox(x,     y - 2, 2, 2);
+  if (bars >= 2) oled.drawBox(x + 3, y - 4, 2, 4);
+  if (bars >= 3) oled.drawBox(x + 6, y - 6, 2, 6);
+}
+
+void drawServerStatusDot(int x, int y) {
+  bool serverOnline = (WiFi.status() == WL_CONNECTED && lastConnectionStatus == CONN_OK);
+
+  if (serverOnline) {
+    oled.drawDisc(x, y, 2);      // filled circle = server online
+  } else {
+    oled.drawCircle(x, y, 2);    // empty circle = server offline/unknown
+  }
+}
