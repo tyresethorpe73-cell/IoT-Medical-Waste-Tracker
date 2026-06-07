@@ -1,0 +1,939 @@
+// ESP1 Code
+// Updated to use non-blocking millis() timing.
+// No delay() calls are used.
+
+#include <U8g2lib.h>
+#include <HardwareSerial.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+/* ================= PIN DEFINITIONS ================= */
+
+// OLED
+#define OLED_CS   14
+#define OLED_DC    4
+#define OLED_RST  33
+
+// RFID
+#define RFID_SS   5
+#define RFID_RST  13
+
+// Buttons
+#define BTN_MONITOR  32
+#define BTN_NETWORK  27
+#define BTN_OVERRIDE 26
+
+// Lid
+#define LID_PIN 25
+
+// Alert strobe output
+// ESP32 GPIO12 / D12 controls the logic-level MOSFET gate
+#define ALERT_STROBE_PIN 12
+
+/* ================= TIMING CONSTANTS ================= */
+
+const unsigned long HOME_TIMEOUT_MS        = 15000;
+const unsigned long RFID_COOLDOWN_MS       = 1500;
+const unsigned long BUTTON_DEBOUNCE_MS     = 200;
+const unsigned long PING_INTERVAL_MS       = 2000;
+const unsigned long OLED_REFRESH_MS        = 200;
+
+const unsigned long MSG_SHORT_MS           = 1500;  // quick feedback like SCANNING
+const unsigned long MSG_NORMAL_MS          = 4000;  // normal status messages
+const unsigned long MSG_LONG_MS            = 7000;  // prompts that user must act on
+const unsigned long MSG_BAG_RESULT_MS      = 5000;  // bag valid feedback
+const unsigned long MSG_BAG_ERROR_MS       = 6000;  // wrong bag feedback
+
+// ================= ALERT STROBE SETTINGS =================
+// GPIO12 / D12 stays HIGH while any unsafe condition is active.
+// It goes LOW only after all values fall back below their thresholds.
+
+// Adjust these to suit your real safe limits.
+const uint8_t FILL_ALERT_THRESHOLD         = 90;    // GPIO12 HIGH when fill is > 90%
+const float TEMP_ALERT_THRESHOLD_C         = 30.0;  // GPIO12 HIGH when temp is > 30 C
+const float HUM_ALERT_THRESHOLD            = 80.0;  // GPIO12 HIGH when humidity is > 80%
+
+// Strobe threshold monitoring starts only after the lid has been open this long.
+const unsigned long BIN_OPEN_ALERT_DELAY_MS = 15000;; // 30 seconds
+
+/* ================= OBJECTS ================= */
+
+MFRC522 mfrc522(RFID_SS, RFID_RST);
+MFRC522::MIFARE_Key keyA;
+
+U8G2_SSD1309_128X64_NONAME0_F_4W_HW_SPI oled(
+  U8G2_R0,
+  OLED_CS,
+  OLED_DC,
+  OLED_RST
+);
+
+HardwareSerial ESP2(2);
+
+/* ================= UI STATE ================= */
+
+enum ScreenState {
+  SCREEN_MONITOR,
+  SCREEN_NETWORK,
+  SCREEN_OVERRIDE
+};
+
+ScreenState currentScreen = SCREEN_MONITOR;
+ScreenState previousScreen = SCREEN_MONITOR;
+
+/* ================= SYSTEM PLACEHOLDER DATA ================= */
+
+uint8_t BIN_ID = 2;
+
+// Time & date format locked
+char timeStr[6] = "1:09";     // H:MM or HH:MM
+char dateStr[9] = "1/21/26";  // M/DD/YY
+
+/* ================= SYSTEM STATUS FROM ESP2 ================= */
+
+struct SystemStatus {
+  bool doorOpen;
+  uint8_t fillPercent;
+  float temperature;
+  float humidity;
+  bool wifiConnected;
+  uint8_t wifiBars;
+  bool serverOnline;
+};
+
+SystemStatus status = {
+  false,
+  0,
+  0.0,
+  0.0,
+  false,
+  0,
+  false
+};
+
+/* ================= GLOBAL STATE ================= */
+
+String accessMessage = "";
+String accessMessage2 = "";
+unsigned long accessMessageUntil = 0;
+
+unsigned long lastInteractionTime = 0;
+unsigned long lastRFIDScan = 0;
+unsigned long overrideStartTime = 0;
+
+// Alert strobe state
+bool alertStrobeIsOn = false;
+unsigned long binOpenedAt = 0; // millis() timestamp when the lid first opened
+
+String lastUIDSent = "";
+bool waitingForCardRemoval = false;
+
+// After bag UID is validated, next card must be read as employee UUID
+bool expectingEmployeeCard = false;
+
+// Forces the OLED to redraw immediately when an important message appears
+bool oledNeedsRefresh = true;
+
+/* ================= MILLIS HELPERS ================= */
+
+bool hasElapsed(unsigned long now, unsigned long previous, unsigned long interval) {
+  return (now - previous) >= interval;
+}
+
+bool timeReached(unsigned long now, unsigned long targetTime) {
+  return (long)(now - targetTime) >= 0;
+}
+
+bool messageStillActive(unsigned long now) {
+  return accessMessage != "" && !timeReached(now, accessMessageUntil);
+}
+
+void showMessage(const String &line1, const String &line2, unsigned long durationMs) {
+  accessMessage = line1;
+  accessMessage2 = line2;
+  accessMessageUntil = millis() + durationMs;
+  lastInteractionTime = millis();
+  oledNeedsRefresh = true;   // show the message right away
+}
+
+void clearAccessMessage() {
+  accessMessage = "";
+  accessMessage2 = "";
+  oledNeedsRefresh = true;
+}
+
+/* ================= ALERT STROBE HANDLER ================= */
+
+bool alertConditionActive() {
+  // Strobe must only work when the bin is open.
+  if (!status.doorOpen) {
+    return false;
+  }
+
+  // When the bin opens, give the user 30 seconds before allowing the strobe.
+  // This prevents the strobe from coming on immediately when the lid is raised.
+  if (binOpenedAt == 0 || millis() - binOpenedAt < BIN_OPEN_ALERT_DELAY_MS) {
+    return false;
+  }
+
+  // After the bin has been open for more than 30 seconds,
+  // monitor fill, temperature, and humidity thresholds.
+  return (
+    status.fillPercent > FILL_ALERT_THRESHOLD ||
+    status.temperature > TEMP_ALERT_THRESHOLD_C ||
+    status.humidity > HUM_ALERT_THRESHOLD
+  );
+}
+
+void handleAlertStrobe() {
+  bool activeNow = alertConditionActive();
+
+  // GPIO12 / D12 stays HIGH for the entire time an unsafe condition exists.
+  // It only goes LOW after fill, temperature, and humidity are all safe again.
+  if (activeNow && !alertStrobeIsOn) {
+    digitalWrite(ALERT_STROBE_PIN, HIGH);
+    alertStrobeIsOn = true;
+    Serial.println("ALERT STROBE ON - UNSAFE CONDITION ACTIVE");
+  }
+  else if (!activeNow && alertStrobeIsOn) {
+    digitalWrite(ALERT_STROBE_PIN, LOW);
+    alertStrobeIsOn = false;
+    Serial.println("ALERT STROBE OFF - CONDITIONS SAFE");
+  }
+}
+
+/* ================= WIFI ICON ================= */
+
+void drawWiFiIcon(int x, int y, int bars) {
+  if (!status.wifiConnected) {
+    oled.drawFrame(x, y - 6, 10, 6);
+    oled.drawLine(x, y - 6, x + 10, y);
+    return;
+  }
+
+  if (bars >= 1) oled.drawBox(x,     y - 2, 2, 2);
+  if (bars >= 2) oled.drawBox(x + 3, y - 4, 2, 4);
+  if (bars >= 3) oled.drawBox(x + 6, y - 6, 2, 6);
+}
+
+void drawServerStatusDot(int x, int y) {
+  // Filled circle = server online
+  // Empty circle  = server offline/unknown
+  if (status.serverOnline) {
+    oled.drawDisc(x, y, 2);
+  } else {
+    oled.drawCircle(x, y, 2);
+  }
+}
+
+/* ================= TOP BAR ================= */
+
+void drawTopBar() {
+  oled.setFont(u8g2_font_5x8_tf);
+
+  char binBuf[8];
+  snprintf(binBuf, sizeof(binBuf), "Bin:%02d", BIN_ID);
+  oled.drawStr(0, 8, binBuf);
+
+  oled.drawStr(48, 8, timeStr);
+
+  // Battery display removed.
+  // Top-right now shows Wi-Fi bars and server status dot only.
+  drawWiFiIcon(111, 8, status.wifiBars);
+  drawServerStatusDot(124, 5);
+
+  oled.drawStr(48, 16, dateStr);
+}
+
+/* ================= SCREEN 1: MONITOR ================= */
+
+void drawMonitorScreen() {
+  unsigned long now = millis();
+
+  oled.clearBuffer();
+  drawTopBar();
+
+  oled.setFont(u8g2_font_6x12_tf);
+
+  if (messageStillActive(now)) {
+    oled.drawStr(0, 36, accessMessage.c_str());
+
+    if (accessMessage2 != "") {
+      oled.drawStr(0, 50, accessMessage2.c_str());
+    }
+
+    oled.sendBuffer();
+    return;
+  }
+
+  oled.drawStr(0, 36, status.doorOpen ? "Door: OPEN" : "Door: CLOSED");
+
+  char fillBuf[16];
+
+  // When the lid is open, the ultrasonic sensor may no longer point down
+  // into the bin, so hide the fill percentage instead of showing garbage.
+  if (status.doorOpen) {
+    snprintf(fillBuf, sizeof(fillBuf), "Fill: //%%");
+  } else {
+    snprintf(fillBuf, sizeof(fillBuf), "Fill: %d%%", status.fillPercent);
+  }
+
+  oled.drawStr(0, 48, fillBuf);
+
+  char thBuf[32];
+  snprintf(thBuf, sizeof(thBuf),
+           "Temp: %.1fC  Hum: %.0f%%",
+           status.temperature, status.humidity);
+  oled.drawStr(0, 60, thBuf);
+
+  oled.sendBuffer();
+}
+
+/* ================= SCREEN 2: NETWORK ================= */
+
+void drawNetworkScreen() {
+  oled.clearBuffer();
+  drawTopBar();
+
+  oled.setFont(u8g2_font_6x12_tf);
+
+  oled.drawStr(
+    0, 32,
+    status.wifiConnected ? "WiFi: CONNECTED" : "WiFi: DISCONNECTED"
+  );
+
+  oled.drawStr(
+    0, 44,
+    status.serverOnline ? "Server: ONLINE" : "Server: OFFLINE"
+  );
+
+  char rssiBuf[24];
+  const char* signalText;
+
+  if (!status.wifiConnected) {
+    signalText = "----";
+  }
+  else if (status.wifiBars == 1) {
+    signalText = "WEAK";
+  }
+  else if (status.wifiBars == 2) {
+    signalText = "GOOD";
+  }
+  else {
+    signalText = "STRONG";
+  }
+
+  snprintf(rssiBuf, sizeof(rssiBuf), "Signal: %s", signalText);
+  oled.drawStr(0, 56, rssiBuf);
+
+  oled.sendBuffer();
+}
+
+/* ================= SCREEN 3: OVERRIDE ================= */
+
+void drawOverrideScreen() {
+  oled.clearBuffer();
+  drawTopBar();
+
+  oled.setFont(u8g2_font_6x12_tf);
+
+  if (accessMessage != "") {
+    oled.drawStr(0, 36, accessMessage.c_str());
+
+    if (accessMessage2 != "") {
+      oled.drawStr(0, 50, accessMessage2.c_str());
+    }
+  } else {
+    oled.drawStr(0, 36, "MANAGER OVERRIDE");
+    oled.drawStr(0, 50, "Scan Manager Card");
+  }
+
+  oled.sendBuffer();
+}
+
+/* ================= UI DISPATCHER ================= */
+
+void drawUI() {
+  switch (currentScreen) {
+    case SCREEN_MONITOR:
+      drawMonitorScreen();
+      break;
+
+    case SCREEN_NETWORK:
+      drawNetworkScreen();
+      break;
+
+    case SCREEN_OVERRIDE:
+      drawOverrideScreen();
+      break;
+  }
+}
+
+/* ================= BUTTON HANDLER ================= */
+
+void exitOverrideModeIfNeeded() {
+  if (currentScreen == SCREEN_OVERRIDE) {
+    Serial.println("TX -> OVERRIDE:CANCEL");
+    ESP2.println("OVERRIDE:CANCEL");
+
+    expectingEmployeeCard = false;
+    waitingForCardRemoval = false;
+    lastUIDSent = "";
+    overrideStartTime = 0;
+
+    clearAccessMessage();
+  }
+}
+
+void handleButtons() {
+  static unsigned long lastDebounceTime = 0;
+
+  static bool lastMonitorState = HIGH;
+  static bool lastNetworkState = HIGH;
+  static bool lastOverrideState = HIGH;
+
+  unsigned long now = millis();
+
+  bool monitorState = digitalRead(BTN_MONITOR);
+  bool networkState = digitalRead(BTN_NETWORK);
+  bool overrideState = digitalRead(BTN_OVERRIDE);
+
+  if (!hasElapsed(now, lastDebounceTime, BUTTON_DEBOUNCE_MS)) {
+    lastMonitorState = monitorState;
+    lastNetworkState = networkState;
+    lastOverrideState = overrideState;
+    return;
+  }
+
+  // Trigger only on new button press, not while holding button
+  bool monitorPressed = (lastMonitorState == HIGH && monitorState == LOW);
+  bool networkPressed = (lastNetworkState == HIGH && networkState == LOW);
+  bool overridePressed = (lastOverrideState == HIGH && overrideState == LOW);
+
+  // Allow the MONITOR button to leave manager override immediately.
+  if (monitorPressed) {
+    exitOverrideModeIfNeeded();
+
+    currentScreen = SCREEN_MONITOR;
+    oledNeedsRefresh = true;
+    lastInteractionTime = now;
+    lastDebounceTime = now;
+  }
+
+  // Allow the NETWORK button to leave manager override immediately.
+  if (networkPressed) {
+    exitOverrideModeIfNeeded();
+
+    currentScreen = SCREEN_NETWORK;
+    oledNeedsRefresh = true;
+    lastInteractionTime = now;
+    lastDebounceTime = now;
+  }
+
+  // Start manager override only if we are not already in manager override.
+  if (overridePressed && currentScreen != SCREEN_OVERRIDE) {
+    Serial.println("TX -> OVERRIDE:START");
+    ESP2.println("OVERRIDE:START");
+
+    previousScreen = currentScreen;
+    currentScreen = SCREEN_OVERRIDE;
+    oledNeedsRefresh = true;
+
+    overrideStartTime = now;
+    lastInteractionTime = now;
+
+    expectingEmployeeCard = false;
+    waitingForCardRemoval = false;
+    lastUIDSent = "";
+
+    showMessage("MANAGER", "OVERRIDE", MSG_SHORT_MS);
+
+    lastDebounceTime = now;
+  }
+
+  lastMonitorState = monitorState;
+  lastNetworkState = networkState;
+  lastOverrideState = overrideState;
+}
+
+/* ================= UART HANDLER ================= */
+
+void handleUART() {
+  static String line = "";
+
+  while (ESP2.available()) {
+    char c = ESP2.read();
+
+    if (c == '\n' || c == '\r') {
+      line.trim();
+
+      if (line.length() > 0) {
+        Serial.println("RX <- [" + line + "]");
+
+        if (line.startsWith("TIME:")) {
+          line.substring(5).toCharArray(timeStr, sizeof(timeStr));
+        }
+        else if (line.startsWith("DATE:")) {
+          line.substring(5).toCharArray(dateStr, sizeof(dateStr));
+        }
+        else if (line == "DOOR:OPEN") {
+          if (!status.doorOpen) {
+            binOpenedAt = millis();   // start 30-second open timer
+          }
+          status.doorOpen = true;
+        }
+        else if (line == "DOOR:CLOSED") {
+          status.doorOpen = false;
+          binOpenedAt = 0;            // reset timer when closed
+        }
+        else if (line.startsWith("FILL:")) {
+          // Only accept new ultrasonic fill readings while the lid is closed.
+          // When the lid is open, the sensor angle can produce false readings.
+          // The last valid closed-lid value remains stored and will show again
+          // once the lid closes.
+          if (!status.doorOpen) {
+            status.fillPercent = line.substring(5).toInt();
+          }
+        }
+        else if (line.startsWith("TEMP:")) {
+          status.temperature = line.substring(5).toFloat();
+        }
+        else if (line.startsWith("HUM:")) {
+          status.humidity = line.substring(4).toFloat();
+        }
+        else if (line == "NET:OK") {
+          status.wifiConnected = true;
+        }
+        else if (line == "NET:DOWN") {
+          status.wifiConnected = false;
+          status.serverOnline = false;
+        }
+        else if (line == "SERVER:OK" || line == "SERVER:Online") {
+          status.serverOnline = true;
+        }
+        else if (line == "SERVER:DOWN" || line == "SERVER:Offline") {
+          status.serverOnline = false;
+        }
+        else if (line == "PING") {
+          Serial.println("PING RECEIVED");
+        }
+        else if (line.startsWith("RSSI:")) {
+          status.wifiBars = line.substring(5).toInt();
+        }
+
+        else if (line == "BAG VALID") {
+          if (currentScreen != SCREEN_OVERRIDE) {
+            currentScreen = SCREEN_MONITOR;
+            showMessage("BAG VALID", "", MSG_BAG_RESULT_MS);
+          }
+        }
+        else if (line == "SCAN ID TAG") {
+          if (currentScreen != SCREEN_OVERRIDE) {
+            currentScreen = SCREEN_MONITOR;
+            showMessage("BAG VALID", "SCAN ID TAG", MSG_LONG_MS);
+          }
+
+          expectingEmployeeCard = true;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+          lastInteractionTime = millis();
+        }
+        else if (line == "WRONG TAG") {
+          if (currentScreen != SCREEN_OVERRIDE) {
+            currentScreen = SCREEN_MONITOR;
+            showMessage("WRONG TAG", "", MSG_BAG_ERROR_MS);
+          }
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "TRY ANOTHER BIN") {
+          if (currentScreen != SCREEN_OVERRIDE) {
+            currentScreen = SCREEN_MONITOR;
+            showMessage("WRONG TAG", "TRY ANOTHER BIN", MSG_BAG_ERROR_MS);
+          }
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "SCAN USER CARD") {
+          if (currentScreen != SCREEN_OVERRIDE) {
+            currentScreen = SCREEN_MONITOR;
+            showMessage("SCAN USER CARD", "", MSG_LONG_MS);
+          }
+
+          expectingEmployeeCard = true;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "SCAN MANAGER CARD" || line == "SCAN MANAGER UUID") {
+          currentScreen = SCREEN_OVERRIDE;
+          showMessage("SCAN MANAGER", "CARD", MSG_LONG_MS);
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "TIMEOUT") {
+          currentScreen = SCREEN_MONITOR;
+          showMessage("TIMEOUT", "", MSG_NORMAL_MS);
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "OVERRIDE SUCCESS") {
+          currentScreen = SCREEN_MONITOR;
+          showMessage("OVERRIDE", "SUCCESS", MSG_NORMAL_MS);
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "UUID INVALID") {
+          currentScreen = SCREEN_MONITOR;
+          showMessage("UUID INVALID", "", MSG_NORMAL_MS);
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "ACCESS:GRANTED") {
+          currentScreen = SCREEN_MONITOR;
+          showMessage("ACCESS GRANTED", "", MSG_NORMAL_MS);
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+        else if (line == "ACCESS:DENIED") {
+          currentScreen = SCREEN_MONITOR;
+          showMessage("ACCESS DENIED", "", MSG_NORMAL_MS);
+
+          expectingEmployeeCard = false;
+          waitingForCardRemoval = false;
+          lastUIDSent = "";
+        }
+      }
+
+      line = "";
+    }
+    else {
+      line += c;
+    }
+  }
+}
+
+/* ================= UART SEND ================= */
+
+void sendCardToESP2(String uuid) {
+  ESP2.println("CARD:" + uuid);
+  Serial.println("Sent CARD:" + uuid);
+}
+
+/* ================= LID STATUS ================= */
+
+void updateLidStatus() {
+  static bool lastDoorOpen = false;
+
+  bool doorOpenNow = (digitalRead(LID_PIN) == HIGH); // HIGH = open
+
+  if (doorOpenNow != lastDoorOpen) {
+    lastDoorOpen = doorOpenNow;
+    status.doorOpen = doorOpenNow;
+
+    if (doorOpenNow) {
+      binOpenedAt = millis();   // start 30-second open timer
+      ESP2.println("DOOR:OPEN");
+    } else {
+      binOpenedAt = 0;          // reset timer when closed
+      ESP2.println("DOOR:CLOSED");
+    }
+
+    lastInteractionTime = millis();
+    oledNeedsRefresh = true;
+  }
+}
+
+/* ================= RFID UUID READ ================= */
+
+bool readManagerUUIDFromCard(String &uuidOut) {
+  byte blocks[] = {5, 6, 8};   // UUID is stored across blocks 5, 6, and 8
+  MFRC522::StatusCode rfidStatus;
+
+  String raw = "";
+
+  for (byte bi = 0; bi < 3; bi++) {
+    byte block = blocks[bi];
+    byte buffer[18];
+    byte size = sizeof(buffer);
+
+    rfidStatus = mfrc522.PCD_Authenticate(
+      MFRC522::PICC_CMD_MF_AUTH_KEY_A,
+      block,
+      &keyA,
+      &(mfrc522.uid)
+    );
+
+    if (rfidStatus != MFRC522::STATUS_OK) {
+      Serial.print("AUTH FAILED B");
+      Serial.print(block);
+      Serial.print(": ");
+      Serial.println(mfrc522.GetStatusCodeName(rfidStatus));
+      return false;
+    }
+
+    rfidStatus = mfrc522.MIFARE_Read(block, buffer, &size);
+
+    if (rfidStatus != MFRC522::STATUS_OK) {
+      Serial.print("READ FAILED B");
+      Serial.print(block);
+      Serial.print(": ");
+      Serial.println(mfrc522.GetStatusCodeName(rfidStatus));
+      return false;
+    }
+
+    for (byte i = 0; i < 16; i++) {
+      char ch = (char)buffer[i];
+
+      if (ch == '\0' || ch == 0xFF) {
+        uuidOut = raw;
+        uuidOut.trim();
+        uuidOut.toUpperCase();
+
+        Serial.print("UUID READ FROM CARD: ");
+        Serial.println(uuidOut);
+
+        return uuidOut.length() > 0;
+      }
+
+      if (ch >= 32 && ch <= 126) {
+        raw += ch;
+      }
+    }
+  }
+
+  uuidOut = raw;
+  uuidOut.trim();
+  uuidOut.toUpperCase();
+
+  Serial.print("UUID READ FROM CARD: ");
+  Serial.println(uuidOut);
+
+  return uuidOut.length() > 0;
+}
+
+/* ================= RFID HANDLER ================= */
+
+void handleRFID() {
+  unsigned long now = millis();
+
+  if (!hasElapsed(now, lastRFIDScan, RFID_COOLDOWN_MS)) {
+    return;
+  }
+
+  // Do not scan during normal status messages.
+  // But allow scanning when waiting for employee card or manager card.
+  if (messageStillActive(now) &&
+      !expectingEmployeeCard &&
+      currentScreen != SCREEN_OVERRIDE) {
+    return;
+  }
+
+  // Once card is gone, allow next read
+  if (!mfrc522.PICC_IsNewCardPresent()) {
+    waitingForCardRemoval = false;
+    lastUIDSent = "";
+    return;
+  }
+
+  if (!mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  String valueToSend = "";
+
+  // Manager override -> read stored UUID
+  if (currentScreen == SCREEN_OVERRIDE) {
+    String managerUUID = "";
+
+    if (!readManagerUUIDFromCard(managerUUID)) {
+      Serial.println("MANAGER UUID READ FAILED");
+
+      showMessage("UUID READ", "FAILED", MSG_NORMAL_MS);
+
+      lastRFIDScan = now;
+
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      return;
+    }
+
+    if (waitingForCardRemoval && managerUUID == lastUIDSent) {
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      return;
+    }
+
+    valueToSend = managerUUID;
+
+    Serial.print("MANAGER UUID SEND: ");
+    Serial.println(valueToSend);
+  }
+
+  // Normal mode:
+  // Bag stage -> physical UID
+  // User stage -> stored UUID from card
+  else {
+    if (expectingEmployeeCard) {
+      String employeeUUID = "";
+
+      if (!readManagerUUIDFromCard(employeeUUID)) {
+        Serial.println("EMPLOYEE UUID READ FAILED");
+
+        showMessage("UUID READ", "FAILED", MSG_NORMAL_MS);
+
+        lastRFIDScan = now;
+
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+        return;
+      }
+
+      employeeUUID.trim();
+      employeeUUID.toUpperCase();
+
+      if (waitingForCardRemoval && employeeUUID == lastUIDSent) {
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+        return;
+      }
+
+      valueToSend = employeeUUID;
+
+      Serial.print("EMPLOYEE UUID SEND: ");
+      Serial.println(valueToSend);
+    }
+    else {
+      String uid = "";
+
+      for (byte i = 0; i < mfrc522.uid.size; i++) {
+        if (mfrc522.uid.uidByte[i] < 0x10) {
+          uid += "0";
+        }
+        uid += String(mfrc522.uid.uidByte[i], HEX);
+      }
+
+      uid.toUpperCase();
+
+      if (waitingForCardRemoval && uid == lastUIDSent) {
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+        return;
+      }
+
+      valueToSend = uid;
+
+      Serial.print("BAG UID SEND: ");
+      Serial.println(valueToSend);
+    }
+  }
+
+  sendCardToESP2(valueToSend);
+
+  lastUIDSent = valueToSend;
+  waitingForCardRemoval = true;
+
+  if (currentScreen != SCREEN_OVERRIDE) {
+    showMessage("SCANNING...", "", MSG_SHORT_MS);
+  }
+
+  lastInteractionTime = now;
+  lastRFIDScan = now;
+
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+/* ================= SETUP ================= */
+
+void setup() {
+  Serial.begin(115200);
+  ESP2.begin(115200, SERIAL_8N1, 16, 17); // RX, TX
+  ESP2.setTimeout(10);
+
+  pinMode(BTN_MONITOR, INPUT_PULLUP);
+  pinMode(BTN_NETWORK, INPUT_PULLUP);
+  pinMode(BTN_OVERRIDE, INPUT_PULLUP);
+  pinMode(LID_PIN, INPUT_PULLUP);  // LOW = closed, HIGH = open
+
+  pinMode(ALERT_STROBE_PIN, OUTPUT);
+  digitalWrite(ALERT_STROBE_PIN, LOW);
+
+  oled.begin();
+  oled.setPowerSave(0);
+  oled.setContrast(255);
+
+  SPI.begin(18, 19, 23); // SCK, MISO, MOSI
+  mfrc522.PCD_Init();
+
+  for (byte i = 0; i < 6; i++) {
+    keyA.keyByte[i] = 0xFF;
+  }
+
+  unsigned long now = millis();
+  lastInteractionTime = now;
+  lastRFIDScan = now;
+
+  Serial.println("RFID Ready...");
+}
+
+/* ================= LOOP ================= */
+
+void loop() {
+  static unsigned long lastPingTime = 0;
+  static unsigned long lastOLEDUpdate = 0;
+
+  unsigned long now = millis();
+
+  // Non-blocking ping to ESP2 every 2 seconds
+  if (hasElapsed(now, lastPingTime, PING_INTERVAL_MS)) {
+    lastPingTime = now;
+    ESP2.println("PING");
+  }
+
+  handleUART();
+
+  // Update lid status before checking alert thresholds so the strobe
+  // immediately turns OFF when the lid is opened.
+  updateLidStatus();
+  handleAlertStrobe();
+
+  // Non-blocking auto-clear message
+  if (accessMessage != "" && timeReached(now, accessMessageUntil)) {
+    clearAccessMessage();
+  }
+
+  // Non-blocking auto return to monitor screen
+  if (currentScreen != SCREEN_OVERRIDE &&
+      hasElapsed(now, lastInteractionTime, HOME_TIMEOUT_MS)) {
+    if (currentScreen != SCREEN_MONITOR) {
+      currentScreen = SCREEN_MONITOR;
+      oledNeedsRefresh = true;
+    }
+  }
+
+  handleRFID();
+  handleButtons();
+
+  // Non-blocking OLED refresh
+  if (oledNeedsRefresh || hasElapsed(now, lastOLEDUpdate, OLED_REFRESH_MS)) {
+    lastOLEDUpdate = now;
+    oledNeedsRefresh = false;
+    drawUI();
+  }
+}
+
+
